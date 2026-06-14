@@ -9,6 +9,7 @@ mod metrics;
 mod proto;
 mod rtp_gateway;
 mod session_hook;
+mod worker_call_module;
 
 use crate::{
     addons::collect_addon_cdr_hooks,
@@ -158,31 +159,33 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("failed to init data context: {e}"))?,
     );
+    #[allow(unused_variables)]
     let routing_state = Arc::new(RoutingState::new());
 
-    // ── WorkerCallRouter ──────────────────────────────────────────────────────
-    let worker_router = Box::new(WorkerCallRouter {
-        data_context: Arc::clone(&data_context),
-        rtp_config: rtp_config.clone(),
-        routing_state: Arc::clone(&routing_state),
-        active_calls: Arc::clone(&active_calls),
-        metrics: Arc::clone(&worker_metrics),
-    });
+    // WorkerCallRouter is kept for future integration (when WorkerCallModule
+    // needs route decisions for IVR/queue). Not injected in Phase 1 skeleton
+    // because WorkerCallModule handles signaling directly without CallModule.
+    #[allow(unused_mut)]
+    let mut _worker_router_unused: Option<Box<dyn rustpbx::proxy::call::CallRouter>> = None;
 
     // ── SIP Server ────────────────────────────────────────────────────────────
-    // Module chain: internal-peer → acl → auth → registrar → presence → call
+    // Module chain: internal-peer → acl → auth → registrar → presence → worker-call
+    //
+    // WorkerCallModule replaces the main crate's CallModule. It owns the SIP
+    // dialog lifecycle and creates an rtp_gateway per call (the sole media
+    // I/O boundary). Phase 1 skeleton uses LoggingSink; Phase 2 replaces it
+    // with a dedicated media thread.
     let _sip_server = SipServerBuilder::new(proxy_config)
         .with_cancel_token(cancel.clone())
         .with_rtp_config(rtp_config)
         .with_callrecord_sender(Some(cdr_sender))
         .with_data_context(Arc::clone(&data_context))
-        .with_call_router(worker_router)
         .register_module("internal-peer", InternalPeerModule::create)
         .register_module("acl", AclModule::create)
         .register_module("auth", AuthModule::create)
         .register_module("registrar", RegistrarModule::create)
         .register_module("presence", PresenceModule::create)
-        .register_module("call", CallModule::create)
+        .register_module("worker-call", worker_call_module::create)
         .build()
         .await?;
 
@@ -215,7 +218,7 @@ fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
         "auth".into(),
         "registrar".into(),
         "presence".into(),
-        "call".into(),
+        "worker-call".into(),
     ]);
     config
 }

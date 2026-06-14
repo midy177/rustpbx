@@ -42,6 +42,7 @@
 pub mod bridge;
 pub mod command;
 pub mod handle;
+pub mod logging_sink;
 
 pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge};
 pub use command::{
@@ -49,3 +50,4 @@ pub use command::{
     TrackSelector,
 };
 pub use handle::RtpGatewayHandle;
+pub use logging_sink::LoggingSink;
