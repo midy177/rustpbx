@@ -24,7 +24,7 @@ use anyhow::Result;
 use ipnetwork::IpNetwork;
 use rustpbx::{
     call::RoutingState,
-    callrecord::{CallRecordManagerBuilder, noop_saver},
+    callrecord::CallRecordManagerBuilder,
     config::{ProxyConfig, RtpConfig},
     proxy::{
         acl::AclModule,
@@ -128,9 +128,8 @@ async fn main() -> Result<()> {
         },
     );
 
-    let mut cdr_builder = CallRecordManagerBuilder::default()
-        .with_cancel_token(cancel.clone())
-        .with_saver(Arc::new(Box::new(noop_saver)));
+    let mut cdr_builder = CallRecordManagerBuilder::new()
+        .with_cancel_token(cancel.clone());
 
     for hook in collect_addon_cdr_hooks() {
         cdr_builder = cdr_builder.with_hook(hook);
@@ -138,7 +137,7 @@ async fn main() -> Result<()> {
     cdr_builder = cdr_builder.with_hook(tracker_hook);
     cdr_builder = cdr_builder.with_hook(grpc_hook);
 
-    let mut cdr_manager = cdr_builder.build();
+    let mut cdr_manager = cdr_builder.build().await?;
     let cdr_sender = cdr_manager.sender.clone();
     tokio::spawn(async move { cdr_manager.serve().await });
 

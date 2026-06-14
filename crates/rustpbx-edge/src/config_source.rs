@@ -6,7 +6,7 @@ use crate::grpc_client::GrpcControlClient;
 use anyhow::Result;
 use async_trait::async_trait;
 use rustpbx::proxy::routing::{
-    DestConfig, MatchConditions, RouteAction, RouteDirection, RouteRule, TrunkConfig,
+    DestConfig, MatchConditions, RouteAction, RouteRule, TrunkConfig,
 };
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -100,11 +100,6 @@ fn trunk_from_proto(p: crate::proto::control::TrunkConfigProto) -> (String, Trun
 }
 
 fn route_from_proto(p: crate::proto::control::RouteRuleProto) -> Option<RouteRule> {
-    let direction = match p.direction.as_str() {
-        "inbound" => RouteDirection::Inbound,
-        "outbound" => RouteDirection::Outbound,
-        _ => RouteDirection::Any,
-    };
     let mc = p.match_conditions.map(|m| MatchConditions {
         from_user: m.from_user,
         from_host: m.from_host,
@@ -135,7 +130,6 @@ fn route_from_proto(p: crate::proto::control::RouteRuleProto) -> Option<RouteRul
         name: p.name,
         description: p.description,
         priority: p.priority,
-        direction,
         source_trunks: p.source_trunks,
         match_conditions: mc,
         action,
