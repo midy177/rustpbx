@@ -6,14 +6,13 @@ use crate::proxy::active_call_registry::{
 };
 use crate::proxy::proxy_call::sip_session::{SipSession, SipSessionHandle};
 use crate::rwi::gateway::RwiGateway;
-use crate::rwi::proto::RwiEvent;
 use futures::FutureExt;
 use rsipstack::dialog::dialog::DialogState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -238,7 +237,7 @@ impl TransferController {
         transaction.update_status(TransferStatus::Accepted);
 
         {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if txs.len() >= self.config.max_concurrent_transfers {
                 crate::metrics::transfer::failed_total("refer", "max_concurrent_reached");
                 return Err(TransferFailureReason::InternalError);
@@ -246,17 +245,17 @@ impl TransferController {
             txs.insert(transaction.transfer_id.clone(), transaction.clone());
         }
 
-        crate::metrics::transfer::set_active_transfers(self.transactions.read().await.len());
+        crate::metrics::transfer::set_active_transfers(self.transactions.read().len());
 
         let _handle = self
             .get_handle(&call_id)
             .await
             .ok_or(TransferFailureReason::InvalidState)?;
 
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferAccepted {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferAccepted {
             call_id: call_id.clone(),
-        };
+        }, None);
         gw.send_event_to_call_owner(&call_id, &event);
 
         Ok(transaction)
@@ -280,7 +279,7 @@ impl TransferController {
         transaction.update_status(TransferStatus::Accepted);
 
         {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if txs.len() >= self.config.max_concurrent_transfers {
                 crate::metrics::transfer::failed_total("refer", "max_concurrent_reached");
                 return Err(TransferFailureReason::InternalError);
@@ -288,17 +287,17 @@ impl TransferController {
             txs.insert(transaction.transfer_id.clone(), transaction.clone());
         }
 
-        crate::metrics::transfer::set_active_transfers(self.transactions.read().await.len());
+        crate::metrics::transfer::set_active_transfers(self.transactions.read().len());
 
         let _handle = self
             .get_handle(&call_id)
             .await
             .ok_or(TransferFailureReason::InvalidState)?;
 
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferAccepted {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferAccepted {
             call_id: call_id.clone(),
-        };
+        }, None);
         gw.send_event_to_call_owner(&call_id, &event);
 
         Ok(transaction)
@@ -438,7 +437,7 @@ impl TransferController {
         sip_status: Option<u16>,
     ) {
         let failed_tx_opt = {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if let Some(tx) = txs.get_mut(transfer_id) {
                 tx.update_status(TransferStatus::Failed(reason.clone()));
                 tx.sip_status = sip_status;
@@ -448,12 +447,12 @@ impl TransferController {
             }
         };
         if let Some(failed_tx) = failed_tx_opt {
-            let gw = self.gateway.read().await;
-            let event = RwiEvent::CallTransferFailed {
+            let gw = self.gateway.read();
+            let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                 call_id: failed_tx.call_id.clone(),
                 sip_status,
                 reason: Some(reason.as_str().to_string()),
-            };
+            }, None);
             gw.send_event_to_call_owner(&failed_tx.call_id, &event);
         }
     }
@@ -480,7 +479,7 @@ impl TransferController {
         transaction.original_leg = Some(call_id.clone());
 
         {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if txs.len() >= self.config.max_concurrent_transfers {
                 return Err(TransferFailureReason::InternalError);
             }
@@ -500,10 +499,10 @@ impl TransferController {
             }),
         });
 
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferAccepted {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferAccepted {
             call_id: call_id.clone(),
-        };
+        }, None);
         gw.send_event_to_call_owner(&call_id, &event);
 
         Ok(transaction)
@@ -514,15 +513,16 @@ impl TransferController {
         call_id: String,
         consultation_call_id: String,
     ) -> Result<TransferTransaction, TransferFailureReason> {
-        let txs = self.transactions.read().await;
-        let transaction = txs
-            .values()
-            .find(|tx| {
-                tx.call_id == call_id
-                    && tx.consultation_call_id.as_ref() == Some(&consultation_call_id)
-            })
-            .cloned();
-        drop(txs);
+        let transaction = {
+            let txs = self.transactions.read();
+            txs
+                .values()
+                .find(|tx| {
+                    tx.call_id == call_id
+                        && tx.consultation_call_id.as_ref() == Some(&consultation_call_id)
+                })
+                .cloned()
+        };
 
         let mut transaction = transaction.ok_or(TransferFailureReason::InvalidState)?;
 
@@ -541,10 +541,10 @@ impl TransferController {
 
         transaction.update_status(TransferStatus::Completed);
 
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferred {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferred {
             call_id: call_id.clone(),
-        };
+        }, None);
         gw.send_event_to_call_owner(&call_id, &event);
 
         Ok(transaction)
@@ -554,25 +554,26 @@ impl TransferController {
         &self,
         consultation_call_id: String,
     ) -> Result<TransferTransaction, TransferFailureReason> {
-        let txs = self.transactions.read().await;
-        let transaction = txs
-            .values()
-            .find(|tx| tx.consultation_call_id.as_ref() == Some(&consultation_call_id))
-            .cloned();
-        drop(txs);
+        let transaction = {
+            let txs = self.transactions.read();
+            txs
+                .values()
+                .find(|tx| tx.consultation_call_id.as_ref() == Some(&consultation_call_id))
+                .cloned()
+        };
 
         let mut transaction = transaction.ok_or(TransferFailureReason::InvalidState)?;
 
         let handle = self.get_handle(&consultation_call_id).await;
         if let Some(handle) = handle {
             let _leg_id = LegId::new(&consultation_call_id);
-            let _ = handle.send_command(CallCommand::Hangup(
+            let _ = handle.send_command_async(CallCommand::Hangup(
                 crate::call::domain::HangupCommand::local(
                     "transfer",
                     Some(crate::callrecord::CallRecordHangupReason::BySystem),
                     Some(487),
                 ),
-            ));
+            )).await;
         }
 
         if let Some(ref original_call_id) = transaction.original_leg {
@@ -582,12 +583,12 @@ impl TransferController {
                 let _ = original_handle.send_command(CallCommand::Unhold { leg_id });
             }
 
-            let gw = self.gateway.read().await;
-            let event = RwiEvent::CallTransferFailed {
+            let gw = self.gateway.read();
+            let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                 call_id: original_call_id.clone(),
                 sip_status: Some(487),
                 reason: Some("cancelled".to_string()),
-            };
+            }, None);
             gw.send_event_to_call_owner(original_call_id, &event);
         }
 
@@ -612,12 +613,12 @@ impl TransferController {
         }
 
         let (tx_clone, gw_event) = {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             let tx = txs.get_mut(&transfer_id)?;
 
             tx.set_sip_status(sip_status);
 
-            let gw_event = if (200..300).contains(&sip_status) {
+            let gw_event = if rsipstack::sip::StatusCode::from(sip_status).kind() == rsipstack::sip::StatusCodeKind::Successful {
                 if tx.status == TransferStatus::Accepted {
                     GatewayEvent::None
                 } else {
@@ -653,10 +654,10 @@ impl TransferController {
 
         match gw_event {
             GatewayEvent::Accepted(call_id) => {
-                let gw = self.gateway.read().await;
-                let event = RwiEvent::CallTransferAccepted {
+                let gw = self.gateway.read();
+                let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferAccepted {
                     call_id: call_id.clone(),
-                };
+                }, None);
                 gw.send_event_to_call_owner(&call_id, &event);
             }
             GatewayEvent::Failed {
@@ -664,12 +665,12 @@ impl TransferController {
                 sip_status,
                 reason,
             } => {
-                let gw = self.gateway.read().await;
-                let event = RwiEvent::CallTransferFailed {
+                let gw = self.gateway.read();
+                let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                     call_id: call_id.clone(),
                     sip_status: Some(sip_status),
                     reason: Some(reason.as_str().to_string()),
-                };
+                }, None);
                 gw.send_event_to_call_owner(&call_id, &event);
             }
             GatewayEvent::None => {}
@@ -691,7 +692,7 @@ impl TransferController {
         }
 
         let (result_tx, post_action) = {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             let tx = txs.get_mut(&transfer_id)?;
 
             tx.set_sip_status(notify_status);
@@ -721,10 +722,10 @@ impl TransferController {
                     let completed_tx = txs.get(&transfer_id)?.clone();
                     return {
                         drop(txs);
-                        let gw = self.gateway.read().await;
-                        let event = RwiEvent::CallTransferred {
+                        let gw = self.gateway.read();
+                        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferred {
                             call_id: completed_tx.call_id.clone(),
-                        };
+                        }, None);
                         gw.send_event_to_call_owner(&completed_tx.call_id, &event);
                         Some(completed_tx)
                     };
@@ -754,12 +755,12 @@ impl TransferController {
         match post_action {
             PostAction::TransferFailed(failed_tx, reason) => {
                 let failed_tx = *failed_tx;
-                let gw = self.gateway.read().await;
-                let event = RwiEvent::CallTransferFailed {
+                let gw = self.gateway.read();
+                let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                     call_id: failed_tx.call_id.clone(),
                     sip_status: Some(notify_status),
                     reason: Some(reason.as_str().to_string()),
-                };
+                }, None);
                 gw.send_event_to_call_owner(&failed_tx.call_id, &event);
                 Some(failed_tx)
             }
@@ -774,7 +775,7 @@ impl TransferController {
         sip_status: u16,
     ) -> Option<TransferTransaction> {
         let transfer_id = {
-            let txs = self.transactions.read().await;
+            let txs = self.transactions.read();
             txs.values()
                 .find(|tx| tx.call_id == call_id && !tx.is_terminal())
                 .map(|tx| tx.transfer_id.clone())?
@@ -789,7 +790,7 @@ impl TransferController {
         notify_status: u16,
     ) -> Option<TransferTransaction> {
         let transfer_id = {
-            let txs = self.transactions.read().await;
+            let txs = self.transactions.read();
             txs.values()
                 .find(|tx| tx.call_id == call_id && !tx.is_terminal())
                 .map(|tx| tx.transfer_id.clone())?
@@ -798,7 +799,7 @@ impl TransferController {
     }
 
     pub async fn fallback_to_3pcc(&self, transfer_id: String) -> Option<TransferTransaction> {
-        let mut txs = self.transactions.write().await;
+        let mut txs = self.transactions.write();
         let tx = txs.get_mut(&transfer_id)?;
 
         if !self.config.three_pcc_fallback_enabled {
@@ -806,12 +807,12 @@ impl TransferController {
             tx.update_status(TransferStatus::Failed(reason.clone()));
             let failed_tx = tx.clone();
             drop(txs);
-            let gw = self.gateway.read().await;
-            let event = RwiEvent::CallTransferFailed {
+            let gw = self.gateway.read();
+            let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                 call_id: failed_tx.call_id.clone(),
                 sip_status: failed_tx.sip_status,
                 reason: Some(reason.as_str().to_string()),
-            };
+            }, None);
             gw.send_event_to_call_owner(&failed_tx.call_id, &event);
             return Some(failed_tx);
         }
@@ -837,7 +838,7 @@ impl TransferController {
     ) -> Result<TransferTransaction, TransferFailureReason> {
         // Get transaction
         let tx = {
-            let txs = self.transactions.read().await;
+            let txs = self.transactions.read();
             txs.get(transfer_id).cloned()
         }
         .ok_or(TransferFailureReason::InvalidState)?;
@@ -897,7 +898,7 @@ impl TransferController {
 
                 // Update transaction with new call leg
                 {
-                    let mut txs = self.transactions.write().await;
+                    let mut txs = self.transactions.write();
                     if let Some(tx) = txs.get_mut(transfer_id) {
                         tx.consultation_call_id = Some(new_call_id.clone());
                         tx.update_status(TransferStatus::NotifyProgress);
@@ -905,10 +906,10 @@ impl TransferController {
                 }
 
                 // Emit 3PCC started event
-                let gw = self.gateway.read().await;
-                let event = RwiEvent::CallTransferred {
+                let gw = self.gateway.read();
+                let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferred {
                     call_id: call_id.clone(),
-                };
+                }, None);
                 gw.send_event_to_call_owner(&call_id, &event);
 
                 info!(%transfer_id, "3PCC transfer initiated, waiting for answer");
@@ -928,7 +929,7 @@ impl TransferController {
 
                 // Update transaction as failed
                 {
-                    let mut txs = self.transactions.write().await;
+                    let mut txs = self.transactions.write();
                     if let Some(tx) = txs.get_mut(transfer_id) {
                         tx.update_status(TransferStatus::Failed(
                             TransferFailureReason::ThreePccFailed,
@@ -938,12 +939,12 @@ impl TransferController {
                 }
 
                 // Emit failure event
-                let gw = self.gateway.read().await;
-                let event = RwiEvent::CallTransferFailed {
+                let gw = self.gateway.read();
+                let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                     call_id: call_id.clone(),
                     sip_status: None,
                     reason: Some(format!("3pcc_originate_failed: {}", e)),
-                };
+                }, None);
                 gw.send_event_to_call_owner(&call_id, &event);
 
                 Err(TransferFailureReason::ThreePccFailed)
@@ -994,7 +995,8 @@ impl TransferController {
         // Create media track and SDP offer
         let media_track = crate::media::RtpTrackBuilder::new(format!("3pcc-{}", call_id))
             .with_cancel_token(tokio_util::sync::CancellationToken::new())
-            .with_external_ip(external_ip);
+            .with_external_ip(external_ip)
+            .with_cname(sip_server.rtc_cname.clone());
         let media_track = if let Some(bind_ip) = sip_server.rtp_config.bind_ip.clone() {
             media_track.with_bind_ip(bind_ip)
         } else {
@@ -1030,7 +1032,7 @@ impl TransferController {
         let orig_call_id_spawn = original_call_id.to_string(); // Clone for spawned task
 
         // Spawn originate task
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut invitation = dialog_layer.do_invite(invite_option, state_tx).boxed();
 
@@ -1061,17 +1063,17 @@ impl TransferController {
                                 if let Some(state) = state {
                                     match state {
                                         DialogState::Calling(_) => {
-                                            let gw = gateway.read().await;
+                                            let gw = gateway.read();
                                             gw.send_event_to_call_owner(
                                                 &call_id_for_spawn,
-                                                &RwiEvent::CallRinging { call_id: call_id_for_spawn.clone() },
+                                                &crate::rwi::event::to_legacy_event(&crate::rwi::CallRinging { call_id: call_id_for_spawn.clone() }, None),
                                             );
                                         }
                                         DialogState::Early(_, _) => {
-                                            let gw = gateway.read().await;
+                                            let gw = gateway.read();
                                             gw.send_event_to_call_owner(
                                                 &call_id_for_spawn,
-                                                &RwiEvent::CallEarlyMedia { call_id: call_id_for_spawn.clone() },
+                                                &crate::rwi::event::to_legacy_event(&crate::rwi::CallEarlyMedia { call_id: call_id_for_spawn.clone() }, None),
                                             );
                                         }
                                         _ => {}
@@ -1101,12 +1103,12 @@ impl TransferController {
                     });
 
                     // Send answered event
-                    let gw = gateway.read().await;
+                    let gw = gateway.read();
                     gw.send_event_to_call_owner(
                         &call_id_for_spawn,
-                        &RwiEvent::CallAnswered {
+                        &crate::rwi::event::to_legacy_event(&crate::rwi::CallAnswered {
                             call_id: call_id_for_spawn.clone(),
-                        },
+                        }, None),
                     );
 
                     // Bridge the calls - find original call and bridge with new call
@@ -1121,7 +1123,7 @@ impl TransferController {
                     let new_call_id = call_id_for_spawn.clone();
                     let orig_call_id = orig_call_id_spawn.clone();
 
-                    tokio::spawn(async move {
+                    crate::utils::spawn(async move {
                         // Wait for media to stabilize
                         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1139,26 +1141,26 @@ impl TransferController {
                                     info!(%orig_call_id, %new_call_id, "3PCC bridge command sent successfully");
 
                                     // Emit transfer completion event
-                                    let gw = gateway_clone.read().await;
+                                    let gw = gateway_clone.read();
                                     gw.send_event_to_call_owner(
                                         &orig_call_id,
-                                        &RwiEvent::CallTransferred {
+                                        &crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferred {
                                             call_id: orig_call_id.clone(),
-                                        },
+                                        }, None),
                                     );
                                 }
                                 Err(e) => {
                                     error!(%orig_call_id, %new_call_id, error = %e, "Failed to bridge 3PCC calls");
 
                                     // Emit failure event
-                                    let gw = gateway_clone.read().await;
+                                    let gw = gateway_clone.read();
                                     gw.send_event_to_call_owner(
                                         &orig_call_id,
-                                        &RwiEvent::CallTransferFailed {
+                                        &crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
                                             call_id: orig_call_id.clone(),
                                             sip_status: None,
                                             reason: Some(format!("bridge_failed: {}", e)),
-                                        },
+                                        }, None),
                                     );
                                 }
                             }
@@ -1202,7 +1204,7 @@ impl TransferController {
         transfer_id: &str,
     ) -> Result<TransferTransaction, TransferFailureReason> {
         let tx = {
-            let txs = self.transactions.read().await;
+            let txs = self.transactions.read();
             txs.get(transfer_id).cloned()
         }
         .ok_or(TransferFailureReason::InvalidState)?;
@@ -1237,17 +1239,17 @@ impl TransferController {
 
         // Update transaction status
         {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if let Some(tx) = txs.get_mut(transfer_id) {
                 tx.update_status(TransferStatus::Completed);
             }
         }
 
         // Emit completion event
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferred {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferred {
             call_id: call_id.clone(),
-        };
+        }, None);
         gw.send_event_to_call_owner(call_id, &event);
 
         info!(%transfer_id, "3PCC transfer completed");
@@ -1264,7 +1266,7 @@ impl TransferController {
         reason: &str,
     ) -> Result<(), TransferFailureReason> {
         let tx = {
-            let txs = self.transactions.read().await;
+            let txs = self.transactions.read();
             txs.get(transfer_id).cloned()
         }
         .ok_or(TransferFailureReason::InvalidState)?;
@@ -1287,7 +1289,7 @@ impl TransferController {
 
         // Update transaction status
         {
-            let mut txs = self.transactions.write().await;
+            let mut txs = self.transactions.write();
             if let Some(tx) = txs.get_mut(transfer_id) {
                 tx.update_status(TransferStatus::Failed(
                     TransferFailureReason::ThreePccFailed,
@@ -1297,41 +1299,41 @@ impl TransferController {
         }
 
         // Emit failure event
-        let gw = self.gateway.read().await;
-        let event = RwiEvent::CallTransferFailed {
+        let gw = self.gateway.read();
+        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallTransferFailed {
             call_id: call_id.clone(),
             sip_status: None,
             reason: Some(format!("3pcc_failed: {}", reason)),
-        };
+        }, None);
         gw.send_event_to_call_owner(call_id, &event);
 
         Ok(())
     }
 
     pub async fn get_transaction(&self, transfer_id: &str) -> Option<TransferTransaction> {
-        let txs = self.transactions.read().await;
+        let txs = self.transactions.read();
         txs.get(transfer_id).cloned()
     }
 
     pub async fn get_transaction_by_call_id(&self, call_id: &str) -> Option<TransferTransaction> {
-        let txs = self.transactions.read().await;
+        let txs = self.transactions.read();
         txs.values().find(|tx| tx.call_id == call_id).cloned()
     }
 
     pub async fn cleanup_terminal_transactions(&self) -> usize {
-        let mut txs = self.transactions.write().await;
+        let mut txs = self.transactions.write();
         let before = txs.len();
         txs.retain(|_, tx| !tx.is_terminal());
         before - txs.len()
     }
 
     pub async fn get_active_transfer_count(&self) -> usize {
-        let txs = self.transactions.read().await;
+        let txs = self.transactions.read();
         txs.values().filter(|tx| !tx.is_terminal()).count()
     }
 
     pub async fn cancel_all_transfers_for_call(&self, call_id: &str) -> usize {
-        let mut txs = self.transactions.write().await;
+        let mut txs = self.transactions.write();
         let mut count = 0;
         for tx in txs.values_mut() {
             if tx.call_id == call_id && !tx.is_terminal() {
@@ -1347,7 +1349,6 @@ impl TransferController {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     // ────────────────────────────────────────────────────────────────────────────
     // Test helpers
@@ -1767,7 +1768,7 @@ mod tests {
 
         // Count total transactions before cleanup (includes terminal ones)
         let before_total = {
-            let txs = ctrl.transactions.read().await;
+            let txs = ctrl.transactions.read();
             txs.len()
         };
         assert!(
@@ -1784,7 +1785,7 @@ mod tests {
 
         // After cleanup, total count should be lower
         let after_total = {
-            let txs = ctrl.transactions.read().await;
+            let txs = ctrl.transactions.read();
             txs.len()
         };
         assert!(

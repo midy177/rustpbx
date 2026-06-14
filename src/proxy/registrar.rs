@@ -383,18 +383,11 @@ fn parse_route_header(request: &rsipstack::sip::Request, header: &str) -> Vec<Ur
 }
 
 fn parse_transport_token(value: &str) -> Option<Transport> {
-    match value.to_ascii_lowercase().as_str() {
-        "udp" => Some(Transport::Udp),
-        "tcp" => Some(Transport::Tcp),
-        "tls" => Some(Transport::Tls),
-        "ws" => Some(Transport::Ws),
-        "wss" => Some(Transport::Wss),
-        _ => None,
-    }
+    super::routing::resolve_transport_from_str(value)
 }
 
 fn escape_display_name(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
+    super::routing::escape_sip_quoted(input)
 }
 
 impl RegistrarModule {
@@ -471,7 +464,7 @@ impl ProxyModule for RegistrarModule {
             }
         };
 
-        let default_expires = self.config.registrar_expires.unwrap_or(60);
+        let default_expires = self.config.registrar_expires.unwrap_or(30);
         let global_expires = tx
             .original
             .expires_header()
@@ -535,12 +528,17 @@ impl ProxyModule for RegistrarModule {
         let path_uris = parse_route_header(&tx.original, "Path");
         let service_routes = parse_route_header(&tx.original, "Service-Route");
 
+        let max_expires = self.config.max_registrar_expires.unwrap_or(50);
+
         let mut response_headers = Vec::new();
+        let mut max_contact_expires = 0u32;
         for entry in contact_entries {
             let expires = entry
                 .expires()
                 .or(global_expires)
-                .unwrap_or(default_expires);
+                .unwrap_or(default_expires)
+                .min(max_expires);
+            max_contact_expires = max_contact_expires.max(expires);
 
             let destination = match user
                 .destination
@@ -625,11 +623,11 @@ impl ProxyModule for RegistrarModule {
                 .await
             {
                 Ok(_) => {
-                    // P0: SIP registration success metrics
                     metrics::sip::registration_succeeded(&realm);
                     if let Some(locator_events) = &self.server.locator_events {
                         locator_events.send(LocatorEvent::Registered(location)).ok();
                     }
+                    // DnStateChanged removed. Use agent_state_changed instead.
                 }
                 Err(e) => {
                     info!("failed to register user: {:?}", e);
@@ -656,9 +654,7 @@ impl ProxyModule for RegistrarModule {
                     .into(),
             ));
         }
-        response_headers.push(Header::Expires(
-            global_expires.unwrap_or(default_expires).into(),
-        ));
+        response_headers.push(Header::Expires(max_contact_expires.into()));
 
         tx.reply_with(rsipstack::sip::StatusCode::OK, response_headers, None)
             .await

@@ -5,8 +5,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Local};
 
-use crate::config::SipFlowConfig;
-use crate::sipflow::SipFlowItem;
+use crate::config::{SipFlowClusterNode, SipFlowConfig, SipFlowEngine};
+use crate::sipflow::flowdb_backend::FlowDbBackend;
+use crate::sipflow::{SipFlowItem, SipFlowMediaStats};
 
 #[async_trait]
 pub trait SipFlowBackend: Send + Sync {
@@ -28,7 +29,7 @@ pub trait SipFlowBackend: Send + Sync {
         call_id: &str,
         start_time: DateTime<Local>,
         end_time: DateTime<Local>,
-    ) -> Result<Vec<(i32, String, usize)>>;
+    ) -> Result<Vec<SipFlowMediaStats>>;
     async fn query_media(
         &self,
         call_id: &str,
@@ -55,6 +56,27 @@ pub trait SipFlowBackend: Send + Sync {
         let _ = stream_leg;
         self.query_media(call_id, start_time, end_time).await
     }
+
+    /// Generate WAV audio and write it to a temporary file on disk.
+    ///
+    /// This is the preferred way to export large recordings because it avoids
+    /// holding the full WAV buffer in memory.  The returned `NamedTempFile`
+    /// keeps the underlying file alive and automatically deletes it on drop.
+    async fn generate_wav_file(
+        &self,
+        call_id: &str,
+        start_time: DateTime<Local>,
+        end_time: DateTime<Local>,
+        stream_leg: Option<i32>,
+    ) -> Result<tempfile::NamedTempFile> {
+        let data = self
+            .query_media_stream(call_id, start_time, end_time, stream_leg)
+            .await?;
+        let mut file = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, &data)?;
+        std::io::Write::flush(&mut file)?;
+        Ok(file)
+    }
 }
 
 /// Create backend from configuration
@@ -66,21 +88,52 @@ pub fn create_backend(config: &SipFlowConfig) -> Result<Box<dyn SipFlowBackend>>
             flush_count,
             flush_interval_secs,
             id_cache_size,
+            engine,
+            ttl_secs,
+            memtable_size_mb,
+            block_cache_capacity_mb,
             ..
-        } => local::LocalBackend::new(
-            root.clone(),
-            subdirs.clone(),
-            *flush_count,
-            *flush_interval_secs,
-            *id_cache_size,
-        )
-        .map(|b| Box::new(b) as Box<dyn SipFlowBackend>),
+        } => {
+            if *engine == SipFlowEngine::FlowDb {
+                FlowDbBackend::new(
+                    root.clone(),
+                    *ttl_secs,
+                    *memtable_size_mb,
+                    *block_cache_capacity_mb,
+                )
+                .map(|b| Box::new(b) as Box<dyn SipFlowBackend>)
+            } else {
+                local::LocalBackend::new(
+                    root.clone(),
+                    subdirs.clone(),
+                    *flush_count,
+                    *flush_interval_secs,
+                    *id_cache_size,
+                )
+                .map(|b| Box::new(b) as Box<dyn SipFlowBackend>)
+            }
+        }
         SipFlowConfig::Remote {
+            nodes,
             udp_addr,
             http_addr,
             timeout_secs,
             ..
-        } => remote::RemoteBackend::new(udp_addr.clone(), http_addr.clone(), *timeout_secs)
-            .map(|b| Box::new(b) as Box<dyn SipFlowBackend>),
+        } => {
+            let resolved = if !nodes.is_empty() {
+                nodes.clone()
+            } else if let (Some(udp), Some(http)) = (udp_addr, http_addr) {
+                vec![SipFlowClusterNode {
+                    udp: udp.clone(),
+                    http: http.clone(),
+                }]
+            } else {
+                anyhow::bail!(
+                    "Remote backend requires either `nodes` or both `udp_addr` and `http_addr`"
+                )
+            };
+            remote::RemoteBackend::new(resolved, *timeout_secs)
+                .map(|b| Box::new(b) as Box<dyn SipFlowBackend>)
+        }
     }
 }

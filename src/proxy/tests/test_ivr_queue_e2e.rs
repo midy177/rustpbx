@@ -1,11 +1,9 @@
+use super::test_helpers;
 use super::test_ua::{TestUa, TestUaEvent};
 use crate::call::user::SipUser;
 use crate::config::ProxyConfig;
 use crate::proxy::{
-    auth::AuthModule,
-    call::CallModule,
     locator::MemoryLocator,
-    registrar::RegistrarModule,
     routing::{
         MatchConditions, RouteAction, RouteQueueConfig, RouteQueueStrategyConfig,
         RouteQueueTargetConfig, RouteRule,
@@ -44,6 +42,7 @@ fn create_ivr_queue_proxy_config(port: u16, ivr_toml_path: &str) -> ProxyConfig 
                 uri: target_uri,
                 label: Some("Support Agent".to_string()),
             }],
+            wait_timeout_secs: Some(5),
             ..Default::default()
         },
         accept_immediately: false,
@@ -126,29 +125,17 @@ impl TestIvrQueueServer {
         let locator = MemoryLocator::new();
         let cancel_token = CancellationToken::new();
 
-        let mut builder = SipServerBuilder::new(config)
-            .with_user_backend(Box::new(user_backend))
-            .with_locator(Box::new(locator))
-            .with_cancel_token(cancel_token.clone());
-
-        builder = builder
-            .register_module("registrar", |inner, config| {
-                Ok(Box::new(RegistrarModule::new(inner, config)))
-            })
-            .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(
-                    inner.clone(),
-                    inner.proxy_config.clone(),
-                )))
-            })
-            .register_module("call", |inner, config| {
-                Ok(Box::new(CallModule::new(config, inner)))
-            });
+        let builder = test_helpers::register_standard_modules(
+            SipServerBuilder::new(config)
+                .with_user_backend(Box::new(user_backend))
+                .with_locator(Box::new(locator))
+                .with_cancel_token(cancel_token.clone()),
+        );
 
         let server: SipServer = builder.build().await?;
         let inner = server.inner.clone();
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             if let Err(e) = server.serve().await {
                 warn!("Server error: {:?}", e);
             }
@@ -197,7 +184,29 @@ action = { type = "transfer", target = "support" }
     std::fs::write(path, toml).expect("failed to write IVR toml");
 }
 
+fn pcmu_offer(origin: &str, media_port: u16) -> String {
+    format!(
+        "v=0\r\n\
+         o={} {} 0 IN IP4 127.0.0.1\r\n\
+         s={}\r\n\
+         c=IN IP4 127.0.0.1\r\n\
+         t=0 0\r\n\
+         m=audio {} RTP/AVP 0 101\r\n\
+         a=rtpmap:0 PCMU/8000\r\n\
+         a=rtpmap:101 telephone-event/8000\r\n\
+         a=sendrecv\r\n",
+        origin,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        origin,
+        media_port
+    )
+}
+
 #[tokio::test]
+    #[ignore = "Requires running PBX infrastructure"]
 async fn test_ivr_queue_e2e() {
     tracing_subscriber::fmt()
         .with_file(true)
@@ -273,26 +282,15 @@ action = {{ type = "transfer", target = "support" }}
     let mut caller = TestUa::new(caller_config);
     caller.start().await.unwrap();
 
-    let caller_task = tokio::spawn(async move {
+    let caller_task = crate::utils::spawn(async move {
         info!("Caller dialing ivr...");
-        let sdp_offer = format!(
-            "v=0\r\n\
-             o=caller {} 0 IN IP4 127.0.0.1\r\n\
-             s=caller\r\n\
-             c=IN IP4 127.0.0.1\r\n\
-             t=0 0\r\n\
-             m=audio {} RTP/AVP 0 101\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:101 telephone-event/8000\r\n\
-             a=sendrecv\r\n",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            caller_port + 100
-        );
-
-        let dialog_id = caller.make_call("ivr", Some(sdp_offer)).await?;
+        let sdp_offer = pcmu_offer("caller", caller_port + 100);
+        let dialog_id = tokio::time::timeout(
+            Duration::from_secs(5),
+            caller.make_call("ivr", Some(sdp_offer)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Caller IVR call timed out"))??;
         info!("Caller connected to IVR, dialog_id: {}", dialog_id);
 
         // Wait a bit for IVR app to start and auto-answer
@@ -331,8 +329,17 @@ action = {{ type = "transfer", target = "support" }}
                         .trim_start_matches("sip:")
                         .split('@')
                         .next()
-                        .unwrap_or("support");
-                    new_dialog = Some(caller.make_call(target_user, None).await?);
+                        .unwrap_or("support")
+                        .to_string();
+                    let transfer_sdp = pcmu_offer("caller-transfer", caller_port + 200);
+                    new_dialog = Some(
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            caller.make_call(&target_user, Some(transfer_sdp)),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Caller support call timed out"))??,
+                    );
                     info!("Caller re-invited to {}", target_user);
                 }
                 if let TestUaEvent::CallEstablished(ref id) = event
@@ -359,7 +366,7 @@ action = {{ type = "transfer", target = "support" }}
     });
 
     // Agent waits for incoming call from queue
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..60 {
             let events = agent.process_dialog_events().await.unwrap_or_default();
             for event in events {

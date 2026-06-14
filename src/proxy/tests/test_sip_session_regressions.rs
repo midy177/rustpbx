@@ -51,6 +51,9 @@ impl AlreadyRunningThenOkRuntime {
 
 #[async_trait]
 impl AppRuntime for AlreadyRunningThenOkRuntime {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn start_app(
         &self,
         app_name: &str,
@@ -116,6 +119,9 @@ impl StartOnlyRuntime {
 
 #[async_trait]
 impl AppRuntime for AlwaysFailStartRuntime {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn start_app(
         &self,
         app_name: &str,
@@ -156,6 +162,9 @@ impl AppRuntime for AlwaysFailStartRuntime {
 
 #[async_trait]
 impl AppRuntime for StartOnlyRuntime {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn start_app(
         &self,
         _app_name: &str,
@@ -231,7 +240,8 @@ async fn build_session_on_server(
         original_caller: "sip:alice@rustpbx.com".to_string(),
         original_callee: "sip:ivr@rustpbx.com".to_string(),
         max_forwards: 70,
-        dtmf_digits: Vec::new(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        metadata: None,
     };
 
     let caller_peer = Arc::new(MockMediaPeer::new());
@@ -460,9 +470,11 @@ async fn test_queue_transfer_without_return_ivr_keeps_hangup_fallback_when_no_ag
     );
     let config = make_queue_hangup_config("support");
     let mut session = build_session_with_config(dialplan, config).await;
+    let (callee_tx, mut callee_rx) = mpsc::unbounded_channel();
+    session.callee_event_tx = Some(callee_tx);
 
     let err = session
-        .handle_queue_transfer(LegId::from("caller"), "support", None)
+        .handle_queue_transfer(LegId::from("caller"), "support", None, Vec::new(), &mut callee_rx)
         .await
         .expect_err("without return_ivr, hangup fallback should surface failure");
     assert!(
@@ -481,12 +493,20 @@ async fn test_queue_transfer_return_ivr_overrides_hangup_fallback_when_no_agents
     );
     let config = make_queue_hangup_config("support");
     let mut session = build_session_with_config(dialplan, config).await;
+    let (callee_tx, mut callee_rx) = mpsc::unbounded_channel();
+    session.callee_event_tx = Some(callee_tx);
 
     let runtime = Arc::new(StartOnlyRuntime::new());
     session.app_runtime = runtime.clone();
 
     session
-        .handle_queue_transfer(LegId::from("caller"), "support", Some("hello".to_string()))
+        .handle_queue_transfer(
+            LegId::from("caller"),
+            "support",
+            Some("hello".to_string()),
+            Vec::new(),
+            &mut callee_rx,
+        )
         .await
         .expect("return_ivr should override hangup fallback and start IVR");
 

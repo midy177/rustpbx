@@ -77,7 +77,9 @@ pub fn call_command_to_session_action(cmd: CallCommand) -> Result<SessionAction>
         } => {
             let (rb, passthrough) = match ringback {
                 Some(RingbackPolicy::PassThrough) => (None, true),
-                Some(RingbackPolicy::Replace { source }) => {
+                Some(
+                    RingbackPolicy::Replace { source } | RingbackPolicy::EarlyMedia { source },
+                ) => {
                     let path = match source {
                         MediaSource::File { path } => path,
                         _ => String::new(),
@@ -244,6 +246,11 @@ pub fn call_command_to_session_action(cmd: CallCommand) -> Result<SessionAction>
         | CallCommand::ConferenceMute { .. }
         | CallCommand::ConferenceUnmute { .. }
         | CallCommand::ConferenceDestroy { .. }
+        | CallCommand::ConferenceEnd { .. }
+        | CallCommand::ConferenceKick { .. }
+        | CallCommand::ConferenceMuteAll { .. }
+        | CallCommand::ConferenceInfo { .. }
+        | CallCommand::ConferenceList
         | CallCommand::JoinMixer { .. }
         | CallCommand::LeaveMixer => {
             Err(AdapterError::NotSupported("conference commands".to_string()).into())

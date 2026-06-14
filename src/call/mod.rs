@@ -1,5 +1,5 @@
 use crate::{
-    config::{MediaProxyMode, RouteResult},
+    config::{MediaProxyMode, RecordingPolicy, RouteResult},
     media::recorder::RecorderOption,
     proxy::routing::VideoPolicy,
 };
@@ -93,6 +93,14 @@ pub struct VoicePrompts {
     pub off_hours_prompt: Option<String>,
     #[serde(default)]
     pub no_answer_prompt: Option<String>,
+    /// Audio file to play for queue-position announcement.
+    /// The file should contain a pre-recorded message such as
+    /// "You are number N in the queue" that the operator supplies.
+    #[serde(default)]
+    pub position_prompt: Option<String>,
+    /// Audio file to play for estimated-wait-time announcement.
+    #[serde(default)]
+    pub wait_time_prompt: Option<String>,
 }
 
 impl VoicePrompts {
@@ -102,6 +110,8 @@ impl VoicePrompts {
             busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_ZH.to_string()),
             off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH.to_string()),
             no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH.to_string()),
+            position_prompt: None,
+            wait_time_prompt: None,
         }
     }
 
@@ -111,6 +121,8 @@ impl VoicePrompts {
             busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_EN.to_string()),
             off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN.to_string()),
             no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN.to_string()),
+            position_prompt: None,
+            wait_time_prompt: None,
         }
     }
 }
@@ -620,6 +632,9 @@ pub struct CallRecordingConfig {
     pub option: Option<RecorderOption>,
     /// Auto start recording when call is answered
     pub auto_start: bool,
+    /// When true, use the legacy WAV file recorder instead of SipFlow for
+    /// media capture. SipFlow captures SIP signalling only.
+    pub force_file: bool,
 }
 
 impl CallRecordingConfig {
@@ -628,6 +643,7 @@ impl CallRecordingConfig {
             enabled: false,
             option: None,
             auto_start: true,
+            force_file: false,
         }
     }
 
@@ -785,12 +801,16 @@ pub struct Dialplan {
     // Enhanced call control options
     /// Recording configuration
     pub recording: CallRecordingConfig,
+    /// Optional route/trunk-specific recording policy override.
+    pub recording_policy: Option<RecordingPolicy>,
     /// Ringback configuration
     pub ringback: RingbackConfig,
     /// Media configuration
     pub media: MediaConfig,
     /// Maximum call duration
     pub max_call_duration: Option<Duration>,
+    /// RTP timeout per direction (None = use proxy default)
+    pub rtp_timeout: Option<Duration>,
     /// What to do when a call fails
     pub failure_action: FailureAction,
     /// Enable SIP flow recording (SIP message logging)
@@ -807,6 +827,14 @@ pub struct Dialplan {
     pub extensions: http::Extensions,
     pub allow_codecs: Vec<CodecType>,
     pub passthrough_failure: bool,
+
+    /// Optional per-trunk ringback/early-media audio configuration
+    pub audio_profile: Option<crate::proxy::routing::RingbackAudio>,
+
+    /// Headers modified/added by routing (rewrite rules, trunk config, HTTP router).
+    /// When present, these take priority over the original SIP request headers
+    /// when building CallInfo for application flows (IVR, voicemail, etc.).
+    pub routed_headers: Option<Vec<rsipstack::sip::Header>>,
 }
 
 impl std::fmt::Debug for Dialplan {
@@ -820,6 +848,7 @@ impl std::fmt::Debug for Dialplan {
             .field("recording", &self.recording)
             .field("media", &self.media)
             .field("max_call_duration", &self.max_call_duration)
+            .field("rtp_timeout", &self.rtp_timeout)
             .field("enable_sipflow", &self.enable_sipflow)
             .finish()
     }
@@ -850,9 +879,11 @@ impl Dialplan {
             flow: DialplanFlow::Targets(DialStrategy::Sequential(vec![])),
             max_ring_time: Duration::from_secs(60), // 60 seconds for ringback
             recording: CallRecordingConfig::default(),
+            recording_policy: None,
             ringback: RingbackConfig::default(),
             media: MediaConfig::default(),
             max_call_duration: Some(Duration::from_secs(3600)), // 1 hour
+            rtp_timeout: None,
             failure_action: FailureAction::default(),
             enable_sipflow: true, // Enable SIP flow recording by default
             call_forwarding: None,
@@ -860,16 +891,10 @@ impl Dialplan {
             route_invite: None,
             with_original_headers: true,
             extensions: http::Extensions::new(),
-            allow_codecs: vec![
-                CodecType::G729,
-                CodecType::G722,
-                CodecType::PCMU,
-                CodecType::PCMA,
-                #[cfg(feature = "opus")]
-                CodecType::Opus,
-                CodecType::TelephoneEvent,
-            ],
+            allow_codecs: vec![],
             passthrough_failure: false,
+            audio_profile: None,
+            routed_headers: None,
         }
     }
 
@@ -923,6 +948,12 @@ impl Dialplan {
         self
     }
 
+    /// Set RTP timeout per direction
+    pub fn with_rtp_timeout(mut self, timeout: Duration) -> Self {
+        self.rtp_timeout = Some(timeout);
+        self
+    }
+
     /// Set max ring time
     pub fn with_max_ring_time(mut self, duration: Duration) -> Self {
         self.max_ring_time = duration;
@@ -940,6 +971,11 @@ impl Dialplan {
 
     pub fn with_passthrough_failure(mut self, enabled: bool) -> Self {
         self.passthrough_failure = enabled;
+        self
+    }
+
+    pub fn with_audio_profile(mut self, profile: crate::proxy::routing::RingbackAudio) -> Self {
+        self.audio_profile = Some(profile);
         self
     }
 

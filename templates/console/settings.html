@@ -347,11 +347,52 @@
                             </div>
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{
-                                "settings_page.external_ip" | t }}</label>
-                            <input type="text" x-model="platformDraft.external_ip" :disabled="platformProcessing"
-                                class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder="1.2.3.4" />
+                            <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{ "settings_page.external_ip" | t }}</label>
+                            <div class="mt-1 flex gap-2">
+                                <label class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition"
+                                    :class="platformDraft.external_ip_mode === 'none' ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'">
+                                    <input type="radio" name="ext_ip_mode" value="none" class="sr-only"
+                                        x-model="platformDraft.external_ip_mode">
+                                    None
+                                </label>
+                                <label class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition"
+                                    :class="platformDraft.external_ip_mode === 'manual' ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'">
+                                    <input type="radio" name="ext_ip_mode" value="manual" class="sr-only"
+                                        x-model="platformDraft.external_ip_mode">
+                                    Manual
+                                </label>
+                                <label class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition"
+                                    :class="platformDraft.external_ip_mode === 'auto' ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'">
+                                    <input type="radio" name="ext_ip_mode" value="auto" class="sr-only"
+                                        x-model="platformDraft.external_ip_mode">
+                                    Auto
+                                </label>
+                            </div>
+                            <div x-show="platformDraft.external_ip_mode === 'manual'">
+                                <input type="text" x-model="platformDraft.external_ip" :disabled="platformProcessing"
+                                    class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    placeholder="1.2.3.4" />
+                            </div>
+                            <div x-show="platformDraft.external_ip_mode === 'auto'">
+                                <div class="mt-1 flex gap-2">
+                                    <input type="text" x-model="platformDraft.auto_external_ip" :disabled="platformProcessing || platformDraft.auto_external_ip_testing"
+                                        class="flex-1 rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="http://ifconfig.me" />
+                                    <button type="button" @click="testAutoExternalIp"
+                                        :disabled="platformProcessing || platformDraft.auto_external_ip_testing"
+                                        class="inline-flex items-center gap-1.5 rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <svg x-show="!platformDraft.auto_external_ip_testing" class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"/>
+                                        </svg>
+                                        <svg x-show="platformDraft.auto_external_ip_testing" class="h-4 w-4 animate-spin" viewBox="0 0 20 20" fill="none">
+                                            <circle class="opacity-25" cx="10" cy="10" r="8" stroke="currentColor" stroke-width="3"/>
+                                            <path class="opacity-75" fill="currentColor" d="M10 2a8 8 0 018 8h-2a6 6 0 00-6-6V2z"/>
+                                        </svg>
+                                        <span>REFRESH</span>
+                                    </button>
+                                </div>
+                                <p x-show="platformDraft.auto_external_ip_result" class="mt-1 text-xs" :class="platformDraft.auto_external_ip_result?.startsWith('✓') ? 'text-green-600' : 'text-red-500'" x-text="platformDraft.auto_external_ip_result"></p>
+                            </div>
                         </div>
                         <div class="grid gap-4 sm:grid-cols-2">
                             <div>
@@ -580,6 +621,58 @@
                             <div class="flex justify-start">
                                 <button type="button" @click="testLocatorWebhook"
                                     :disabled="proxyProcessing || !proxyDraft.locator_webhook.url"
+                                    class="inline-flex items-center gap-2 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
+                                    <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                        stroke-width="1.6">
+                                        <path stroke-linecap="round" stroke-linejoin="round"
+                                            d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                                        <path stroke-linecap="round" stroke-linejoin="round"
+                                            d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                    </svg>
+                                    Test webhook
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- RWI Webhook -->
+                        <div class="space-y-4">
+                            <div>
+                                <h3 class="text-sm font-semibold text-slate-900">RWI Webhook</h3>
+                                <p class="text-xs text-slate-500">Forward RWI events (call lifecycle, recording, queue, agent, conference, etc.) to an HTTP endpoint as JSON.</p>
+                            </div>
+                            <div class="grid gap-4 md:grid-cols-2">
+                                <div class="md:col-span-1">
+                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Webhook URL</label>
+                                    <input type="url" x-model="proxyDraft.rwi_webhook.url"
+                                        :disabled="proxyProcessing"
+                                        class="mt-1 block w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="https://api.example.com/rwi-events">
+                                </div>
+                                <div class="md:col-span-1">
+                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Timeout (ms)</label>
+                                    <input type="number" x-model="proxyDraft.rwi_webhook.timeout_ms"
+                                        :disabled="proxyProcessing"
+                                        class="mt-1 block w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="5000">
+                                </div>
+                                <div class="md:col-span-2">
+                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Custom Headers</label>
+                                    <textarea x-model="proxyDraft.rwi_webhook.headers" :disabled="proxyProcessing"
+                                        rows="2"
+                                        class="mt-1 block w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="X-API-Key: secret-key"></textarea>
+                                </div>
+                                <div class="md:col-span-2">
+                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Event Filter (optional, one per line)</label>
+                                    <textarea x-model="proxyDraft.rwi_webhook.events" :disabled="proxyProcessing"
+                                        rows="2"
+                                        class="mt-1 block w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="call_ringing&#10;call_hangup&#10;agent_state_changed"></textarea>
+                                </div>
+                            </div>
+                            <div class="flex justify-start">
+                                <button type="button" @click="testRwiWebhook"
+                                    :disabled="proxyProcessing || !proxyDraft.rwi_webhook.url"
                                     class="inline-flex items-center gap-2 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
                                     <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
                                         stroke-width="1.6">
@@ -979,6 +1072,7 @@
                         <div>
                             <p class="font-semibold">{{ "settings_page.better_io_performance" | t }}</p>
                             <p class="mt-1">{{ "settings_page.concurrent_calls_support" | t }}</p>
+                            <p class="mt-1">When Recording policy is also enabled, SipFlow takes over media capture and upload — no local .wav file is written.</p>
                         </div>
                     </div>
                 </div>
@@ -1046,28 +1140,52 @@
                         <!-- Remote Backend Config -->
                         <div x-show="sipflowDraft.backend_type === 'remote'"
                             class="space-y-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
-                            <div class="grid gap-4 md:grid-cols-2">
-                                <div>
+                            <div>
+                                <div class="flex items-center justify-between">
                                     <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{
-                                        "settings_page.udp_address" | t }}</label>
-                                    <input type="text" x-model="sipflowDraft.remote_udp_addr"
+                                        "settings_page.sipflow_nodes" | t }}</label>
+                                    <button type="button" @click="sipflowDraft.remote_nodes.push({ udp: '', http: '' })"
                                         :disabled="sipflowProcessing"
-                                        class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                        placeholder="192.168.1.100:3000">
-                                    <p class="mt-1 text-xs text-slate-500">{{ "settings_page.udp_address_hint" | t }}
-                                    </p>
+                                        class="inline-flex items-center gap-1 rounded-md bg-white px-2 py-1 text-xs font-medium text-sky-600 shadow-sm ring-1 ring-sky-200 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50">
+                                        <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M12 4v16m8-8H4" />
+                                        </svg>
+                                        {{ "settings_page.sipflow_add_node" | t }}
+                                    </button>
                                 </div>
-                                <div>
-                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{
-                                        "settings_page.http_address" | t }}</label>
-                                    <input type="text" x-model="sipflowDraft.remote_http_addr"
-                                        :disabled="sipflowProcessing"
-                                        class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                        placeholder="http://192.168.1.100:3001">
-                                    <p class="mt-1 text-xs text-slate-500">{{ "settings_page.http_address_hint" | t }}
-                                    </p>
-                                </div>
+                                <p class="mt-1 text-xs text-slate-500">{{ "settings_page.udp_address_hint" | t }}</p>
                             </div>
+                            <template x-for="(node, idx) in sipflowDraft.remote_nodes" :key="idx">
+                                <div class="flex items-start gap-2 rounded-md border border-slate-200 bg-white p-3">
+                                    <div class="flex-1 space-y-2">
+                                        <div class="grid gap-2 md:grid-cols-2">
+                                            <div>
+                                                <label class="block text-xs font-medium text-slate-500">{{
+                                                    "settings_page.udp_address" | t }}</label>
+                                                <input type="text" x-model="node.udp" :disabled="sipflowProcessing"
+                                                    class="mt-0.5 w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                                    placeholder="192.168.1.100:3000">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-slate-500">{{
+                                                    "settings_page.http_address" | t }}</label>
+                                                <input type="text" x-model="node.http" :disabled="sipflowProcessing"
+                                                    class="mt-0.5 w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                                    placeholder="http://192.168.1.100:3001">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <button type="button" @click="sipflowDraft.remote_nodes.splice(idx, 1)"
+                                        :disabled="sipflowProcessing || sipflowDraft.remote_nodes.length <= 1"
+                                        class="mt-5 inline-flex flex-none items-center justify-center rounded-md border border-red-200 bg-white px-2 py-1.5 text-xs font-medium text-red-500 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40">
+                                        <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                        </svg>
+                                    </button>
+                                </div>
+                            </template>
                             <div>
                                 <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{
                                     "settings_page.timeout_label" | t }}</label>
@@ -1110,6 +1228,14 @@
                         <h2 class="text-base font-semibold text-slate-900">{{ "settings_page.recording_policy" | t }}
                         </h2>
                         <p class="text-xs text-slate-500">{{ "settings_page.recording_policy_desc" | t }}</p>
+                        <template x-if="sipflowSettings?.backend_type !== 'none'">
+                            <div class="mt-2 rounded-md bg-sky-50 px-3 py-2 text-xs text-sky-700">
+                                SipFlow backend is active. Enable <strong>Force file recorder</strong>
+                                below to record audio to WAV files via the legacy recorder while
+                                SipFlow captures SIP signalling only. Otherwise, SipFlow handles both
+                                media capture and signalling.
+                            </div>
+                        </template>
                     </div>
                 </div>
                 <form class="mt-4 space-y-4" @submit.prevent="saveStorageSettings">
@@ -1135,34 +1261,43 @@
                                     x-model="storageDraft.recording_auto_start" :disabled="storageProcessing">
                                 <span>{{ "settings_page.auto_start" | t }}</span>
                             </label>
-                            <div>
-                                <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{
-                                    "settings_page.directions" | t }}</span>
-                                <div class="mt-2 grid gap-2 sm:grid-cols-3">
-                                    <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
-                                        <input type="checkbox"
-                                            class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                                            x-model="storageDraft.recording_direction_inbound"
-                                            :disabled="storageProcessing">
-                                        <span>{{ "settings_page.inbound" | t }}</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
-                                        <input type="checkbox"
-                                            class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                                            x-model="storageDraft.recording_direction_outbound"
-                                            :disabled="storageProcessing">
-                                        <span>{{ "settings_page.outbound" | t }}</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
-                                        <input type="checkbox"
-                                            class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                                            x-model="storageDraft.recording_direction_internal"
-                                            :disabled="storageProcessing">
-                                        <span>{{ "settings_page.internal" | t }}</span>
-                                    </label>
-                                </div>
-                                <p class="mt-1 text-[11px] text-slate-400">{{ "settings_page.directions_desc" | t }}</p>
+                            <label class="flex items-center gap-2 text-sm font-semibold text-slate-600">
+                                <input type="checkbox"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                    x-model="storageDraft.recording_force_file" :disabled="storageProcessing">
+                                <span>Force file recorder</span>
+                                <template x-if="sipflowSettings?.backend_type !== 'none'">
+                                    <span class="text-[11px] text-slate-400">(WAV file for media, SipFlow for signalling only)</span>
+                                </template>
+                            </label>
+                        </div>
+                        <div>
+                            <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{
+                                "settings_page.directions" | t }}</span>
+                            <div class="mt-2 grid gap-2 sm:grid-cols-3">
+                                <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
+                                    <input type="checkbox"
+                                        class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                        x-model="storageDraft.recording_direction_inbound"
+                                        :disabled="storageProcessing">
+                                    <span>{{ "settings_page.inbound" | t }}</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
+                                    <input type="checkbox"
+                                        class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                        x-model="storageDraft.recording_direction_outbound"
+                                        :disabled="storageProcessing">
+                                    <span>{{ "settings_page.outbound" | t }}</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs font-semibold text-slate-600">
+                                    <input type="checkbox"
+                                        class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                        x-model="storageDraft.recording_direction_internal"
+                                        :disabled="storageProcessing">
+                                    <span>{{ "settings_page.internal" | t }}</span>
+                                </label>
                             </div>
+                            <p class="mt-1 text-[11px] text-slate-400">{{ "settings_page.directions_desc" | t }}</p>
                         </div>
                         <div class="grid gap-4 md:grid-cols-2">
                             <div>
@@ -1500,6 +1635,38 @@
                                         <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Scan block duration (seconds)</label>
                                         <input type="number" min="0" x-model.number="securityDraft.dos_scan_block_duration_secs" :disabled="securityProcessing"
                                             class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <hr class="border-slate-200">
+
+                            <div>
+                                <h3 class="text-sm font-semibold text-slate-800 mb-3">Channel Capacities (restart required)</h3>
+                                <div class="grid gap-3 sm:grid-cols-2">
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Session cmd channel</label>
+                                        <input type="number" min="64" x-model.number="securityDraft.session_cmd_channel_capacity" :disabled="securityProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                        <p class="mt-0.5 text-xs text-slate-400">SipSession command channel (per-session, default 256)</p>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Session state channel</label>
+                                        <input type="number" min="64" x-model.number="securityDraft.session_state_channel_capacity" :disabled="securityProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                        <p class="mt-0.5 text-xs text-slate-400">SipSession state channel (per-session, default 256)</p>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Media engine cmd channel</label>
+                                        <input type="number" min="128" x-model.number="securityDraft.media_cmd_channel_capacity" :disabled="securityProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                        <p class="mt-0.5 text-xs text-slate-400">MediaEngine command channel (global, default 512)</p>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Media engine event channel</label>
+                                        <input type="number" min="128" x-model.number="securityDraft.media_event_channel_capacity" :disabled="securityProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                        <p class="mt-0.5 text-xs text-slate-400">MediaEngine event broadcast channel (global, default 1024)</p>
                                     </div>
                                 </div>
                             </div>
@@ -1965,13 +2132,27 @@
                     </div>
                     <template x-if="clusterReloadResults.length">
                         <div class="mt-4 space-y-2 border-t border-slate-200 pt-4">
+                            <template x-if="clusterReloadDone">
+                                <div class="mb-3 rounded-lg border-2 px-4 py-3 text-sm font-semibold"
+                                    :class="clusterReloadOverall === 'ok' ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-rose-300 bg-rose-50 text-rose-800'">
+                                    <div class="flex items-center justify-between">
+                                        <span x-text="clusterReloadOverall === 'ok' ? '✅ All nodes succeeded' : '❌ Some nodes failed'"></span>
+                                        <span class="rounded-full px-3 py-1 text-xs font-bold"
+                                            :class="clusterReloadOverall === 'ok' ? 'bg-emerald-200 text-emerald-800' : 'bg-rose-200 text-rose-800'"
+                                            x-text="clusterReloadOverall"></span>
+                                    </div>
+                                </div>
+                            </template>
                             <template x-for="result in clusterReloadResults" :key="(result.addon || 'node') + '-' + result.node">
                                 <div class="rounded-lg border px-4 py-2 text-sm"
-                                    :class="result.status === 'ok' ? 'border-emerald-200 bg-emerald-50' : (result.status === 'skipped' ? 'border-slate-200 bg-slate-50' : 'border-rose-200 bg-rose-50')">
+                                    :class="result.status === 'ok' ? 'border-emerald-200 bg-emerald-50' : (result.status === 'running' ? 'border-sky-200 bg-sky-50' : (result.status === 'skipped' ? 'border-slate-200 bg-slate-50' : 'border-rose-200 bg-rose-50'))">
                                     <div class="flex items-center justify-between">
-                                        <span class="font-semibold text-slate-700" x-text="(result.addon || result.node)"></span>
+                                        <span class="font-semibold text-slate-700">
+                                            <span x-text="(result.addon || result.node)"></span>
+                                            <span x-show="result.addon === null && result.elapsed_ms != null" class="ml-2 text-xs font-normal text-slate-400" x-text="'(' + result.elapsed_ms + 'ms)'"></span>
+                                        </span>
                                         <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold"
-                                            :class="result.status === 'ok' ? 'bg-emerald-100 text-emerald-700' : (result.status === 'skipped' ? 'bg-slate-200 text-slate-600' : 'bg-rose-100 text-rose-700')"
+                                            :class="result.status === 'ok' ? 'bg-emerald-100 text-emerald-700' : (result.status === 'running' ? 'bg-sky-100 text-sky-700' : (result.status === 'skipped' ? 'bg-slate-200 text-slate-600' : 'bg-rose-100 text-rose-700'))"
                                             x-text="result.status"></span>
                                     </div>
                                     <div x-show="result.message" class="mt-1 text-xs text-slate-500" x-text="result.message"></div>
@@ -2678,6 +2859,7 @@
     document.addEventListener('alpine:init', () => {
         Alpine.data('settingsConsole', (options = {}) => ({
             basePath: options?.basePath || '/console',
+            apiBase: '{{ api_prefix | safe }}',
             rawSettings: options?.settings || {},
             amiEndpoint: options?.amiEndpoint || (options?.ami_path || '/ami/v1'),
             currentUser: options?.currentUser || null,
@@ -2716,6 +2898,10 @@
                 log_level: '',
                 log_file: '',
                 external_ip: '',
+                auto_external_ip: '',
+                external_ip_mode: 'none',
+                auto_external_ip_testing: false,
+                auto_external_ip_result: '',
                 rtp_start_port: '',
                 rtp_end_port: '',
             },
@@ -2726,6 +2912,12 @@
                     url: '',
                     timeout_ms: '',
                     headers: '',
+                },
+                rwi_webhook: {
+                    url: '',
+                    timeout_ms: '',
+                    headers: '',
+                    events: '',
                 },
                 http_router: {
                     url: '',
@@ -2743,6 +2935,7 @@
                 callrecord_root: '',
                 recording_enabled: false,
                 recording_auto_start: true,
+                recording_force_file: false,
                 recording_direction_inbound: true,
                 recording_direction_outbound: true,
                 recording_direction_internal: true,
@@ -2762,8 +2955,7 @@
                 local_root: '',
                 local_flush_count: 1000,
                 local_flush_interval_secs: 5,
-                remote_udp_addr: '',
-                remote_http_addr: '',
+                remote_nodes: [{ udp: '', http: '' }],
                 remote_timeout_secs: 10,
             },
             sipflowProcessing: false,
@@ -2780,6 +2972,10 @@
                 emergency_enabled: false,
                 emergency_numbers: '',
                 emergency_trunk: '',
+                session_cmd_channel_capacity: 256,
+                session_state_channel_capacity: 256,
+                media_cmd_channel_capacity: 512,
+                media_event_channel_capacity: 1024,
             },
             securityProcessing: false,
             aclReloading: false,
@@ -2825,6 +3021,8 @@
             clusterReloadDraft: { trunks: true, routes: true },
             clusterReloading: false,
             clusterReloadResults: [],
+            clusterReloadOverall: null,
+            clusterReloadDone: false,
             logViewer: {
                 lines: [],
                 limit: 200,
@@ -3235,7 +3433,7 @@
                 }
             },
             departmentEndpoint() {
-                return `${this.basePath}/settings/departments`;
+                return `${this.apiBase}/settings/departments`;
             },
             departmentDetailEndpoint(id) {
                 return `${this.departmentEndpoint()}/${id}`;
@@ -3595,7 +3793,7 @@
                 }
             },
             userEndpoint() {
-                return `${this.basePath}/settings/users`;
+                return `${this.apiBase}/settings/users`;
             },
             userDetailEndpoint(id) {
                 return `${this.userEndpoint()}/${id}`;
@@ -3741,7 +3939,7 @@
             },
             async fetchAvailableRoles() {
                 try {
-                    const resp = await fetch(this.basePath + '/settings/roles');
+                    const resp = await fetch(this.apiBase + '/settings/roles');
                     if (resp.ok) {
                         const data = await resp.json();
                         this.availableRoles = data.roles || data.items || data || [];
@@ -3755,7 +3953,7 @@
                 this.rolesLoading = true;
                 this.rolesError = null;
                 try {
-                    const r = await fetch(this.basePath + '/settings/roles');
+                    const r = await fetch(this.apiBase + '/settings/roles');
                     const d = await r.json();
                     this.roles = d.roles || d.items || d || [];
                 } catch (e) {
@@ -3773,7 +3971,7 @@
                 if (!this.newRoleName.trim()) return;
                 this.roleSaving = true;
                 try {
-                    const r = await fetch(this.basePath + '/settings/roles', {
+                    const r = await fetch(this.apiBase + '/settings/roles', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ name: this.newRoleName.trim(), description: this.newRoleDesc.trim() }),
@@ -3790,7 +3988,7 @@
             async deleteRole(id) {
                 if (!confirm('Delete this role?')) return;
                 try {
-                    const r = await fetch(this.basePath + '/settings/roles/' + id, { method: 'DELETE' });
+                    const r = await fetch(this.apiBase + '/settings/roles/' + id, { method: 'DELETE' });
                     if (!r.ok) { const d = await r.json(); throw new Error(d.error || 'Failed'); }
                     if (this.selectedRole && this.selectedRole.id === id) this.selectedRole = null;
                     await this.fetchRoles();
@@ -3800,7 +3998,7 @@
             },
             async selectRole(id) {
                 try {
-                    const r = await fetch(this.basePath + '/settings/roles/' + id);
+                    const r = await fetch(this.apiBase + '/settings/roles/' + id);
                     this.selectedRole = await r.json();
                 } catch (e) {
                     this.$dispatch('toast', { title: 'Error', message: e.message });
@@ -3826,7 +4024,7 @@
                 if (!this.selectedRole) return;
                 this.roleSaving = true;
                 try {
-                    const r = await fetch(this.basePath + '/settings/roles/' + this.selectedRole.id, {
+                    const r = await fetch(this.apiBase + '/settings/roles/' + this.selectedRole.id, {
                         method: 'PATCH',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -3897,7 +4095,7 @@
                 await this.fetchAvailableRoles();
                 // Load user roles
                 try {
-                    const resp = await fetch(this.basePath + '/settings/users/' + id + '/roles');
+                    const resp = await fetch(this.apiBase + '/settings/users/' + id + '/roles');
                     if (resp.ok) {
                         const roleData = await resp.json();
                         detail.role_ids = (roleData.roles || roleData || []).map(r => r.id);
@@ -3981,7 +4179,7 @@
                     // Save role assignments
                     if (userId && draft.role_ids) {
                         try {
-                            await fetch(this.basePath + '/settings/users/' + userId + '/roles', {
+                            await fetch(this.apiBase + '/settings/users/' + userId + '/roles', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ role_ids: draft.role_ids }),
@@ -4568,10 +4766,10 @@
                 return `${Math.round(value)}ms`;
             },
             logsRecentEndpoint() {
-                return `${this.basePath}/settings/logs/recent`;
+                return `${this.apiBase}/settings/logs/recent`;
             },
             logsStreamEndpoint() {
-                return `${this.basePath}/settings/logs/stream`;
+                return `${this.apiBase}/settings/logs/stream`;
             },
             ensureLogVisibleTail() {
                 this.$nextTick(() => {
@@ -4734,13 +4932,15 @@
                 const toStringOrEmpty = (value) => (value === undefined || value === null || value === ''
                     ? ''
                     : String(value));
-                this.platformDraft = {
-                    log_level: this.platform?.log_level || '',
-                    log_file: this.platform?.log_file || '',
-                    external_ip: rtp?.external_ip || '',
-                    rtp_start_port: toStringOrEmpty(rtp?.start_port),
-                    rtp_end_port: toStringOrEmpty(rtp?.end_port),
-                };
+                const manualIp = rtp?.external_ip || '';
+                const autoUrl = rtp?.auto_external_ip || '';
+                this.platformDraft.external_ip = manualIp;
+                this.platformDraft.auto_external_ip = autoUrl;
+                this.platformDraft.external_ip_mode = autoUrl ? 'auto' : (manualIp ? 'manual' : 'none');
+                this.platformDraft.auto_external_ip_testing = false;
+                this.platformDraft.auto_external_ip_result = '';
+                this.platformDraft.rtp_start_port = toStringOrEmpty(rtp?.start_port);
+                this.platformDraft.rtp_end_port = toStringOrEmpty(rtp?.end_port);
             },
             initProxyDraft() {
                 const proxy = this.proxyConfig || {};
@@ -4750,6 +4950,12 @@
                         url: proxy.locator_webhook?.url || '',
                         timeout_ms: proxy.locator_webhook?.timeout_ms || '',
                         headers: this.formatHeaders(proxy.locator_webhook?.headers),
+                    },
+                    rwi_webhook: {
+                        url: proxy.rwi_webhook?.url || '',
+                        timeout_ms: proxy.rwi_webhook?.timeout_ms || '',
+                        headers: this.formatHeaders(proxy.rwi_webhook?.headers),
+                        events: (proxy.rwi_webhook?.events || []).join('\n'),
                     },
                     http_router: {
                         url: proxy.http_router?.url || '',
@@ -4781,25 +4987,28 @@
                     user_backends: this.proxyDraft.user_backends,
                 };
 
-                if (this.proxyDraft.locator_webhook.url) {
-                    body.locator_webhook = {
-                        url: this.proxyDraft.locator_webhook.url,
-                        timeout_ms: this.normalizeOptionalNumber(this.proxyDraft.locator_webhook.timeout_ms),
-                        headers: this.parseHeaders(this.proxyDraft.locator_webhook.headers),
-                    };
-                }
+                body.locator_webhook = {
+                    url: this.proxyDraft.locator_webhook.url,
+                    timeout_ms: this.normalizeOptionalNumber(this.proxyDraft.locator_webhook.timeout_ms),
+                    headers: this.parseHeaders(this.proxyDraft.locator_webhook.headers),
+                };
 
-                if (this.proxyDraft.http_router.url) {
-                    body.http_router = {
-                        url: this.proxyDraft.http_router.url,
-                        timeout_ms: this.normalizeOptionalNumber(this.proxyDraft.http_router.timeout_ms),
-                        headers: this.parseHeaders(this.proxyDraft.http_router.headers),
-                    };
-                }
+                body.rwi_webhook = {
+                    url: this.proxyDraft.rwi_webhook.url,
+                    timeout_ms: this.normalizeOptionalNumber(this.proxyDraft.rwi_webhook.timeout_ms),
+                    headers: this.parseHeaders(this.proxyDraft.rwi_webhook.headers),
+                    events: this.listFromTextarea(this.proxyDraft.rwi_webhook.events),
+                };
+
+                body.http_router = {
+                    url: this.proxyDraft.http_router.url,
+                    timeout_ms: this.normalizeOptionalNumber(this.proxyDraft.http_router.timeout_ms),
+                    headers: this.parseHeaders(this.proxyDraft.http_router.headers),
+                };
 
                 this.proxyProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/proxy`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/proxy`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -4813,6 +5022,7 @@
                     this.proxyConfig.realms = body.realms;
                     this.proxyConfig.user_backends = body.user_backends;
                     this.proxyConfig.locator_webhook = body.locator_webhook;
+                    this.proxyConfig.rwi_webhook = body.rwi_webhook;
                     this.proxyConfig.http_router = body.http_router;
                     this.initProxyDraft();
                 } catch (err) {
@@ -4827,7 +5037,25 @@
                 if (!draft.url) return;
                 this.proxyProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/proxy/locator-webhook/test`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/proxy/locator-webhook/test`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: draft.url, headers: this.parseHeaders(draft.headers) }),
+                    });
+                    const data = await response.json();
+                    this.$dispatch('toast', { title: response.ok ? 'Success' : 'Failed', message: data.message });
+                } catch (err) {
+                    this.$dispatch('toast', { title: 'Test failed', message: err.message });
+                } finally {
+                    this.proxyProcessing = false;
+                }
+            },
+            async testRwiWebhook() {
+                const draft = this.proxyDraft.rwi_webhook;
+                if (!draft.url) return;
+                this.proxyProcessing = true;
+                try {
+                    const response = await fetch(`${this.apiBase}/settings/config/proxy/rwi-webhook/test`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ url: draft.url, headers: this.parseHeaders(draft.headers) }),
@@ -4845,7 +5073,7 @@
                 if (!draft.url) return;
                 this.proxyProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/proxy/http-router/test`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/proxy/http-router/test`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ url: draft.url, headers: this.parseHeaders(draft.headers) }),
@@ -4862,7 +5090,7 @@
                 const backend = this.proxyDraft.user_backends[index];
                 this.proxyProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/proxy/user-backend/test`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/proxy/user-backend/test`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ backend }),
@@ -4905,6 +5133,29 @@
                 }
                 return parsed;
             },
+            async testAutoExternalIp() {
+                if (this.platformDraft.auto_external_ip_testing) return;
+                this.platformDraft.auto_external_ip_testing = true;
+                this.platformDraft.auto_external_ip_result = '';
+                const url = this.platformDraft.auto_external_ip.trim() || null;
+                try {
+                    const response = await fetch(`${this.apiBase}/settings/config/platform/auto-external-ip/test`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok && data?.status === 'ok') {
+                        this.platformDraft.auto_external_ip_result = `✓ Detected: ${data.ip}`;
+                    } else {
+                        this.platformDraft.auto_external_ip_result = `✗ ${data?.message || 'Test failed'}`;
+                    }
+                } catch (e) {
+                    this.platformDraft.auto_external_ip_result = `✗ ${e.message || 'Request failed'}`;
+                } finally {
+                    this.platformDraft.auto_external_ip_testing = false;
+                }
+            },
             async savePlatformSettings() {
                 if (this.platformProcessing) {
                     return;
@@ -4935,13 +5186,18 @@
                 const body = {
                     log_level: this.normalizeOptionalString(this.platformDraft.log_level),
                     log_file: this.normalizeOptionalString(this.platformDraft.log_file),
-                    external_ip: this.normalizeOptionalString(this.platformDraft.external_ip),
+                    external_ip: this.platformDraft.external_ip_mode === 'manual'
+                        ? this.normalizeOptionalString(this.platformDraft.external_ip)
+                        : null,
+                    auto_external_ip: this.platformDraft.external_ip_mode === 'auto'
+                        ? this.normalizeOptionalString(this.platformDraft.auto_external_ip)
+                        : null,
                     rtp_start_port: startPortValue,
                     rtp_end_port: endPortValue,
                 };
                 this.platformProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/platform`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/platform`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -4960,6 +5216,7 @@
                         this.proxyConfig.rtp = {};
                     }
                     this.proxyConfig.rtp.external_ip = rtp.external_ip ?? null;
+                    this.proxyConfig.rtp.auto_external_ip = rtp.auto_external_ip ?? null;
                     this.proxyConfig.rtp.start_port = rtp.start_port ?? null;
                     this.proxyConfig.rtp.end_port = rtp.end_port ?? null;
                     this.initPlatformDraft();
@@ -5022,6 +5279,7 @@
                     callrecord_s3_keep_media_copy: !!crConfig?.keep_media_copy,
                     recording_enabled: !!recording?.enabled,
                     recording_auto_start: recording?.auto_start !== undefined ? !!recording.auto_start : true,
+                    recording_force_file: !!recording?.force_file,
                     recording_direction_inbound: directionInbound,
                     recording_direction_outbound: directionOutbound,
                     recording_direction_internal: directionInternal,
@@ -5079,6 +5337,7 @@
                 const recordingPayload = {
                     enabled: !!this.storageDraft.recording_enabled,
                     auto_start: !!this.storageDraft.recording_auto_start,
+                    force_file: !!this.storageDraft.recording_force_file,
                     caller_allow: this.listFromTextarea(this.storageDraft.recording_caller_allow),
                     caller_deny: this.listFromTextarea(this.storageDraft.recording_caller_deny),
                     callee_allow: this.listFromTextarea(this.storageDraft.recording_callee_allow),
@@ -5135,7 +5394,7 @@
                 };
                 this.storageProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/storage`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/storage`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -5174,7 +5433,7 @@
             },
             async fetchSipFlowSettings() {
                 try {
-                    const response = await fetch(`${this.basePath}/sipflow/settings`, {
+                    const response = await fetch(`${this.apiBase}/sipflow/settings`, {
                         method: 'GET',
                         headers: {
                             Accept: 'application/json',
@@ -5198,6 +5457,15 @@
                 const config = this.sipflowSettings.config || {};
                 const backendType = this.sipflowSettings.backend_type || 'none';
 
+                let remoteNodes = [{ udp: '', http: '' }];
+                if (backendType === 'remote') {
+                    if (Array.isArray(config.nodes) && config.nodes.length > 0) {
+                        remoteNodes = config.nodes.map(n => ({ udp: n.udp || '', http: n.http || '' }));
+                    } else if (config.udp_addr || config.http_addr) {
+                        remoteNodes = [{ udp: config.udp_addr || '', http: config.http_addr || '' }];
+                    }
+                }
+
                 this.sipflowDraft = {
                     backend_type: backendType,
                     // Local backend
@@ -5206,8 +5474,7 @@
                     local_flush_count: backendType === 'local' ? (config.flush_count || 1000) : 1000,
                     local_flush_interval_secs: backendType === 'local' ? (config.flush_interval_secs || 5) : 5,
                     // Remote backend
-                    remote_udp_addr: backendType === 'remote' ? (config.udp_addr || '') : '',
-                    remote_http_addr: backendType === 'remote' ? (config.http_addr || '') : '',
+                    remote_nodes: remoteNodes,
                     remote_timeout_secs: backendType === 'remote' ? (config.timeout_secs || 10) : 10,
                 };
             },
@@ -5238,9 +5505,10 @@
                         flush_interval_secs: this.sipflowDraft.local_flush_interval_secs || 5,
                     };
                 } else if (backendType === 'remote') {
-                    const udp_addr = (this.sipflowDraft.remote_udp_addr || '').trim();
-                    const http_addr = (this.sipflowDraft.remote_http_addr || '').trim();
-                    if (!udp_addr || !http_addr) {
+                    const nodes = (this.sipflowDraft.remote_nodes || [])
+                        .map(n => ({ udp: (n.udp || '').trim(), http: (n.http || '').trim() }))
+                        .filter(n => n.udp && n.http);
+                    if (nodes.length === 0) {
                         this.$dispatch('toast', {
                             title: this.tt('settings_page.missing_information'),
                             message: this.tt('settings_page.sipflow_remote_required'),
@@ -5248,8 +5516,7 @@
                         return;
                     }
                     config = {
-                        udp_addr,
-                        http_addr,
+                        nodes,
                         timeout_secs: this.sipflowDraft.remote_timeout_secs || 10,
                     };
                 }
@@ -5262,7 +5529,7 @@
 
                 this.sipflowProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/sipflow/settings`, {
+                    const response = await fetch(`${this.apiBase}/sipflow/settings`, {
                         method: 'PUT',
                         headers: {
                             Accept: 'application/json',
@@ -5332,7 +5599,7 @@
 
                 this.storageProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/storage/test`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/storage/test`, {
                         method: 'POST',
                         headers: {
                             Accept: 'application/json',
@@ -5385,6 +5652,10 @@
                 this.securityDraft.emergency_enabled = emg.enabled ?? false;
                 this.securityDraft.emergency_numbers = Array.isArray(emg.numbers) ? emg.numbers.join(', ') : '';
                 this.securityDraft.emergency_trunk = emg.emergency_trunk || '';
+                this.securityDraft.session_cmd_channel_capacity = p.session_cmd_channel_capacity ?? 256;
+                this.securityDraft.session_state_channel_capacity = p.session_state_channel_capacity ?? 256;
+                this.securityDraft.media_cmd_channel_capacity = p.media_cmd_channel_capacity ?? 512;
+                this.securityDraft.media_event_channel_capacity = p.media_event_channel_capacity ?? 1024;
             },
             resetSecurityDraft() {
                 this.initSecurityDraft();
@@ -5400,6 +5671,10 @@
                     dos_max_concurrent_per_ip: Number(this.securityDraft.dos_max_concurrent_per_ip),
                     dos_scan_probe_threshold: Number(this.securityDraft.dos_scan_probe_threshold),
                     dos_scan_block_duration_secs: Number(this.securityDraft.dos_scan_block_duration_secs),
+                    session_cmd_channel_capacity: Number(this.securityDraft.session_cmd_channel_capacity),
+                    session_state_channel_capacity: Number(this.securityDraft.session_state_channel_capacity),
+                    media_cmd_channel_capacity: Number(this.securityDraft.media_cmd_channel_capacity),
+                    media_event_channel_capacity: Number(this.securityDraft.media_event_channel_capacity),
                     uri_max_length: Number(this.securityDraft.uri_max_length),
                     uri_reject_malformed: this.securityDraft.uri_reject_malformed,
                     emergency: {
@@ -5410,7 +5685,7 @@
                 };
                 this.securityProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/security`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/security`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -5487,7 +5762,7 @@
                 };
                 this.rwiProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/rwi`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/rwi`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -5533,7 +5808,7 @@
             },
             async fetchReloadAddons() {
                 try {
-                    const resp = await fetch(`${this.basePath}/settings/config/cluster/reload-addons`);
+                    const resp = await fetch(`${this.apiBase}/settings/config/cluster/reload-addons`);
                     const data = await resp.json();
                     this.reloadAddonList = data.addons || [];
                     // Auto-check all by default
@@ -5568,7 +5843,7 @@
                 };
                 this.clusterProcessing = true;
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/cluster`, {
+                    const response = await fetch(`${this.apiBase}/settings/config/cluster`, {
                         method: 'PATCH',
                         headers: {
                             Accept: 'application/json',
@@ -5643,6 +5918,8 @@
                 }
                 this.clusterReloading = true;
                 this.clusterReloadResults = [];
+                this.clusterReloadOverall = null;
+                this.clusterReloadDone = false;
 
                 const params = new URLSearchParams();
                 if (trunkSelected) params.set('trunks', 'true');
@@ -5650,7 +5927,7 @@
                 for (const id of addonIds) params.append('addons', id);
 
                 try {
-                    const response = await fetch(`${this.basePath}/settings/config/cluster/reload?${params.toString()}`);
+                    const response = await fetch(`${this.apiBase}/settings/config/cluster/reload?${params.toString()}`);
                     if (!response.ok) throw new Error('Failed to connect');
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
@@ -5692,9 +5969,12 @@
                     const existing = this.clusterReloadResults.find(r => r.addon === null && r.node === data.node);
                     const nodeStatus = t === 'node_complete' ? (data.result?.status || 'ok') : 'error';
                     const nodeMsg = data.error || '';
-                    if (existing) Object.assign(existing, { status: nodeStatus, result: data.result, message: nodeMsg });
-                    else this.clusterReloadResults.push({ addon: null, node: data.node, status: nodeStatus, result: data.result, message: nodeMsg });
+                    const elapsed_ms = data.elapsed_ms;
+                    if (existing) Object.assign(existing, { status: nodeStatus, result: data.result, message: nodeMsg, elapsed_ms });
+                    else this.clusterReloadResults.push({ addon: null, node: data.node, status: nodeStatus, result: data.result, message: nodeMsg, elapsed_ms });
                 } else if (t === 'complete') {
+                    this.clusterReloadOverall = data.overall_status || 'ok';
+                    this.clusterReloadDone = true;
                     this.$dispatch('toast', { title: 'Reload complete', message: 'All selected addons have been reloaded.' });
                 }
             },

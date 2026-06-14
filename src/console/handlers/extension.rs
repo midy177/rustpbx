@@ -1,5 +1,3 @@
-use crate::addons::queue::models::{Column as QueueColumn, Entity as QueueEntity};
-use crate::addons::queue::services::utils as queue_utils;
 use crate::call::Location;
 use crate::console::handlers::forms::{self, ExtensionPayload, ListQuery};
 use crate::console::{ConsoleState, middleware::AuthRequired};
@@ -13,7 +11,7 @@ use crate::models::{
     },
 };
 use crate::proxy::server::SipServerRef;
-use axum::routing::get;
+use axum::routing::{get, patch, put};
 use axum::{Json, Router};
 use axum::{
     extract::{Path as AxumPath, State},
@@ -55,35 +53,6 @@ struct QueryExtensionsFilters {
     registered_at_to: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ForwardingCatalog {
-    queues: Vec<ForwardingQueue>,
-    ivr_projects: Vec<ForwardingIvr>,
-}
-
-impl ForwardingCatalog {
-    fn empty() -> Self {
-        Self {
-            queues: Vec::new(),
-            ivr_projects: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ForwardingIvr {
-    /// IVR project name (used as file stem and forwarding reference).
-    name: String,
-    description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ForwardingQueue {
-    id: i64,
-    name: String,
-    reference: String,
-    description: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct ExtensionLocatorRecord {
@@ -293,6 +262,18 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         )
 }
 
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route(
+            "/extensions",
+            put(create_extension).post(query_extensions),
+        )
+        .route(
+            "/extensions/{id}",
+            patch(update_extension).delete(delete_extension),
+        )
+}
+
 async fn build_filters(state: Arc<ConsoleState>) -> serde_json::Value {
     let departments = match DepartmentEntity::find()
         .order_by_asc(DepartmentColumn::Name)
@@ -332,70 +313,14 @@ async fn build_filters(state: Arc<ConsoleState>) -> serde_json::Value {
     })
 }
 
-async fn build_forwarding_catalog(state: Arc<ConsoleState>) -> ForwardingCatalog {
-    let mut catalog = ForwardingCatalog::empty();
-    let queues = match QueueEntity::find()
-        .order_by_asc(QueueColumn::Name)
-        .all(state.db())
-        .await
+fn build_forwarding_catalog(state: &ConsoleState) -> crate::console::catalog::ForwardingCatalog {
+    if let Some(proxy_config) =
+        crate::console::catalog::load_proxy_config(state.app_state().as_ref())
     {
-        Ok(models) => models,
-        Err(err) => {
-            warn!("failed to load queues for forwarding catalog: {}", err);
-            vec![]
-        }
-    };
-    catalog.queues = queues
-        .into_iter()
-        .filter_map(|queue| match queue_utils::convert_queue_model(queue) {
-            Ok(entry) => {
-                let Some(id) = entry.id else {
-                    warn!("queue entry missing id when building forwarding catalog");
-                    return None;
-                };
-                Some(ForwardingQueue {
-                    id,
-                    reference: id.to_string(),
-                    name: entry.name,
-                    description: entry.description,
-                })
-            }
-            Err(err) => {
-                warn!(error = %err, "failed to convert queue when building forwarding catalog");
-                None
-            }
-        })
-        .collect();
-
-    // Load IVR projects if ivr_editor addon is present
-    #[cfg(feature = "addon-ivr-editor")]
-    {
-        use crate::addons::ivr_editor::models::{Column as IvrColumn, Entity as IvrEntity};
-        match IvrEntity::find()
-            .filter(IvrColumn::Status.eq("active"))
-            .order_by_asc(IvrColumn::Name)
-            .all(state.db())
-            .await
-        {
-            Ok(ivr_models) => {
-                catalog.ivr_projects = ivr_models
-                    .into_iter()
-                    .map(|m| ForwardingIvr {
-                        name: m.name,
-                        description: m.description,
-                    })
-                    .collect();
-            }
-            Err(err) => {
-                warn!(
-                    "failed to load IVR projects for forwarding catalog: {}",
-                    err
-                );
-            }
-        }
+        crate::console::catalog::build_forwarding_catalog(&proxy_config)
+    } else {
+        crate::console::catalog::ForwardingCatalog::empty()
     }
-
-    catalog
 }
 
 async fn page_extensions(
@@ -446,7 +371,7 @@ async fn page_extension_detail(
     let realm = resolve_default_realm(state.as_ref());
     let locator_info =
         fetch_extension_locator_summary(state.sip_server(), &realm, &model.extension).await;
-    let forwarding_catalog = build_forwarding_catalog(state.clone()).await;
+    let forwarding_catalog = build_forwarding_catalog(&state);
     let current_user = state.build_current_user_ctx(&user).await;
 
     state.render_with_headers(
@@ -471,7 +396,7 @@ async fn page_extension_create(
     headers: HeaderMap,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    let forwarding_catalog = build_forwarding_catalog(state.clone()).await;
+    let forwarding_catalog = build_forwarding_catalog(&state);
     let current_user = state.build_current_user_ctx(&user).await;
     state.render_with_headers(
         "console/extension_detail.html",
@@ -887,9 +812,7 @@ mod tests {
             .await
             .expect("connect sqlite memory");
         Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(
-            Arc::new(crate::callrecord::DefaultCallRecordFormatter::default()),
-            db,
+        ConsoleState::initialize(db,
             ConsoleConfig::default(),
         )
         .await

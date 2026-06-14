@@ -5,16 +5,16 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::config::SipFlowSubdirs;
 use crate::sipflow::backend::SipFlowBackend;
 use crate::sipflow::protocol::{MsgType, Packet};
 use crate::sipflow::storage::{StorageManager, process_packet};
 use crate::sipflow::wav_utils::{
-    build_payload_type_map, build_payload_type_map_by_leg,
-    generate_wav_from_packets_with_leg_map_ex,
+    generate_wav_to_writer,
 };
-use crate::sipflow::{SipFlowItem, SipFlowMsgType};
+use crate::sipflow::{SipFlowItem, SipFlowMediaStats, SipFlowMsgType};
 
 enum Command {
     RecordItem {
@@ -50,7 +50,7 @@ impl LocalBackend {
         let root_clone = root.clone();
         let subdirs_clone = subdirs.clone();
         // Spawn background worker task
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             let mut storage = StorageManager::new(
                 &PathBuf::from(&root_clone),
                 flush_count,
@@ -87,18 +87,23 @@ impl LocalBackend {
                                 let (src_ip, src_port) = if !item.src_addr.is_empty() {
                                     parse_addr(&item.src_addr)
                                 } else {
-                                    (IpAddr::from([127, 0, 0, 1]), 5060)
+                                    (IpAddr::from([127, 0, 0, 1]), default_port)
                                 };
 
                                 let (dst_ip, dst_port) = if !item.dst_addr.is_empty() {
                                     parse_addr(&item.dst_addr)
                                 } else {
-                                    (IpAddr::from([127, 0, 0, 1]), 5060)
+                                    (IpAddr::from([127, 0, 0, 1]), default_port)
                                 };
 
                                 let msg_type = match item.msg_type {
                                     SipFlowMsgType::Sip => MsgType::Sip,
                                     SipFlowMsgType::Rtp => MsgType::Rtp,
+                                };
+                                let (packet_call_id, packet_leg) = if msg_type == MsgType::Rtp {
+                                    (Some(call_id), item.leg)
+                                } else {
+                                    (None, None)
                                 };
 
                                 let packet = Packet {
@@ -106,37 +111,12 @@ impl LocalBackend {
                                     src: (src_ip, src_port),
                                     dst: (dst_ip, dst_port),
                                     timestamp: item.timestamp,
+                                    call_id: packet_call_id,
+                                    leg: packet_leg,
                                     payload: item.payload,
                                 };
 
-                                let mut processed = process_packet(packet);
-
-                                if msg_type == MsgType::Rtp {
-                                    processed.callid = Some(call_id);
-
-                                    // Parse src_addr to extract leg and real IP
-                                    // Format expected: "LegA_IP:PORT" or "A_IP:PORT" or just "LegA" (legacy)
-                                    let (leg_id, real_src) = if item.src_addr.starts_with("LegA_") {
-                                        (Some(0), item.src_addr[5..].to_string())
-                                    } else if item.src_addr.starts_with("LegB_") {
-                                        (Some(1), item.src_addr[5..].to_string())
-                                    } else if item.src_addr.starts_with("A_") {
-                                        (Some(0), item.src_addr[2..].to_string())
-                                    } else if item.src_addr.starts_with("B_") {
-                                        (Some(1), item.src_addr[2..].to_string())
-                                    } else if item.src_addr == "LegA" || item.src_addr == "A" {
-                                        (Some(0), item.src_addr.clone())
-                                    } else if item.src_addr == "LegB" || item.src_addr == "B" {
-                                        (Some(1), item.src_addr.clone())
-                                    } else {
-                                        // Default to Leg A if no explicit leg info
-                                        (Some(0), item.src_addr.clone())
-                                    };
-
-                                    processed.leg = leg_id;
-                                    processed.src = real_src;
-                                }
-
+                                let processed = process_packet(packet);
                                 let _ = storage.write_processed(processed).await;
                             }
                             Command::Flush { done } => {
@@ -165,16 +145,34 @@ impl LocalBackend {
 impl SipFlowBackend for LocalBackend {
     async fn flush(&self) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.sender.send(Command::Flush { done: tx });
-        rx.await.ok();
-        Ok(())
+        if self
+            .sender
+            .send(Command::Flush { done: tx })
+            .is_err()
+        {
+            warn!("SipFlowBackend flush: worker channel closed, skipping flush");
+            return Ok(());
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                warn!("SipFlowBackend flush: oneshot cancelled");
+                Ok(())
+            }
+            Err(_) => {
+                warn!("SipFlowBackend flush: timed out after 30s");
+                Ok(())
+            }
+        }
     }
 
     fn record(&self, call_id: &str, item: SipFlowItem) -> Result<()> {
-        self.sender.send(Command::RecordItem {
-            call_id: call_id.to_string(),
-            item,
-        })?;
+        self.sender
+            .send(Command::RecordItem {
+                call_id: call_id.to_string(),
+                item,
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send record command: {}", e))?;
         Ok(())
     }
 
@@ -205,7 +203,7 @@ impl SipFlowBackend for LocalBackend {
         call_id: &str,
         start_time: DateTime<Local>,
         end_time: DateTime<Local>,
-    ) -> Result<Vec<(i32, String, usize)>> {
+    ) -> Result<Vec<SipFlowMediaStats>> {
         let call_id = call_id.to_string();
         let root = self.root.clone();
         let subdirs = self.subdirs.clone();
@@ -233,32 +231,14 @@ impl SipFlowBackend for LocalBackend {
 
         let result = tokio::task::spawn(async move {
             let mut storage = StorageManager::new(&PathBuf::from(&root), 1000, 5, 1024, subdirs);
-
-            // Query media packets directly by call_id
             let packets = storage.query_media(&call_id, start_time, end_time).await?;
             if packets.is_empty() {
-                return Ok(Vec::new());
+                return Ok(Vec::<u8>::new());
             }
-            let media_stats = storage
-                .query_media_stats(&call_id, start_time, end_time)
-                .await
-                .unwrap_or_default();
-            let mut leg_sources = std::collections::HashMap::<i32, Vec<String>>::new();
-            for (leg, src, _) in media_stats {
-                leg_sources.entry(leg).or_default().push(src);
-            }
-            let flow = storage
-                .query_flow_in_range(start_time, end_time)
-                .await
-                .unwrap_or_default();
-            let payload_map = build_payload_type_map(&flow);
-            let leg_payload_map = build_payload_type_map_by_leg(&flow, &leg_sources);
-            generate_wav_from_packets_with_leg_map_ex(
-                &packets,
-                &payload_map,
-                &leg_payload_map,
-                true,
-            )
+            let payload_map = build_payload_maps(&mut storage, &call_id, start_time, end_time).await;
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            generate_wav_to_writer(&packets, &payload_map.0, &payload_map.1, true, &mut cursor)?;
+            Ok::<Vec<u8>, anyhow::Error>(cursor.into_inner())
         })
         .await??;
 
@@ -278,45 +258,122 @@ impl SipFlowBackend for LocalBackend {
 
         let result = tokio::task::spawn(async move {
             let mut storage = StorageManager::new(&PathBuf::from(&root), 1000, 5, 1024, subdirs);
-
-            // Query media packets directly by call_id and optionally filter by leg.
             let mut packets = storage.query_media(&call_id, start_time, end_time).await?;
             if let Some(leg) = stream_leg {
                 packets.retain(|(packet_leg, _, _)| *packet_leg == leg);
             }
-
             if packets.is_empty() {
-                return Ok(Vec::new());
+                return Ok::<Vec<u8>, anyhow::Error>(Vec::new());
             }
-
-            let media_stats = storage
-                .query_media_stats(&call_id, start_time, end_time)
-                .await
-                .unwrap_or_default();
-            let mut leg_sources = std::collections::HashMap::<i32, Vec<String>>::new();
-            for (leg, src, _) in media_stats {
-                if stream_leg.is_none_or(|selected| selected == leg) {
-                    leg_sources.entry(leg).or_default().push(src);
-                }
-            }
-
-            let flow = storage
-                .query_flow_in_range(start_time, end_time)
-                .await
-                .unwrap_or_default();
-            let payload_map = build_payload_type_map(&flow);
-            let leg_payload_map = build_payload_type_map_by_leg(&flow, &leg_sources);
-            generate_wav_from_packets_with_leg_map_ex(
-                &packets,
-                &payload_map,
-                &leg_payload_map,
-                true,
+            let payload_map = build_payload_maps_filtered(
+                &mut storage,
+                &call_id,
+                start_time,
+                end_time,
+                stream_leg,
             )
+            .await;
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            generate_wav_to_writer(&packets, &payload_map.0, &payload_map.1, true, &mut cursor)?;
+            Ok::<Vec<u8>, anyhow::Error>(cursor.into_inner())
         })
         .await??;
 
         Ok(result)
     }
+
+    async fn generate_wav_file(
+        &self,
+        call_id: &str,
+        start_time: DateTime<Local>,
+        end_time: DateTime<Local>,
+        stream_leg: Option<i32>,
+    ) -> Result<tempfile::NamedTempFile> {
+        let call_id = call_id.to_string();
+        let root = self.root.clone();
+        let subdirs = self.subdirs.clone();
+
+        let file = tokio::task::spawn(async move {
+            let mut storage = StorageManager::new(&PathBuf::from(&root), 1000, 5, 1024, subdirs);
+            let mut packets = storage.query_media(&call_id, start_time, end_time).await?;
+            if let Some(leg) = stream_leg {
+                packets.retain(|(packet_leg, _, _)| *packet_leg == leg);
+            }
+            if packets.is_empty() {
+                return Ok::<Option<tempfile::NamedTempFile>, anyhow::Error>(None);
+            }
+            let payload_map = build_payload_maps_filtered(
+                &mut storage,
+                &call_id,
+                start_time,
+                end_time,
+                stream_leg,
+            )
+            .await;
+
+            let mut file = tempfile::NamedTempFile::new()?;
+            generate_wav_to_writer(&packets, &payload_map.0, &payload_map.1, true, &mut file)?;
+            std::io::Write::flush(&mut file)?;
+            Ok::<Option<tempfile::NamedTempFile>, anyhow::Error>(Some(file))
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("No media packets found"))?;
+
+        Ok(file)
+    }
+}
+
+async fn build_payload_maps(
+    storage: &mut StorageManager,
+    call_id: &str,
+    start_time: DateTime<Local>,
+    end_time: DateTime<Local>,
+) -> (crate::sipflow::wav_utils::PayloadTypeMap, crate::sipflow::wav_utils::LegPayloadTypeMap) {
+    use crate::sipflow::wav_utils::{build_payload_type_map, build_payload_type_map_by_leg};
+    let media_sources = storage
+        .query_media_sources(call_id, start_time, end_time)
+        .await
+        .unwrap_or_default();
+    let mut leg_sources = std::collections::HashMap::<i32, Vec<String>>::new();
+    for source in media_sources {
+        leg_sources.entry(source.leg).or_default().push(source.src);
+    }
+    let flow = storage
+        .query_flow(call_id, start_time, end_time)
+        .await
+        .unwrap_or_default();
+    let payload_map = build_payload_type_map(&flow);
+    let leg_payload_map = build_payload_type_map_by_leg(&flow, &leg_sources);
+    (payload_map, leg_payload_map)
+}
+
+type LegPayloadTypeMap = crate::sipflow::wav_utils::LegPayloadTypeMap;
+
+async fn build_payload_maps_filtered(
+    storage: &mut StorageManager,
+    call_id: &str,
+    start_time: DateTime<Local>,
+    end_time: DateTime<Local>,
+    stream_leg: Option<i32>,
+) -> (crate::sipflow::wav_utils::PayloadTypeMap, LegPayloadTypeMap) {
+    use crate::sipflow::wav_utils::{build_payload_type_map, build_payload_type_map_by_leg};
+    let media_sources = storage
+        .query_media_sources(call_id, start_time, end_time)
+        .await
+        .unwrap_or_default();
+    let mut leg_sources = std::collections::HashMap::<i32, Vec<String>>::new();
+    for source in media_sources {
+        if stream_leg.is_none_or(|selected| selected == source.leg) {
+            leg_sources.entry(source.leg).or_default().push(source.src);
+        }
+    }
+    let flow = storage
+        .query_flow(call_id, start_time, end_time)
+        .await
+        .unwrap_or_default();
+    let payload_map = build_payload_type_map(&flow);
+    let leg_payload_map = build_payload_type_map_by_leg(&flow, &leg_sources);
+    (payload_map, leg_payload_map)
 }
 
 impl Drop for LocalBackend {

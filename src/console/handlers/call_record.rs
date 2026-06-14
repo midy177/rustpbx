@@ -19,7 +19,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{self, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, patch},
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use sea_orm::sea_query::Order;
@@ -39,7 +39,7 @@ use tokio_util::io::ReaderStream;
 use tracing::warn;
 use urlencoding::encode;
 
-use hound;
+use crate::media::wav_reader::{WavReader, WavSpec, WavWriter};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +79,13 @@ struct RecordingPlaybackQuery {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+struct SipFlowRequestQuery {
+    #[serde(default)]
+    detail: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct UpdateCallRecordPayload {
     #[serde(default)]
     tags: Option<Vec<String>>,
@@ -95,6 +102,24 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
             get(page_call_record_detail)
                 .patch(update_call_record)
                 .delete(delete_call_record),
+        )
+        .route(
+            "/call-records/{id}/metadata",
+            get(download_call_record_metadata),
+        )
+        .route(
+            "/call-records/{id}/sip-flow",
+            get(download_call_record_sip_flow),
+        )
+        .route("/call-records/{id}/recording", get(stream_call_recording))
+}
+
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route("/call-records", get(query_call_records).post(query_call_records))
+        .route(
+            "/call-records/{id}",
+            patch(update_call_record).delete(delete_call_record),
         )
         .route(
             "/call-records/{id}/metadata",
@@ -155,6 +180,7 @@ async fn resolve_call_record_by_id_or_call_id(
 
 async fn download_call_record_sip_flow(
     AxumPath(identifier): AxumPath<String>,
+    Query(query): Query<SipFlowRequestQuery>,
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(_): AuthRequired,
 ) -> Response {
@@ -204,35 +230,49 @@ async fn download_call_record_sip_flow(
     }
 
     let mut flow_items = Vec::new();
-    // Map of (Role, Src, Dst) -> PacketCount
-    let mut rtp_stats: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut rtp_streams = Vec::new();
 
     for (cid, role) in &call_id_roles {
-        match backend.query_flow(cid, start_time, end_time).await {
-            Ok(items) => {
-                for item in items {
-                    flow_items.push((item, role.clone(), cid.clone()));
+        if query.detail {
+            match backend.query_flow(cid, start_time, end_time).await {
+                Ok(items) => {
+                    for item in items {
+                        flow_items.push((item, role.clone(), cid.clone()));
+                    }
                 }
-            }
-            Err(err) => {
-                warn!(identifier = %identifier, call_id = %cid, "failed to query sip flow for leg: {}", err);
+                Err(err) => {
+                    warn!(identifier = %identifier, call_id = %cid, "failed to query sip flow for leg: {}", err);
+                }
             }
         }
 
         match backend.query_media_stats(cid, start_time, end_time).await {
             Ok(stats) => {
-                for (leg, src_addr, count) in stats {
-                    *rtp_stats
-                        .entry((
-                            role.clone(),
-                            if src_addr.is_empty() {
-                                format!("Leg {}", leg)
-                            } else {
-                                src_addr
-                            },
-                            "RTP".to_string(),
-                        ))
-                        .or_insert(0) += count;
+                for stat in stats {
+                    let src_addr = if stat.src.is_empty() {
+                        format!("Leg {}", stat.leg)
+                    } else {
+                        stat.src
+                    };
+                    rtp_streams.push(json!({
+                        "role": match stat.leg {
+                            0 => "caller",
+                            1 => "callee",
+                            _ => role.as_str(),
+                        },
+                        "leg": stat.leg,
+                        "src_addr": src_addr,
+                        "dst_addr": "RTP",
+                        "packet_count": stat.packet_count,
+                        "lost_packets": stat.lost_packets,
+                        "expected_packets": stat.expected_packets,
+                        "loss_percent": stat.loss_percent,
+                        "jitter_ms": stat.jitter_ms,
+                        "ssrc": stat.ssrc,
+                        "ssrc_hex": stat.ssrc.map(|ssrc| format!("0x{ssrc:08x}")),
+                        "payload_type": stat.payload_type,
+                        "clock_rate": stat.clock_rate,
+                    }));
                 }
             }
             Err(err) => {
@@ -241,49 +281,42 @@ async fn download_call_record_sip_flow(
         }
     }
 
-    // Sort combined SIP flow by timestamp
-    flow_items.sort_by(|(a, _, _), (b, _, _)| {
-        a.timestamp
-            .partial_cmp(&b.timestamp)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut flow_json = Vec::new();
-
-    for (item, role, cid) in flow_items {
-        let raw_message = String::from_utf8_lossy(&item.payload).to_string();
-        flow_json.push(json!({
-            "timestamp": item.timestamp,
-            "seq": item.seq,
-            "msg_type": "Sip",
-            "src_addr": item.src_addr,
-            "dst_addr": item.dst_addr,
-            "raw_message": raw_message,
-            "role": role,
-            "call_id": cid,
-        }));
-    }
-
-    let rtp_streams: Vec<Value> = rtp_stats
-        .into_iter()
-        .map(|((role, src, dst), count)| {
-            json!({
-                "role": role,
-                "src_addr": src,
-                "dst_addr": dst,
-                "packet_count": count
-            })
-        })
-        .collect();
-
-    Json(json!({
+    let mut response = json!({
         "call_id": record.call_id,
         "start_time": record.started_at,
         "status": "success",
-        "flow": flow_json,
+        "flow": [],
         "rtp_streams": rtp_streams,
-    }))
-    .into_response()
+    });
+
+    if query.detail {
+        // Sort combined SIP flow by timestamp
+        flow_items.sort_by(|(a, _, _), (b, _, _)| {
+            a.timestamp
+                .partial_cmp(&b.timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut flow_json = Vec::new();
+
+        for (item, role, cid) in flow_items {
+            let raw_message = String::from_utf8_lossy(&item.payload).to_string();
+            flow_json.push(json!({
+                "timestamp": item.timestamp,
+                "seq": item.seq,
+                "msg_type": "Sip",
+                "src_addr": item.src_addr,
+                "dst_addr": item.dst_addr,
+                "raw_message": raw_message,
+                "role": role,
+                "call_id": cid,
+            }));
+        }
+
+        response["flow"] = Value::Array(flow_json);
+    }
+
+    Json(response).into_response()
 }
 
 async fn stream_call_recording(
@@ -374,18 +407,36 @@ async fn stream_call_recording(
             );
         }
 
-        if let Ok(audio_data) = backend
-            .query_media_stream(&record.call_id, start_time, end_time, stream_leg)
-            .await
-            && !audio_data.is_empty()
+        let wav_result: Result<tempfile::NamedTempFile, _> = backend
+            .generate_wav_file(&record.call_id, start_time, end_time, stream_leg)
+            .await;
+
+        if let Ok(temp_file) = wav_result
         {
-            // SipFlow can briefly generate a one-frame silent WAV before media is flushed.
-            // Treat that as not ready so the same local endpoint can work on a later page load.
-            let data_size = audio_data
-                .get(40..44)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u32::from_le_bytes)
-                .unwrap_or(0);
+            let temp_path = temp_file.path().to_owned();
+            let file_len = match std::fs::metadata(&temp_path) {
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            };
+
+            if file_len <= 44 {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(http::header::CACHE_CONTROL, "no-store")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "message": "Recording is not ready" }).to_string(),
+                    ))
+                    .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response());
+            }
+
+            let mut header_buf = [0u8; 4];
+            if let Ok(mut f) = std::fs::File::open(&temp_path) {
+                use std::io::{Read, Seek, SeekFrom};
+                let _ = f.seek(SeekFrom::Start(40));
+                let _ = f.read_exact(&mut header_buf);
+            }
+            let data_size = u32::from_le_bytes(header_buf);
             if record.duration_secs > 1 && data_size <= 1280 {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
@@ -397,18 +448,11 @@ async fn stream_call_recording(
                     .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response());
             }
 
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(http::header::CONTENT_TYPE, "audio/wav")
-                .header(http::header::CONTENT_LENGTH, audio_data.len())
-                .header(http::header::CACHE_CONTROL, "no-store")
-                .header("x-available-streams", "A,B,mixed")
-                .header(
-                    http::header::CONTENT_DISPOSITION,
-                    "inline; filename=\"recording.wav\"",
-                )
-                .body(Body::from(audio_data))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let path_str = temp_path.to_string_lossy().to_string();
+            std::mem::forget(temp_file);
+            let response = stream_file_with_range(&path_str, file_len, &headers).await;
+            let _ = std::fs::remove_file(&path_str);
+            return response;
         }
     }
 
@@ -1335,7 +1379,7 @@ fn build_recording_payload(
     let (url, supports_streams) = if let Some(raw_value) = raw {
         if raw_value.starts_with("http://") || raw_value.starts_with("https://") {
             // External URL – cannot extract per-leg streams
-                (raw_value.to_string(), false)
+            (raw_value.to_string(), false)
         } else {
             // Local file path – serve through /recording endpoint with stream selection
             (
@@ -1395,8 +1439,8 @@ fn derive_recording_download_url(state: &ConsoleState, record: &CallRecordModel)
 fn strip_storage_root(state: &ConsoleState, path: &str) -> String {
     if let Some(app) = state.app_state() {
         if let Some(config) = &app.config().callrecord {
-            match config {
-                crate::config::CallRecordConfig::Local { root } => {
+            match &config.storage {
+                crate::config::CallRecordStorageConfig::Local { root } => {
                     let root_path = Path::new(root);
                     let candidate_path = Path::new(path);
                     if let Ok(stripped) = candidate_path.strip_prefix(root_path) {
@@ -1410,7 +1454,7 @@ fn strip_storage_root(state: &ConsoleState, path: &str) -> String {
                         }
                     }
                 }
-                crate::config::CallRecordConfig::S3 { root, .. } => {
+                crate::config::CallRecordStorageConfig::S3 { root, .. } => {
                     let root_str = root.trim_end_matches('/');
                     if let Some(stripped) = path.strip_prefix(root_str) {
                         stripped.trim_start_matches('/').to_string()
@@ -1429,9 +1473,15 @@ fn strip_storage_root(state: &ConsoleState, path: &str) -> String {
 }
 
 pub async fn load_cdr_data(state: &ConsoleState, record: &CallRecordModel) -> Option<CdrData> {
+    let app = state.app_state()?;
+    let root = match app.config().callrecord.as_ref().map(|config| &config.storage) {
+        Some(crate::config::CallRecordStorageConfig::Local { root })
+        | Some(crate::config::CallRecordStorageConfig::S3 { root, .. }) => root.as_str(),
+        _ => "",
+    };
     let storage = resolve_cdr_storage(state);
     let callrecord: CallRecord = record.clone().into();
-    let candidate = state.callrecord_formatter.format_file_name(&callrecord);
+    let candidate = crate::callrecord::format_file_name(root, &callrecord);
     let mut content: Option<String> = None;
 
     if let Some(ref storage_ref) = storage {
@@ -1504,22 +1554,21 @@ pub fn select_recording_path(record: &CallRecordModel, cdr: Option<&CdrData>) ->
 /// Returns `Ok(data)` on success, `Err` if the file is not a valid 16-bit stereo WAV.
 /// The caller should fall back to serving the full file on error.
 fn extract_channel_from_wav(path: &str, stream_leg: i32) -> anyhow::Result<Vec<u8>> {
-    let mut reader = hound::WavReader::open(path)?;
-    let spec = reader.spec();
+    let mut reader = WavReader::open(path)?;
+    let spec = *reader.spec();
 
-    // Only handle 16-bit PCM stereo WAV files
     if spec.channels < 2 || spec.bits_per_sample != 16 {
         anyhow::bail!("not a 16-bit stereo WAV");
     }
 
     let channel_idx = match stream_leg {
-        0 => 0usize, // A-leg / caller → left channel
-        1 => 1usize, // B-leg / callee → right channel
+        0 => 0usize,
+        1 => 1usize,
         _ => anyhow::bail!("invalid stream_leg: expected 0 or 1"),
     };
 
     let all_samples: Vec<i16> = reader
-        .samples::<i16>()
+        .samples()
         .collect::<::std::result::Result<Vec<_>, _>>()?;
 
     let channel_samples: Vec<i16> = all_samples
@@ -1528,13 +1577,13 @@ fn extract_channel_from_wav(path: &str, stream_leg: i32) -> anyhow::Result<Vec<u
         .collect();
 
     let mut buf = Vec::new();
-    let mono_spec = hound::WavSpec {
+    let mono_spec = WavSpec {
         channels: 1,
         sample_rate: spec.sample_rate,
         bits_per_sample: spec.bits_per_sample,
         sample_format: spec.sample_format,
     };
-    let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut buf), mono_spec)?;
+    let mut writer = WavWriter::new(std::io::Cursor::new(&mut buf), mono_spec)?;
     for sample in &channel_samples {
         writer.write_sample(*sample)?;
     }
@@ -1598,7 +1647,8 @@ fn build_detail_payload(
         Value::Null
     };
 
-    let sip_flow_download = state.url_for(&format!("/call-records/{}/sip-flow", record.id));
+    let sip_flow_download =
+        state.url_for(&format!("/call-records/{}/sip-flow?detail=true", record.id));
 
     let mut download_recording = derive_recording_download_url(state, record);
     if download_recording.is_none() {
@@ -1618,8 +1668,8 @@ fn build_detail_payload(
             "download_recording": download_recording,
             "download_metadata": metadata_download,
             "download_sip_flow": sip_flow_download,
-            "transcript_url": state.url_for(&format!("/call-records/{}/transcript", record.id)),
-            "update_record": state.url_for(&format!("/call-records/{}", record.id)),
+            "transcript_url": state.api_url_for(&format!("/call-records/{}/transcript", record.id)),
+            "update_record": state.api_url_for(&format!("/call-records/{}", record.id)),
         }),
     })
 }
@@ -1764,6 +1814,7 @@ fn parse_recording_stream_selector(stream: Option<&str>) -> Result<Option<i32>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::wav_reader::SampleFormat;
     use crate::{
         config::ConsoleConfig,
         console::{ConsoleState, middleware::AuthRequired},
@@ -1828,9 +1879,7 @@ mod tests {
     }
 
     async fn create_console_state(db: DatabaseConnection) -> Arc<ConsoleState> {
-        ConsoleState::initialize(
-            Arc::new(crate::callrecord::DefaultCallRecordFormatter::default()),
-            db,
+        ConsoleState::initialize(db,
             ConsoleConfig {
                 session_secret: "secret".into(),
                 base_path: "/console".into(),
@@ -1964,13 +2013,13 @@ mod tests {
     // ── extract_channel_from_wav tests ─────────────────────────────────────
 
     fn create_test_stereo_wav(path: &str) {
-        let spec = hound::WavSpec {
+        let spec = WavSpec {
             channels: 2,
             sample_rate: 8000,
             bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: SampleFormat::Int,
         };
-        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let mut writer = WavWriter::create(path, spec).unwrap();
         // 10 samples: left = 100, right = 200 for each frame
         for _ in 0..10 {
             writer.write_sample(100i16).unwrap(); // left
@@ -1990,15 +2039,18 @@ mod tests {
         assert!(!result.is_empty(), "should return WAV data");
 
         // Read the mono output and verify it contains only left channel values
-        let mut mono_reader = hound::WavReader::new(std::io::Cursor::new(&result)).unwrap();
+        let mut mono_reader = WavReader::new(std::io::Cursor::new(&result)).unwrap();
         assert_eq!(mono_reader.spec().channels, 1, "should be mono");
         assert_eq!(mono_reader.spec().sample_rate, 8000);
         let mono_samples: Vec<i16> = mono_reader
-            .samples::<i16>()
+            .samples()
             .collect::<::std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(mono_samples.len(), 10, "should have 10 samples");
-        assert!(mono_samples.iter().all(|&s| s == 100), "all samples should be 100 (left)");
+        assert!(
+            mono_samples.iter().all(|&s| s == 100),
+            "all samples should be 100 (left)"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2013,14 +2065,17 @@ mod tests {
         let result = extract_channel_from_wav(&path_str, 1).unwrap();
         assert!(!result.is_empty(), "should return WAV data");
 
-        let mut mono_reader = hound::WavReader::new(std::io::Cursor::new(&result)).unwrap();
+        let mut mono_reader = WavReader::new(std::io::Cursor::new(&result)).unwrap();
         assert_eq!(mono_reader.spec().channels, 1, "should be mono");
         let mono_samples: Vec<i16> = mono_reader
-            .samples::<i16>()
+            .samples()
             .collect::<::std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(mono_samples.len(), 10, "should have 10 samples");
-        assert!(mono_samples.iter().all(|&s| s == 200), "all samples should be 200 (right)");
+        assert!(
+            mono_samples.iter().all(|&s| s == 200),
+            "all samples should be 200 (right)"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2030,13 +2085,13 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_mono.wav");
         let path_str = path.to_string_lossy().to_string();
-        let spec = hound::WavSpec {
+        let spec = WavSpec {
             channels: 1,
             sample_rate: 8000,
             bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: SampleFormat::Int,
         };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let mut writer = WavWriter::create(&path, spec).unwrap();
         writer.write_sample(42i16).unwrap();
         writer.finalize().unwrap();
 
@@ -2104,8 +2159,14 @@ mod tests {
 
         let payload = build_recording_payload(&state, &record, None);
         let payload = payload.expect("should return a recording payload");
-        assert_eq!(payload["supports_streams"], true, "local path should support streams");
-        assert!(payload["url"].as_str().unwrap().contains("/call-records/"), "should route through /recording endpoint");
+        assert_eq!(
+            payload["supports_streams"], true,
+            "local path should support streams"
+        );
+        assert!(
+            payload["url"].as_str().unwrap().contains("/call-records/"),
+            "should route through /recording endpoint"
+        );
     }
 
     #[tokio::test]
@@ -2133,8 +2194,14 @@ mod tests {
 
         let payload = build_recording_payload(&state, &record, None);
         let payload = payload.expect("should return a recording payload");
-        assert_eq!(payload["supports_streams"], false, "external URL should not support streams");
-        assert_eq!(payload["url"], "https://cdn.example.com/recording.wav", "should use URL directly");
+        assert_eq!(
+            payload["supports_streams"], false,
+            "external URL should not support streams"
+        );
+        assert_eq!(
+            payload["url"], "https://cdn.example.com/recording.wav",
+            "should use URL directly"
+        );
     }
 
     #[tokio::test]
@@ -2162,7 +2229,10 @@ mod tests {
         let inline_url = state.url_for(&format!("/call-records/{}/recording", record.id));
         let payload = build_recording_payload(&state, &record, Some(inline_url.as_str()));
         let payload = payload.expect("should return a recording payload");
-        assert_eq!(payload["supports_streams"], true, "inline recording URL should support streams");
+        assert_eq!(
+            payload["supports_streams"], true,
+            "inline recording URL should support streams"
+        );
     }
 
     #[tokio::test]
@@ -2188,6 +2258,9 @@ mod tests {
         .expect("insert call record");
 
         let payload = build_recording_payload(&state, &record, None);
-        assert!(payload.is_none(), "should return None when no recording and no sipflow");
+        assert!(
+            payload.is_none(),
+            "should return None when no recording and no sipflow"
+        );
     }
 }

@@ -2,10 +2,11 @@ use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::models::call_record::{Column as CallRecordColumn, Entity as CallRecordEntity};
 use anyhow::Result;
 use axum::{
-    Json,
+    Json, Router,
     extract::{Query, State},
     http::HeaderMap,
     response::Response,
+    routing::get,
 };
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use sea_orm::{
@@ -17,6 +18,37 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::warn;
+
+fn count_when<C>(condition: C) -> sea_query::SimpleExpr
+where
+    C: sea_query::IntoCondition,
+{
+    sea_query::Func::count(sea_query::Expr::case(condition, sea_query::Expr::val(1))).into()
+}
+
+fn sum_i64<E>(db: &impl ConnectionTrait, expr: E) -> sea_query::SimpleExpr
+where
+    E: Into<sea_query::SimpleExpr>,
+{
+    let cast_type = match db.get_database_backend() {
+        DatabaseBackend::Sqlite => "INTEGER",
+        DatabaseBackend::MySql => "SIGNED",
+        DatabaseBackend::Postgres => "BIGINT",
+    };
+
+    sea_query::SimpleExpr::from(sea_query::Func::sum(expr))
+        .cast_as(sea_query::Alias::new(cast_type))
+}
+
+pub fn urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/dashboard/data", get(dashboard_data))
+}
+
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new().route("/dashboard/data", get(dashboard_data))
+}
 
 pub async fn dashboard(
     State(state): State<Arc<ConsoleState>>,
@@ -105,6 +137,8 @@ impl DashboardPayload {
                 active: 0,
                 capacity: 0,
                 active_util: 0,
+                transaction_running: 0,
+                transaction_capacity: 0,
             },
             call_direction: default_direction_map(),
             active_calls: Vec::new(),
@@ -128,6 +162,8 @@ pub struct DashboardMetrics {
     active: u32,
     capacity: u32,
     active_util: u32,
+    transaction_running: u32,
+    transaction_capacity: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -216,27 +252,18 @@ async fn build_dashboard_payload(
         .select_only()
         .column_as(CallRecordColumn::Id.count(), "total")
         .column_as(
-            sea_query::SimpleExpr::from(sea_query::Func::sum(
-                sea_query::CaseStatement::new()
-                    .case(
-                        CallRecordColumn::Status.is_in(["answered", "completed"]),
-                        sea_query::Expr::val(1),
-                    )
-                    .finally(sea_query::Expr::val(0)),
-            ))
-            .cast_as(sea_query::Alias::new("SIGNED")),
+            count_when(CallRecordColumn::Status.is_in(["answered", "completed"])),
             "answered",
         )
         .column_as(
-            sea_query::SimpleExpr::from(sea_query::Func::sum(
-                sea_query::CaseStatement::new()
-                    .case(
-                        CallRecordColumn::Status.is_in(["answered", "completed"]),
-                        CallRecordColumn::DurationSecs.into_expr(),
-                    )
-                    .finally(sea_query::Expr::val(0)),
-            ))
-            .cast_as(sea_query::Alias::new("SIGNED")),
+            sum_i64(
+                db,
+                sea_query::Expr::case(
+                    CallRecordColumn::Status.is_in(["answered", "completed"]),
+                    CallRecordColumn::DurationSecs.into_expr(),
+                )
+                .finally(sea_query::Expr::val(0)),
+            ),
             "total_duration",
         )
         .into_model::<RecentStats>()
@@ -301,27 +328,18 @@ async fn build_dashboard_payload(
         .filter(CallRecordColumn::StartedAt.gte(today_start))
         .select_only()
         .column_as(
-            sea_query::SimpleExpr::from(sea_query::Func::sum(
-                sea_query::CaseStatement::new()
-                    .case(
-                        CallRecordColumn::Status.is_in(["answered", "completed"]),
-                        sea_query::Expr::val(1),
-                    )
-                    .finally(sea_query::Expr::val(0)),
-            ))
-            .cast_as(sea_query::Alias::new("SIGNED")),
+            count_when(CallRecordColumn::Status.is_in(["answered", "completed"])),
             "answered_count",
         )
         .column_as(
-            sea_query::SimpleExpr::from(sea_query::Func::sum(
-                sea_query::CaseStatement::new()
-                    .case(
-                        CallRecordColumn::Status.is_in(["answered", "completed"]),
-                        CallRecordColumn::DurationSecs.into_expr(),
-                    )
-                    .finally(sea_query::Expr::val(0)),
-            ))
-            .cast_as(sea_query::Alias::new("SIGNED")),
+            sum_i64(
+                db,
+                sea_query::Expr::case(
+                    CallRecordColumn::Status.is_in(["answered", "completed"]),
+                    CallRecordColumn::DurationSecs.into_expr(),
+                )
+                .finally(sea_query::Expr::val(0)),
+            ),
             "total_duration",
         )
         .into_model::<TodayStats>()
@@ -355,6 +373,12 @@ async fn build_dashboard_payload(
         .sip_server()
         .and_then(|server| server.proxy_config.max_concurrency)
         .unwrap_or(0) as u32;
+
+    let transaction_running = state
+        .sip_server()
+        .map(|server| server.runnings_tx.load(std::sync::atomic::Ordering::Relaxed) as u32)
+        .unwrap_or(0);
+    let transaction_capacity = capacity;
 
     let total_recent = recent_stats.total as u32;
     let answered_recent = recent_stats.answered.unwrap_or(0) as u32;
@@ -402,6 +426,8 @@ async fn build_dashboard_payload(
         active: active_total as u32,
         capacity,
         active_util: calc_util(active_total as u32, capacity),
+        transaction_running,
+        transaction_capacity,
     };
 
     let mut direction_counts: BTreeMap<String, i64> = BTreeMap::new();

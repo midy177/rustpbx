@@ -1,6 +1,37 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub const RWI_VERSION: &str = "1.0";
+
+/// Common call context flattened into all call-scoped RWI events.
+/// All fields are Option — when None they are omitted from JSON.
+/// When enriched, gateway populates from `CallMetaStore`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventCallContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callee_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trunk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RwiEnvelope<T> {
@@ -171,6 +202,10 @@ pub enum RwiCommand {
     ConferenceDestroy {
         conf_id: String,
     },
+    ConferenceEnd {
+        conf_id: String,
+        host_call_id: String,
+    },
     ConferenceMerge {
         conf_id: String,
         call_id: String,
@@ -314,8 +349,11 @@ pub struct ConferenceCreateParams {
     pub max_members: Option<u32>,
     #[serde(default)]
     pub record: bool,
-    #[serde(default)]
     pub mcu_uri: Option<String>,
+    #[serde(default)]
+    pub host_call_id: Option<String>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,436 +370,100 @@ pub type RwiEventTx = tokio::sync::mpsc::UnboundedSender<RwiEvent>;
 /// Type alias for RWI event receiver.
 pub type RwiEventRx = tokio::sync::mpsc::UnboundedReceiver<RwiEvent>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize)]
 pub enum RwiEvent {
-    CallIncoming(CallIncomingData),
-    CallRinging {
-        call_id: String,
-    },
-    CallEarlyMedia {
-        call_id: String,
-    },
-    CallAnswered {
-        call_id: String,
-    },
-    CallBridged {
-        leg_a: String,
-        leg_b: String,
-    },
-    CallUnbridged {
-        call_id: String,
-    },
-    CallTransferred {
-        call_id: String,
-    },
-    CallTransferAccepted {
-        call_id: String,
-    },
-    CallTransferFailed {
-        call_id: String,
-        sip_status: Option<u16>,
-        reason: Option<String>,
-    },
-    CallHangup {
-        call_id: String,
-        reason: Option<String>,
-        sip_status: Option<u16>,
-    },
-    CallNoAnswer {
-        call_id: String,
-    },
-    CallBusy {
-        call_id: String,
-    },
-    MediaHoldStarted {
-        call_id: String,
-    },
-    MediaHoldStopped {
-        call_id: String,
-    },
-    MediaRingbackPassthroughStarted {
-        source: String,
-        target: String,
-    },
-    MediaRingbackPassthroughStopped {
-        source: String,
-        target: String,
-    },
-    MediaPlayStarted {
-        call_id: String,
-        leg_id: Option<String>,
-        track_id: String,
-    },
-    MediaPlayFinished {
-        call_id: String,
-        leg_id: Option<String>,
-        track_id: String,
-        interrupted: bool,
-    },
-    MediaStreamStarted {
-        call_id: String,
-    },
-    MediaStreamStopped {
-        call_id: String,
-    },
-    RecordStarted {
-        call_id: String,
-        recording_id: String,
-    },
-    RecordPaused {
-        call_id: String,
-        recording_id: String,
-    },
-    RecordResumed {
-        call_id: String,
-        recording_id: String,
-    },
-    RecordStopped {
-        call_id: String,
-        recording_id: String,
-        duration_secs: Option<u64>,
-    },
-    RecordFailed {
-        call_id: String,
-        recording_id: String,
-        error: String,
-    },
-    QueueJoined {
-        call_id: String,
-        queue_id: String,
-    },
-    QueuePositionChanged {
-        call_id: String,
-        queue_id: String,
-        position: u32,
-    },
-    QueueAgentOffered {
-        call_id: String,
-        queue_id: String,
-        agent_id: String,
-    },
-    QueueAgentConnected {
-        call_id: String,
-        queue_id: String,
-        agent_id: String,
-    },
-    QueueLeft {
-        call_id: String,
-        queue_id: String,
-        reason: Option<String>,
-    },
-    QueueWaitTimeout {
-        call_id: String,
-        queue_id: String,
-    },
-    QueueOverflowed {
-        call_id: String,
-        original_queue_id: String,
-        overflow_queue_id: String,
-        reason: String,
-    },
-    QueueVoicemailRedirected {
-        call_id: String,
-        queue_id: String,
-        reason: String,
-    },
-    SupervisorListenStarted {
-        supervisor_call_id: String,
-        target_call_id: String,
-    },
-    SupervisorWhisperStarted {
-        supervisor_call_id: String,
-        target_call_id: String,
-    },
-    SupervisorBargeStarted {
-        supervisor_call_id: String,
-        target_call_id: String,
-    },
-    SupervisorTakeoverStarted {
-        supervisor_call_id: String,
-        target_call_id: String,
-    },
-    SupervisorModeStopped {
-        supervisor_call_id: String,
-        target_call_id: String,
-    },
-    SipMessageReceived {
-        call_id: String,
-        content_type: String,
-        body: String,
-    },
-    SipNotifyReceived {
-        call_id: String,
-        event: String,
-        content_type: String,
-        body: String,
-    },
-    Dtmf {
-        call_id: String,
-        digit: String,
-        /// Leg that generated the DTMF
-        leg_id: Option<String>,
-    },
-    /// All requested DTMF digits have been collected (or timeout with ≥ min_digits).
-    DtmfCollected {
-        call_id: String,
-        /// Leg that provided the digits
-        leg_id: String,
-        /// Collected digit string (terminator excluded)
-        digits: String,
-    },
-    /// DtmfCollect timed out before the minimum number of digits was reached.
-    DtmfCollectionTimeout {
-        call_id: String,
-        leg_id: String,
-    },
-    ConferenceCreated {
-        conf_id: String,
-    },
-    ConferenceMemberJoined {
-        conf_id: String,
-        call_id: String,
-    },
-    ConferenceMemberLeft {
-        conf_id: String,
-        call_id: String,
-    },
-    ConferenceMemberMuted {
-        conf_id: String,
-        call_id: String,
-    },
-    ConferenceMemberUnmuted {
-        conf_id: String,
-        call_id: String,
-    },
-    ConferenceDestroyed {
-        conf_id: String,
-    },
-    ConferenceError {
-        conf_id: String,
-        error: String,
-    },
-    ConferenceConsultDialing {
-        call_id: String,
-        target: String,
-    },
-    ConferenceConsultConnected {
-        call_id: String,
-        target: String,
-    },
-    ConferenceMergeRequested {
-        call_id: String,
-        consultation_call_id: String,
-    },
-    ConferenceMerged {
-        conf_id: String,
-        call_id: String,
-    },
-    ConferenceMergeFailed {
-        conf_id: String,
-        call_id: String,
-        reason: String,
-    },
-    // CC addon events
-    AgentStateChanged {
-        agent_id: String,
-        from_status: String,
-        to_status: String,
-        call_id: Option<String>,
-    },
-    QueueCandidatesFound {
-        call_id: String,
-        queue_id: String,
-        candidates: Vec<String>,
-        trace_id: String,
-    },
-    QueueAgentRinging {
-        call_id: String,
-        queue_id: String,
-        agent_id: String,
-        trace_id: String,
-    },
-    QueueAgentNoAnswer {
-        call_id: String,
-        queue_id: String,
-        agent_id: String,
-        attempt: u32,
-        trace_id: String,
-    },
-    QueueAgentRejected {
-        call_id: String,
-        queue_id: String,
-        agent_id: String,
-        attempt: u32,
-        trace_id: String,
-    },
-    QueueFallbackExecuted {
-        call_id: String,
-        queue_id: String,
-        action: String,
-        reason: String,
-        trace_id: String,
-    },
-    QueueAlert {
-        queue_id: String,
-        alert_type: String,
-        message: String,
-    },
-    ConferenceSeatReplaceStarted {
-        conf_id: String,
-        old_call_id: String,
-        new_call_id: String,
-    },
-    ConferenceSeatReplaceSucceeded {
-        conf_id: String,
-        old_call_id: String,
-        new_call_id: String,
-    },
-    ConferenceSeatReplaceFailed {
-        conf_id: String,
-        old_call_id: String,
-        new_call_id: String,
-        reason: String,
-    },
-    ConferenceSeatReplaceRollbackFailed {
-        conf_id: String,
-        old_call_id: String,
-        new_call_id: String,
-        reason: String,
-    },
-    CallOwnershipChanged {
-        call_id: String,
-        session_id: String,
-        mode: String,
-    },
-    SessionResumed {
-        session_id: String,
-        last_sequence: u64,
-    },
-    ParallelOriginateStarted {
-        operation_id: String,
-        leg_count: u32,
-    },
-    ParallelOriginateLegRinging {
-        operation_id: String,
-        call_id: String,
-        destination: String,
-    },
-    ParallelOriginateWinner {
-        operation_id: String,
-        call_id: String,
-        destination: String,
-    },
-    ParallelOriginateLegCancelled {
-        operation_id: String,
-        call_id: String,
-        reason: String,
-    },
-    ParallelOriginateCompleted {
-        operation_id: String,
-        winning_call_id: String,
-    },
-    ParallelOriginateFailed {
-        operation_id: String,
-        reason: String,
-    },
+    Custom(crate::rwi::event::FlatEvent),
 }
 
 impl RwiEvent {
     pub fn call_id(&self) -> Option<&str> {
         match self {
-            RwiEvent::CallIncoming(data) => Some(&data.call_id),
-            RwiEvent::CallRinging { call_id } => Some(call_id),
-            RwiEvent::CallEarlyMedia { call_id } => Some(call_id),
-            RwiEvent::CallAnswered { call_id } => Some(call_id),
-            RwiEvent::CallUnbridged { call_id } => Some(call_id),
-            RwiEvent::CallTransferred { call_id } => Some(call_id),
-            RwiEvent::CallTransferAccepted { call_id } => Some(call_id),
-            RwiEvent::CallTransferFailed { call_id, .. } => Some(call_id),
-            RwiEvent::CallHangup { call_id, .. } => Some(call_id),
-            RwiEvent::CallNoAnswer { call_id } => Some(call_id),
-            RwiEvent::CallBusy { call_id } => Some(call_id),
-            RwiEvent::MediaHoldStarted { call_id } => Some(call_id),
-            RwiEvent::MediaHoldStopped { call_id } => Some(call_id),
-            RwiEvent::MediaRingbackPassthroughStarted { source, .. } => Some(source),
-            RwiEvent::MediaRingbackPassthroughStopped { source, .. } => Some(source),
-            RwiEvent::MediaPlayStarted { call_id, .. } => Some(call_id),
-            RwiEvent::MediaPlayFinished { call_id, .. } => Some(call_id),
-            RwiEvent::MediaStreamStarted { call_id } => Some(call_id),
-            RwiEvent::MediaStreamStopped { call_id } => Some(call_id),
-            RwiEvent::RecordStarted { call_id, .. } => Some(call_id),
-            RwiEvent::RecordPaused { call_id, .. } => Some(call_id),
-            RwiEvent::RecordResumed { call_id, .. } => Some(call_id),
-            RwiEvent::RecordStopped { call_id, .. } => Some(call_id),
-            RwiEvent::RecordFailed { call_id, .. } => Some(call_id),
-            RwiEvent::QueueJoined { call_id, .. } => Some(call_id),
-            RwiEvent::QueuePositionChanged { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAgentOffered { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAgentConnected { call_id, .. } => Some(call_id),
-            RwiEvent::QueueLeft { call_id, .. } => Some(call_id),
-            RwiEvent::QueueWaitTimeout { call_id, .. } => Some(call_id),
-            RwiEvent::QueueOverflowed { call_id, .. } => Some(call_id),
-            RwiEvent::QueueVoicemailRedirected { call_id, .. } => Some(call_id),
-            RwiEvent::SupervisorListenStarted {
-                supervisor_call_id, ..
-            } => Some(supervisor_call_id),
-            RwiEvent::SupervisorWhisperStarted {
-                supervisor_call_id, ..
-            } => Some(supervisor_call_id),
-            RwiEvent::SupervisorBargeStarted {
-                supervisor_call_id, ..
-            } => Some(supervisor_call_id),
-            RwiEvent::SupervisorTakeoverStarted {
-                supervisor_call_id, ..
-            } => Some(supervisor_call_id),
-            RwiEvent::SupervisorModeStopped {
-                supervisor_call_id, ..
-            } => Some(supervisor_call_id),
-            RwiEvent::SipMessageReceived { call_id, .. } => Some(call_id),
-            RwiEvent::SipNotifyReceived { call_id, .. } => Some(call_id),
-            RwiEvent::Dtmf { call_id, .. } => Some(call_id),
-            RwiEvent::DtmfCollected { call_id, .. } => Some(call_id),
-            RwiEvent::DtmfCollectionTimeout { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMemberJoined { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMemberLeft { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMemberMuted { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMemberUnmuted { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceConsultDialing { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceConsultConnected { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMergeRequested { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMerged { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceMergeFailed { call_id, .. } => Some(call_id),
-            RwiEvent::ConferenceSeatReplaceStarted { old_call_id, .. } => Some(old_call_id),
-            RwiEvent::ConferenceSeatReplaceSucceeded { old_call_id, .. } => Some(old_call_id),
-            RwiEvent::ConferenceSeatReplaceFailed { old_call_id, .. } => Some(old_call_id),
-            RwiEvent::ConferenceSeatReplaceRollbackFailed { old_call_id, .. } => Some(old_call_id),
-            RwiEvent::CallOwnershipChanged { call_id, .. } => Some(call_id),
-
-            RwiEvent::ParallelOriginateStarted { .. } => None,
-            RwiEvent::ParallelOriginateLegRinging { call_id, .. } => Some(call_id),
-            RwiEvent::ParallelOriginateWinner { call_id, .. } => Some(call_id),
-            RwiEvent::ParallelOriginateLegCancelled { call_id, .. } => Some(call_id),
-            RwiEvent::ParallelOriginateCompleted {
-                winning_call_id, ..
-            } => Some(winning_call_id),
-            RwiEvent::ParallelOriginateFailed { .. } => None,
-
-            RwiEvent::CallBridged { leg_a, .. } => Some(leg_a),
-            // CC addon events
-            RwiEvent::AgentStateChanged { call_id, .. } => call_id.as_deref(),
-            RwiEvent::QueueCandidatesFound { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAgentRinging { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAgentNoAnswer { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAgentRejected { call_id, .. } => Some(call_id),
-            RwiEvent::QueueFallbackExecuted { call_id, .. } => Some(call_id),
-            RwiEvent::QueueAlert { .. } => None,
-
-            RwiEvent::ConferenceCreated { .. } => None,
-            RwiEvent::ConferenceDestroyed { .. } => None,
-            RwiEvent::ConferenceError { .. } => None,
-            RwiEvent::SessionResumed { .. } => None,
+            RwiEvent::Custom(flat) => flat.call_id.as_deref(),
         }
+    }
+
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            RwiEvent::Custom(flat) => flat.event_type,
+        }
+    }
+
+    pub fn to_flat_value(&self) -> (Value, &'static str) {
+        match self {
+            RwiEvent::Custom(flat) => (flat.payload.clone(), flat.event_type),
+        }
+    }
+
+    pub fn enrich(self, _ctx: EventCallContext) -> Self {
+        match self {
+            RwiEvent::Custom(flat) => RwiEvent::Custom(flat),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CallMeta and CallMetaStore
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Per-call metadata for enriching events at dispatch time.
+#[derive(Debug, Clone, Default)]
+pub struct CallMeta {
+    pub caller: Option<String>,
+    pub callee: Option<String>,
+    pub caller_name: Option<String>,
+    pub callee_name: Option<String>,
+    pub direction: Option<String>,
+    pub trunk: Option<String>,
+    pub app_id: Option<String>,
+    pub routing_target: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+}
+
+impl From<CallMeta> for EventCallContext {
+    fn from(m: CallMeta) -> Self {
+        EventCallContext {
+            caller: m.caller,
+            callee: m.callee,
+            caller_name: m.caller_name,
+            callee_name: m.callee_name,
+            direction: m.direction,
+            trunk: m.trunk,
+            app_id: m.app_id,
+            routing_target: m.routing_target,
+            agent_id: m.agent_id,
+            agent_name: m.agent_name,
+        }
+    }
+}
+
+/// Thread-safe, in-memory store mapping call_id → CallMeta.
+pub struct CallMetaStore {
+    store: RwLock<HashMap<String, CallMeta>>,
+}
+
+impl CallMetaStore {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            store: RwLock::new(HashMap::new()),
+        })
+    }
+
+    pub async fn insert(&self, call_id: String, meta: CallMeta) {
+        self.store.write().await.insert(call_id, meta);
+    }
+
+    pub async fn get(&self, call_id: &str) -> Option<CallMeta> {
+        self.store.read().await.get(call_id).cloned()
+    }
+
+    /// Synchronous non-blocking lookup.
+    pub fn get_sync(&self, call_id: &str) -> Option<CallMeta> {
+        self.store.try_read().ok()?.get(call_id).cloned()
+    }
+
+    pub async fn remove(&self, call_id: &str) {
+        self.store.write().await.remove(call_id);
     }
 }
 
@@ -771,160 +473,86 @@ pub struct CallIncomingData {
     pub context: String,
     pub caller: String,
     pub callee: String,
-    pub direction: String,
+    pub dial_direction: String,
     pub trunk: Option<String>,
     #[serde(default)]
     pub sip_headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub root_call_id: Option<String>,
+    #[serde(default)]
+    pub caller_name: Option<String>,
+    #[serde(default)]
+    pub callee_name: Option<String>,
+    #[serde(default)]
+    pub called_phone: Option<String>,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub routing_target: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub routing_path: Option<Vec<String>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rwi_envelope_new() {
-        let envelope = RwiEnvelope::new(RwiCommand::SessionListCalls);
-        assert_eq!(envelope.version, RWI_VERSION);
-    }
-
-    #[test]
-    fn test_attach_mode_serialization() {
-        let json = r#""control""#;
-        let mode: AttachMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, AttachMode::Control));
-
-        let json = r#""listen""#;
-        let mode: AttachMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, AttachMode::Listen));
-
-        let json = r#""whisper""#;
-        let mode: AttachMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, AttachMode::Whisper));
-
-        let json = r#""barge""#;
-        let mode: AttachMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, AttachMode::Barge));
-    }
-
-    #[test]
-    fn test_reject_reason_serialization() {
-        let json = r#""busy""#;
-        let reason: RejectReason = serde_json::from_str(json).unwrap();
-        assert!(matches!(reason, RejectReason::Busy));
-
-        let json = r#""forbidden""#;
-        let reason: RejectReason = serde_json::from_str(json).unwrap();
-        assert!(matches!(reason, RejectReason::Forbidden));
-
-        let json = r#""not_found""#;
-        let reason: RejectReason = serde_json::from_str(json).unwrap();
-        assert!(matches!(reason, RejectReason::NotFound));
-    }
-
-    #[test]
-    fn test_ringback_mode_serialization() {
-        let json = r#""local""#;
-        let mode: RingbackMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, RingbackMode::Local));
-
-        let json = r#""passthrough""#;
-        let mode: RingbackMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, RingbackMode::Passthrough));
-
-        let json = r#""none""#;
-        let mode: RingbackMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, RingbackMode::None));
-    }
-
-    #[test]
-    fn test_media_source_serialization() {
-        let json = r#"{"type": "file", "uri": "welcome.wav", "looped": true}"#;
-        let source: MediaSource = serde_json::from_str(json).unwrap();
-        assert!(matches!(source.source_type, MediaSourceType::File));
-        assert_eq!(source.uri, Some("welcome.wav".to_string()));
-        assert_eq!(source.looped, Some(true));
-
-        let json = r#"{"type": "silence"}"#;
-        let source: MediaSource = serde_json::from_str(json).unwrap();
-        assert!(matches!(source.source_type, MediaSourceType::Silence));
-
-        let json = r#"{"type": "ringback"}"#;
-        let source: MediaSource = serde_json::from_str(json).unwrap();
-        assert!(matches!(source.source_type, MediaSourceType::Ringback));
-    }
-
-    #[test]
-    fn test_media_direction_serialization() {
-        let json = r#""send""#;
-        let dir: MediaDirection = serde_json::from_str(json).unwrap();
-        assert!(matches!(dir, MediaDirection::Send));
-
-        let json = r#""recv""#;
-        let dir: MediaDirection = serde_json::from_str(json).unwrap();
-        assert!(matches!(dir, MediaDirection::Recv));
-
-        let json = r#""sendrecv""#;
-        let dir: MediaDirection = serde_json::from_str(json).unwrap();
-        assert!(matches!(dir, MediaDirection::Sendrecv));
-    }
-
-    #[test]
-    fn test_record_mode_serialization() {
-        let json = r#""mixed""#;
-        let mode: RecordMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, RecordMode::Mixed));
-
-        let json = r#""separate_legs""#;
-        let mode: RecordMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, RecordMode::SeparateLegs));
-    }
-
-    #[test]
-    fn test_call_incoming_data_serialization() {
-        let json = r#"{
-            "call_id": "c_123",
-            "context": "default",
-            "caller": "1001",
-            "callee": "2000",
-            "direction": "inbound"
-        }"#;
-        let data: CallIncomingData = serde_json::from_str(json).unwrap();
-        assert_eq!(data.call_id, "c_123");
-        assert_eq!(data.caller, "1001");
-        assert_eq!(data.callee, "2000");
-        assert_eq!(data.direction, "inbound");
-    }
-
-    #[test]
-    fn test_seat_replace_events_call_id_mapping() {
-        let started = RwiEvent::ConferenceSeatReplaceStarted {
-            conf_id: "room-1".to_string(),
-            old_call_id: "call-old".to_string(),
-            new_call_id: "call-new".to_string(),
-        };
-        assert_eq!(started.call_id(), Some("call-old"));
-
-        let succeeded = RwiEvent::ConferenceSeatReplaceSucceeded {
-            conf_id: "room-1".to_string(),
-            old_call_id: "call-old".to_string(),
-            new_call_id: "call-new".to_string(),
-        };
-        assert_eq!(succeeded.call_id(), Some("call-old"));
-
-        let failed = RwiEvent::ConferenceSeatReplaceFailed {
-            conf_id: "room-1".to_string(),
-            old_call_id: "call-old".to_string(),
-            new_call_id: "call-new".to_string(),
-            reason: "busy".to_string(),
-        };
-        assert_eq!(failed.call_id(), Some("call-old"));
-
-        let rollback_failed = RwiEvent::ConferenceSeatReplaceRollbackFailed {
-            conf_id: "room-1".to_string(),
-            old_call_id: "call-old".to_string(),
-            new_call_id: "call-new".to_string(),
-            reason: "rollback error".to_string(),
-        };
-        assert_eq!(rollback_failed.call_id(), Some("call-old"));
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordingMetadata {
+    pub filename: String,
+    pub unique_id: String,
+    pub file_size: u64,
+    pub download_url: Option<String>,
+    pub caller_name: Option<String>,
+    pub callee_name: Option<String>,
+    pub called_phone: Option<String>,
+    pub call_type: String,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub call_start_time: Option<String>,
+    pub call_end_time: Option<String>,
+    pub upload_time: Option<String>,
+    pub switch_flag: Option<String>,
+    pub process_flag: Option<String>,
+    pub root_call_id: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IvrNodeInfo {
+    pub node_id: String,
+    pub node_name: String,
+    pub node_type: String,
+    pub routing_target: Option<String>,
+    pub previous_node_id: Option<String>,
+    pub next_node_id: Option<String>,
+    pub duration_ms: Option<u32>,
+    pub result_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IvrFlowContext {
+    pub app_id: String,
+    #[serde(default)]
+    pub routing_path: Vec<String>,
+    pub service_type: Option<String>,
+    pub customer_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CallMetadata {
+    pub root_call_id: Option<String>,
+    pub caller_name: Option<String>,
+    pub callee_name: Option<String>,
+    pub called_phone: Option<String>,
+    pub dial_direction: Option<String>,
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub routing_path: Option<Vec<String>>,
+    pub app_id: Option<String>,
+    pub routing_target: Option<String>,
+    pub switch_name: Option<String>,
+}
+
+

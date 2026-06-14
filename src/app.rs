@@ -1,7 +1,6 @@
 use crate::{
     callrecord::{
-        CallRecordFormatter, CallRecordManagerBuilder, CallRecordSender,
-        DefaultCallRecordFormatter, noop_saver, recording_upload::RecordingUploadHook,
+        CallRecordManagerBuilder, CallRecordSender, recording_upload::RecordingUploadHook,
         sipflow_upload::SipFlowUploadHook,
     },
     config::{ClusterConfig, Config, UserBackendConfig},
@@ -85,7 +84,6 @@ pub type AppState = Arc<AppStateInner>;
 pub struct AppStateBuilder {
     pub config: Option<Config>,
     pub callrecord_sender: Option<CallRecordSender>,
-    pub callrecord_formatter: Option<Arc<dyn CallRecordFormatter>>,
     pub cancel_token: Option<CancellationToken>,
     pub proxy_builder: Option<SipServerBuilder>,
     pub config_loaded_at: Option<DateTime<Utc>>,
@@ -194,7 +192,6 @@ impl AppStateBuilder {
         Self {
             config: None,
             callrecord_sender: None,
-            callrecord_formatter: None,
             cancel_token: None,
             proxy_builder: None,
             config_loaded_at: None,
@@ -292,16 +289,16 @@ impl AppStateBuilder {
             .filter(|policy| policy.uploads_recording())
             .cloned();
 
-        let callrecord_formatter = if let Some(formatter) = self.callrecord_formatter {
-            formatter
-        } else {
-            let formatter = if let Some(ref callrecord) = config.callrecord {
-                DefaultCallRecordFormatter::new_with_config(callrecord)
+        // Create RWI gateway early so it can be shared with call record hooks
+        // (e.g. RecordingUploadHook emits RecordingMetadataAvailable after upload).
+        let rwi_gateway: Option<crate::rwi::RwiGatewayRef> =
+            if config.rwi.is_some() || config.rwi_webhook.is_some() {
+                Some(std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::rwi::RwiGateway::new(),
+                )))
             } else {
-                DefaultCallRecordFormatter::default()
+                None
             };
-            Arc::new(formatter)
-        };
 
         let mut callrecord_stats = None;
         let mut callrecord_manager = None;
@@ -316,44 +313,44 @@ impl AppStateBuilder {
             //  - [sipflow.upload] is configured (post-call WAV upload)
             //  - [recording].type exports live recorder WAV after call completion.
             // DatabaseHook is always included so call records reach the DB.
-            let mut builder = CallRecordManagerBuilder::new()
-                .with_cancel_token(token.child_token())
-                .with_formatter(callrecord_formatter.clone());
+            let mut builder =
+                CallRecordManagerBuilder::new().with_cancel_token(token.child_token());
 
             if let Some(ref callrecord) = config.callrecord {
+                builder = builder.with_max_concurrent(callrecord.max_concurrent);
                 builder = builder.with_config(callrecord.clone());
-            } else {
-                // No CDR file output needed – use a no-op saver so only hooks run.
-                builder = builder
-                    .with_config(crate::config::CallRecordConfig::default())
-                    .with_saver(Arc::new(Box::new(noop_saver)));
-            }
-
-            // Attach the SipFlow upload hook if configured.
-            // Upload runs in a background task so it never blocks the call flow.
-            if let (Some(backend), Some(upload_cfg)) =
-                (sipflow_backend_arc.as_ref(), sipflow_upload_config.as_ref())
-            {
-                builder = builder.with_hook(Box::new(SipFlowUploadHook {
-                    backend: backend.clone(),
-                    upload_config: upload_cfg.clone(),
-                    db: Some(db_conn.clone()),
-                }));
             }
 
             if let Some(policy) = recording_upload_policy.as_ref() {
-                builder = builder.with_hook(Box::new(RecordingUploadHook::new(policy.clone())));
+                let mut hook = RecordingUploadHook::new(policy.clone())?;
+                if let Some(ref gw) = rwi_gateway {
+                    hook = hook.with_rwi_gateway(gw.clone());
+                }
+                builder = builder.with_hook(Box::new(hook));
             }
 
             builder = builder.with_hook(Box::new(DatabaseHook {
                 db: db_conn.clone(),
             }));
 
+            // Attach SipFlow upload after DatabaseHook so recording URL updates
+            // target a row that has already been inserted.
+            if let (Some(backend), Some(upload_cfg)) =
+                (sipflow_backend_arc.as_ref(), sipflow_upload_config.as_ref())
+            {
+                builder = builder.with_hook(Box::new(SipFlowUploadHook::new(
+                    backend.clone(),
+                    upload_cfg.clone(),
+                    Some(db_conn.clone()),
+                    rwi_gateway.clone(),
+                )?));
+            }
+
             for hook in addon_registry.get_call_record_hooks(&config, &db_conn) {
                 builder = builder.with_hook(hook);
             }
 
-            let manager = builder.build();
+            let manager = builder.build().await?;
             let sender = manager.sender.clone();
             callrecord_stats = Some(manager.stats.clone());
             callrecord_manager = Some(manager);
@@ -365,11 +362,7 @@ impl AppStateBuilder {
         #[cfg(feature = "console")]
         let console_state = match config.console.clone() {
             Some(console_config) => Some(
-                crate::console::ConsoleState::initialize(
-                    callrecord_formatter,
-                    db_conn.clone(),
-                    console_config,
-                )
+                crate::console::ConsoleState::initialize(db_conn.clone(), console_config)
                 .await?,
             ),
             None => None,
@@ -383,9 +376,7 @@ impl AppStateBuilder {
             callrecord_stats: callrecord_stats.clone(),
             storage: storage.clone(),
             rwi_auth: crate::rwi::create_rwi_auth(&config),
-            rwi_gateway: config.rwi.as_ref().map(|_| {
-                std::sync::Arc::new(tokio::sync::RwLock::new(crate::rwi::RwiGateway::new()))
-            }),
+            rwi_gateway: rwi_gateway.clone(),
             rwi_call_registry: None,
         });
 
@@ -437,6 +428,11 @@ impl AppStateBuilder {
                     .register_module("presence", PresenceModule::create)
                     .register_module("registrar", RegistrarModule::create)
                     .register_module("call", CallModule::create);
+
+                // Pass RWI gateway to the SIP server so call lifecycle events can be emitted.
+                if let Some(ref gw) = core.rwi_gateway {
+                    builder = builder.with_rwi_gateway(gw.clone());
+                }
 
                 // Apply addon proxy server hooks (including CC addon's AgentRegistry registration)
                 builder = addon_registry.apply_proxy_server_hooks(builder, core.clone());
@@ -502,9 +498,18 @@ impl AppStateBuilder {
         }
 
         if let Some(mut manager) = callrecord_manager {
-            tokio::spawn(async move {
+            crate::utils::spawn(async move {
                 manager.serve().await;
             });
+        }
+
+        // Start RWI webhook handler if configured.
+        if let Some(webhook_config) = config.rwi_webhook.clone()
+            && let Some(gateway_ref) = core.rwi_gateway.clone()
+        {
+            let webhook_tx = crate::rwi::webhook::start_rwi_webhook_handler(webhook_config);
+            let mut gw = gateway_ref.write();
+            gw.set_webhook_tx(webhook_tx);
         }
 
         // Initialize addons
@@ -808,13 +813,19 @@ pub fn create_router(state: AppState) -> Router {
         state.core.rwi_gateway.clone(),
         state.core.rwi_call_registry.clone(),
     ) {
+        let rwi_path = state
+            .config()
+            .proxy
+            .rwi_path
+            .clone()
+            .unwrap_or_else(|| "/rwi/v1".to_string());
         let rwi_auth = auth;
         let rwi_gateway = gateway.clone();
         let rwi_call_registry = call_registry.clone();
         let rwi_sip_server: Option<crate::proxy::server::SipServerRef> =
             Some(state.sip_server().get_inner());
         router = router.route(
-            "/rwi/v1",
+            &rwi_path,
             axum::routing::get(
                 async move |client_addr: crate::handler::middleware::clientaddr::ClientAddr,
                             ws: axum::extract::ws::WebSocketUpgrade,
@@ -843,7 +854,8 @@ pub fn create_router(state: AppState) -> Router {
 
     #[cfg(feature = "console")]
     if let Some(console_state) = state.console.clone() {
-        router = router.merge(crate::console::router(console_state));
+        router = router.merge(crate::console::router(console_state.clone()));
+        router = router.merge(crate::api::router(console_state));
     }
 
     let access_log_skip_paths = Arc::new(state.config().http_access_skip_paths.clone());

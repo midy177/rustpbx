@@ -103,7 +103,24 @@ impl CallSessionBuilder {
             original_caller,
             original_callee,
             max_forwards: self.max_forwards,
-            dtmf_digits: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            metadata: dialplan
+                .first_target()
+                .and_then(|loc| loc.headers.as_ref())
+                .and_then(|hdrs| {
+                    let meta: std::collections::HashMap<String, String> = hdrs
+                        .iter()
+                        .filter_map(|h| {
+                            let name = h.name().to_string();
+                            if name.starts_with("X-CRM-") || name.starts_with("X-CC-") {
+                                Some((name, h.value().to_string()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if meta.is_empty() { None } else { Some(meta) }
+                }),
         };
 
         SipSession::serve(server, context, tx, cancel_token, self.call_record_sender).await
@@ -143,7 +160,8 @@ impl CallSessionBuilder {
             original_caller: original_caller.clone(),
             original_callee: original_callee.clone(),
             max_forwards: 70,
-            dtmf_digits: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            metadata: None,
         };
 
         let reporter = crate::proxy::proxy_call::reporter::CallReporter {

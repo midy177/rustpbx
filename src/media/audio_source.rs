@@ -1,42 +1,3 @@
-/// Audio sources for unified PC architecture
-///
-/// This module provides a trait-based audio source system that enables dynamic
-/// audio source switching without recreating PeerConnections or renegotiating SDP.
-///
-/// # Supported Formats
-/// - **WAV files**: Using `hound` crate for reading PCM data
-/// - **MP3 files**: Using `minimp3` crate for decoding to PCM
-/// - **Raw audio**: PCMU, PCMA, G.722, G.729 encoded files
-///
-/// # File Sources
-/// - **Local files**: Direct file path (e.g., "/path/to/audio.wav")
-/// - **HTTP/HTTPS**: Remote files are automatically downloaded to temporary storage
-///   (e.g., "https://example.com/audio.mp3")
-///
-/// # Architecture
-/// The `AudioSource` trait defines a common interface for all audio sources.
-/// `FileAudioSource` handles actual file I/O and decoding, with format-specific
-/// implementations for WAV, MP3, and raw audio files.
-///
-/// `ResamplingAudioSource` wraps any `AudioSource` and provides automatic
-/// sample rate conversion using the `audio_codec::Resampler`.
-///
-/// `AudioSourceManager` manages the current active source and allows thread-safe
-/// switching between different audio sources at runtime.
-///
-/// # Usage in Queue System
-/// Queue hold music and prompts use the unified PC architecture:
-/// 1. Create a FileTrack with an initial audio file
-/// 2. Switch audio sources dynamically via `FileTrack::switch_audio_source()`
-/// 3. No re-INVITE or SDP renegotiation required
-///
-/// # Example
-/// ```ignore
-/// let manager = AudioSourceManager::new(8000, cancel_token);
-/// manager.switch_to_file("hold_music.wav".to_string(), true)?;
-/// // Later, switch to a different file
-/// manager.switch_to_file("announcement.mp3".to_string(), false)?;
-/// ```
 use anyhow::{Result, anyhow};
 use audio_codec::{CodecType, Decoder, Resampler, create_decoder};
 use std::fs::File;
@@ -45,6 +6,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{debug, warn};
+
+use crate::media::wav_reader::WavReader;
 
 pub trait AudioSource: Send + Sync {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize;
@@ -58,26 +21,30 @@ pub struct FileAudioSource {
     decoder: Box<dyn Decoder>,
     file_path: String,
     loop_playback: bool,
-    eof_reached: bool,
-    wav_reader: Option<hound::WavReader<BufReader<File>>>,
+    pub(crate) eof_reached: bool,
+    pub(crate) wav_reader: Option<WavReader<BufReader<File>>>,
     mp3_decoder: Option<minimp3::Decoder<BufReader<File>>>,
     mp3_buffer: Vec<i16>,
     mp3_buffer_pos: usize,
-    /// Actual sample rate detected from the first MP3 frame (replaces the old 44100 hardcode).
     mp3_sample_rate: u32,
-    /// Actual channel count detected from the first MP3 frame (replaces the old hardcoded 2).
     mp3_channels: u16,
     raw_file: Option<BufReader<File>>,
     raw_frame_size: usize,
     temp_file_path: Option<String>,
+    /// Pre-decoded PCM cache — populated once at construction.
+    /// All subsequent `read_samples` calls copy from here.
+    pub(crate) pcm_cache: Vec<i16>,
+    pub(crate) pcm_cache_pos: usize,
+    pub(crate) cached_channels: u16,
+    pub(crate) cached_sample_rate: u32,
 }
 
 impl FileAudioSource {
-    pub fn new(file_path: String, loop_playback: bool) -> Result<Self> {
+    pub async fn new(file_path: String, loop_playback: bool) -> Result<Self> {
         let (actual_path, temp_file_path) =
             if file_path.starts_with("http://") || file_path.starts_with("https://") {
                 debug!("Downloading audio file from URL: {}", file_path);
-                let temp_path = Self::download_file(&file_path)?;
+                let temp_path = Self::download_file(&file_path).await?;
                 (temp_path.clone(), Some(temp_path))
             } else {
                 if !Path::new(&file_path).exists() {
@@ -86,32 +53,25 @@ impl FileAudioSource {
                 (file_path.clone(), None)
             };
 
-        let codec_type = Self::detect_codec(&actual_path)?;
-        let decoder = create_decoder(codec_type);
-
         let extension = Path::new(&actual_path)
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
 
-        // Detect actual MP3 metadata by pre-reading the first frame.
         let mut mp3_sample_rate = 44100u32;
         let mut mp3_channels = 2u16;
         let mut initial_mp3_buffer: Vec<i16> = Vec::new();
 
-        let (wav_reader, mp3_decoder, raw_file) = match extension.as_str() {
+        let (wav_reader, codec_type, mp3_decoder, raw_file) = match extension.as_str() {
             "wav" => {
-                let reader = hound::WavReader::open(&actual_path)?;
-                (Some(reader), None, None)
+                let reader = WavReader::open(&actual_path)?;
+                (Some(reader), CodecType::PCMU, None, None)
             }
             "mp3" => {
                 let file = File::open(&actual_path)?;
                 let buf_reader = BufReader::new(file);
                 let mut mp3_dec = minimp3::Decoder::new(buf_reader);
-                // Pre-read the first frame to detect the actual sample rate and channel
-                // count.  The legacy code hard-coded 44100 / 2, which is wrong for
-                // telephony MP3s that are commonly 8 kHz mono.
                 match mp3_dec.next_frame() {
                     Ok(frame) => {
                         mp3_sample_rate = frame.sample_rate as u32;
@@ -128,14 +88,17 @@ impl FileAudioSource {
                         debug!(file = %actual_path, error = ?e, "Could not pre-read first MP3 frame, using fallback parameters");
                     }
                 }
-                (None, Some(mp3_dec), None)
+                (None, CodecType::PCMU, Some(mp3_dec), None)
             }
             _ => {
                 let file = File::open(&actual_path)?;
                 let buf_reader = BufReader::new(file);
-                (None, None, Some(buf_reader))
+                let codec = Self::detect_codec(&actual_path)?;
+                (None, codec, None, Some(buf_reader))
             }
         };
+
+        let decoder = create_decoder(codec_type);
 
         let raw_frame_size = match codec_type {
             CodecType::PCMU | CodecType::PCMA => 160,
@@ -144,7 +107,7 @@ impl FileAudioSource {
             _ => 160,
         };
 
-        Ok(Self {
+        let mut source = Self {
             decoder,
             file_path: actual_path,
             loop_playback,
@@ -158,11 +121,158 @@ impl FileAudioSource {
             raw_file,
             raw_frame_size,
             temp_file_path,
-        })
+            pcm_cache: Vec::new(),
+            pcm_cache_pos: 0,
+            cached_channels: 1,
+            cached_sample_rate: 8000,
+        };
+
+        // Pre-decode if the source is small enough to fit in a few MB.
+        source.decode_all_if_small()?;
+        Ok(source)
     }
 
-    /// Download file from HTTP URL to temporary location
-    fn download_file(url: &str) -> Result<String> {
+    /// Pre-decode if the raw data is ≤ ~10 MB (≈ 20 minutes of 8 kHz PCMU).
+    /// Larger files fall back to the per-frame streaming path to avoid
+    /// unbounded heap usage.
+    fn decode_all_if_small(&mut self) -> Result<()> {
+        // 5 MB of encoded data ≈ 10-20 minutes of 8 kHz audio.
+        const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+        let file_size = std::fs::metadata(&self.file_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_size > MAX_FILE_BYTES {
+            debug!(
+                file = %self.file_path,
+                bytes = file_size,
+                "Skipping pre-decode — file too large"
+            );
+            return Ok(());
+        }
+
+        self.decode_all()
+    }
+
+    /// Decode the entire source into `pcm_cache` (mono, native sample rate).
+    fn decode_all(&mut self) -> Result<()> {
+        let (channels, sample_rate) = self.meta();
+
+        // WAV path — drain the WavReader iterator.
+        if self.wav_reader.is_some() {
+            let mut pcm: Vec<i16> = Vec::new();
+            // collect() borrowed through a cell-like pattern — read one by one.
+            loop {
+                let sample = self.read_single_wav_sample();
+                match sample {
+                    Some(s) => pcm.push(s),
+                    None => break,
+                }
+            }
+            if channels > 1 {
+                pcm = mix_stereo_to_mono(&pcm, channels as usize);
+            }
+            self.cached_channels = 1;
+            self.cached_sample_rate = sample_rate;
+            self.pcm_cache = pcm;
+            debug!(
+                file = %self.file_path,
+                samples = self.pcm_cache.len(),
+                channels = channels,
+                rate = sample_rate,
+                "Pre-decoded WAV into PCM cache"
+            );
+            return Ok(());
+        }
+
+        // MP3 path — decode all frames.
+        if let Some(ref mut decoder) = self.mp3_decoder {
+            let mut pcm: Vec<i16> = Vec::new();
+            // Drain the initial buffer.
+            pcm.extend_from_slice(&self.mp3_buffer[self.mp3_buffer_pos..]);
+            loop {
+                match decoder.next_frame() {
+                    Ok(frame) => pcm.extend_from_slice(&frame.data),
+                    Err(minimp3::Error::Eof) => break,
+                    Err(e) => {
+                        warn!(file = %self.file_path, error = %e, "MP3 decode error during pre-decode");
+                        break;
+                    }
+                }
+            }
+            if channels > 1 {
+                pcm = mix_stereo_to_mono(&pcm, channels as usize);
+            }
+            self.cached_channels = 1;
+            self.cached_sample_rate = sample_rate;
+            self.pcm_cache = pcm;
+            self.mp3_decoder = None; // no longer needed
+            self.mp3_buffer.clear();
+            self.mp3_buffer_pos = 0;
+            debug!(
+                file = %self.file_path,
+                samples = self.pcm_cache.len(),
+                channels = channels,
+                rate = sample_rate,
+                "Pre-decoded MP3 into PCM cache"
+            );
+            return Ok(());
+        }
+
+        // Raw file path — read all frames and decode.
+        if let Some(ref mut reader) = self.raw_file {
+            let mut pcm: Vec<i16> = Vec::new();
+            let mut encoded_buf = vec![0u8; self.raw_frame_size];
+            loop {
+                match reader.read_exact(&mut encoded_buf) {
+                    Ok(_) => {
+                        let decoded = self.decoder.decode(&encoded_buf);
+                        pcm.extend_from_slice(&decoded);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => {
+                        warn!(file = %self.file_path, error = %e, "Raw file read error during pre-decode");
+                        break;
+                    }
+                }
+            }
+            self.cached_channels = 1;
+            self.cached_sample_rate = sample_rate;
+            self.pcm_cache = pcm;
+            self.raw_file = None; // no longer needed
+            debug!(
+                file = %self.file_path,
+                samples = self.pcm_cache.len(),
+                rate = sample_rate,
+                "Pre-decoded raw file into PCM cache"
+            );
+            return Ok(());
+        }
+
+        // No source — empty cache.
+        Ok(())
+    }
+
+    /// Read a single decoded i16 sample from the WAV reader.
+    fn read_single_wav_sample(&mut self) -> Option<i16> {
+        self.wav_reader
+            .as_mut()
+            .and_then(|r| r.samples().next())
+            .and_then(|r| r.ok())
+    }
+
+    /// Return (channels, sample_rate) from the underlying source.
+    fn meta(&self) -> (u16, u32) {
+        if let Some(ref reader) = self.wav_reader {
+            return (reader.spec().channels, reader.spec().sample_rate);
+        }
+        if self.mp3_decoder.is_some() {
+            return (self.mp3_channels, self.mp3_sample_rate);
+        }
+        (1, self.decoder.sample_rate())
+    }
+
+    async fn download_file(url: &str) -> Result<String> {
         let temp_dir = std::env::temp_dir();
         let file_name = url
             .split('/')
@@ -175,7 +285,8 @@ impl FileAudioSource {
 
         debug!("Downloading to temporary file: {:?}", temp_path);
 
-        let response = reqwest::blocking::get(url)
+        let response = reqwest::get(url)
+            .await
             .map_err(|e| anyhow!("Failed to download audio file: {}", e))?;
 
         if !response.status().is_success() {
@@ -184,6 +295,7 @@ impl FileAudioSource {
 
         let bytes = response
             .bytes()
+            .await
             .map_err(|e| anyhow!("Failed to read response body: {}", e))?;
 
         let mut file = File::create(&temp_path)
@@ -203,7 +315,6 @@ impl FileAudioSource {
             .unwrap_or("");
 
         match ext.to_lowercase().as_str() {
-            "wav" | "mp3" => Ok(CodecType::PCMU),
             _ => match CodecType::try_from(ext) {
                 Ok(codec) => Ok(codec),
                 Err(_) => match ext {
@@ -219,6 +330,19 @@ impl FileAudioSource {
     }
 }
 
+/// Mix interleaved multichannel PCM down to mono.
+pub(crate) fn mix_stereo_to_mono(samples: &[i16], channels: usize) -> Vec<i16> {
+    if channels == 1 {
+        return samples.to_vec();
+    }
+    let mut mono = Vec::with_capacity(samples.len() / channels);
+    for chunk in samples.chunks(channels) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        mono.push((sum / channels as i32) as i16);
+    }
+    mono
+}
+
 impl AudioSource for FileAudioSource {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
         if self.eof_reached && !self.loop_playback {
@@ -232,10 +356,28 @@ impl AudioSource for FileAudioSource {
             return 0;
         }
 
+        // Pre-decoded cache — fast path.
+        if !self.pcm_cache.is_empty() {
+            let remaining = self.pcm_cache.len() - self.pcm_cache_pos;
+            if remaining == 0 {
+                self.eof_reached = true;
+                return 0;
+            }
+            let copy = remaining.min(buffer.len());
+            buffer[..copy]
+                .copy_from_slice(&self.pcm_cache[self.pcm_cache_pos..self.pcm_cache_pos + copy]);
+            self.pcm_cache_pos += copy;
+            if self.pcm_cache_pos >= self.pcm_cache.len() {
+                self.eof_reached = true;
+            }
+            return copy;
+        }
+
+        // Legacy per-frame paths (should not be reached after pre-decode).
         if let Some(ref mut reader) = self.wav_reader {
             let mut samples_read = 0;
             for sample in buffer.iter_mut() {
-                match reader.samples::<i16>().next() {
+                match reader.samples().next() {
                     Some(Ok(s)) => {
                         *sample = s;
                         samples_read += 1;
@@ -251,10 +393,11 @@ impl AudioSource for FileAudioSource {
                     }
                 }
             }
-            samples_read
-        } else if let Some(ref mut decoder) = self.mp3_decoder {
-            let mut samples_read = 0;
+            return samples_read;
+        }
 
+        if let Some(ref mut decoder) = self.mp3_decoder {
+            let mut samples_read = 0;
             while samples_read < buffer.len() {
                 if self.mp3_buffer_pos < self.mp3_buffer.len() {
                     let available = (self.mp3_buffer.len() - self.mp3_buffer_pos)
@@ -264,12 +407,8 @@ impl AudioSource for FileAudioSource {
                     );
                     self.mp3_buffer_pos += available;
                     samples_read += available;
-
-                    if samples_read >= buffer.len() {
-                        break;
-                    }
+                    if samples_read >= buffer.len() { break; }
                 }
-
                 match decoder.next_frame() {
                     Ok(frame) => {
                         self.mp3_buffer = frame.data;
@@ -286,65 +425,64 @@ impl AudioSource for FileAudioSource {
                     }
                 }
             }
-            samples_read
-        } else if let Some(ref mut reader) = self.raw_file {
+            return samples_read;
+        }
+
+        if let Some(ref mut reader) = self.raw_file {
             let mut encoded_buf = vec![0u8; self.raw_frame_size];
             match reader.read_exact(&mut encoded_buf) {
                 Ok(_) => {
                     let pcm = self.decoder.decode(&encoded_buf);
                     let copy_len = pcm.len().min(buffer.len());
                     buffer[..copy_len].copy_from_slice(&pcm[..copy_len]);
-                    copy_len
+                    return copy_len;
                 }
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        self.eof_reached = true;
-                    } else {
+                    self.eof_reached = e.kind() == std::io::ErrorKind::UnexpectedEof;
+                    if !self.eof_reached {
                         warn!("Raw file read error: {}", e);
                         self.eof_reached = true;
                     }
-                    0
+                    return 0;
                 }
             }
-        } else {
-            for sample in buffer.iter_mut() {
-                *sample = 0;
-            }
-            buffer.len()
         }
+
+        for sample in buffer.iter_mut() { *sample = 0; }
+        buffer.len()
     }
 
     fn sample_rate(&self) -> u32 {
-        if let Some(ref reader) = self.wav_reader {
-            reader.spec().sample_rate
-        } else if self.mp3_decoder.is_some() {
-            // Use the rate detected during construction (was wrongly hardcoded to 44100).
-            self.mp3_sample_rate
-        } else {
-            self.decoder.sample_rate()
-        }
+        if !self.pcm_cache.is_empty() { return self.cached_sample_rate; }
+        if let Some(ref reader) = self.wav_reader { reader.spec().sample_rate }
+        else if self.mp3_decoder.is_some() { self.mp3_sample_rate }
+        else { self.decoder.sample_rate() }
     }
 
     fn channels(&self) -> u16 {
-        if let Some(ref reader) = self.wav_reader {
-            reader.spec().channels
-        } else if self.mp3_decoder.is_some() {
-            // Use the channels detected during construction (was wrongly hardcoded to 2).
-            self.mp3_channels
-        } else {
-            1
-        }
+        if !self.pcm_cache.is_empty() { return self.cached_channels; }
+        if let Some(ref reader) = self.wav_reader { reader.spec().channels }
+        else if self.mp3_decoder.is_some() { self.mp3_channels }
+        else { 1 }
     }
 
     fn has_data(&self) -> bool {
+        if !self.pcm_cache.is_empty() {
+            return self.pcm_cache_pos < self.pcm_cache.len() || self.loop_playback;
+        }
         !self.eof_reached || self.loop_playback
     }
 
     fn reset(&mut self) -> Result<()> {
         self.eof_reached = false;
 
-        if let Some(ref mut reader) = self.wav_reader {
-            *reader = hound::WavReader::open(&self.file_path)?;
+        if !self.pcm_cache.is_empty() {
+            self.pcm_cache_pos = 0;
+            return Ok(());
+        }
+
+        if self.wav_reader.is_some() {
+            self.wav_reader = Some(WavReader::open(&self.file_path)?);
         } else if self.mp3_decoder.is_some() {
             let file = File::open(&self.file_path)?;
             let buf_reader = BufReader::new(file);
@@ -371,7 +509,6 @@ impl Drop for FileAudioSource {
     }
 }
 
-/// Silence audio source
 pub struct SilenceSource {
     sample_rate: u32,
 }
@@ -407,12 +544,9 @@ impl AudioSource for SilenceSource {
     }
 }
 
-/// Audio source with resampling support
 pub struct ResamplingAudioSource {
     source: Box<dyn AudioSource>,
     resampler: Option<Resampler>,
-    /// Sample rate of the wrapped source — cached so `read_samples` can compute
-    /// the correct intermediate buffer size without holding a borrow on `source`.
     source_sample_rate: u32,
     target_sample_rate: u32,
     intermediate_buffer: Vec<i16>,
@@ -443,10 +577,6 @@ impl ResamplingAudioSource {
 impl AudioSource for ResamplingAudioSource {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
         if let Some(ref mut resampler) = self.resampler {
-            // Calculate how many source samples we need to fill `buffer`.
-            // The old code used `buffer.len()` which is the *target* size — when
-            // upsampling (e.g. 8 kHz → 44.1 kHz) that drastically under-reads the
-            // source.  Use ceiling division to avoid off-by-one shortfalls.
             let needed_source = (buffer.len() as u64 * self.source_sample_rate as u64)
                 .div_ceil(self.target_sample_rate as u64) as usize;
 
@@ -457,13 +587,11 @@ impl AudioSource for ResamplingAudioSource {
                 return 0;
             }
 
-            // Resample
             let resampled = resampler.resample(&self.intermediate_buffer[..read]);
             let copy_len = resampled.len().min(buffer.len());
             buffer[..copy_len].copy_from_slice(&resampled[..copy_len]);
             copy_len
         } else {
-            // No resampling needed
             self.source.read_samples(buffer)
         }
     }
@@ -485,7 +613,6 @@ impl AudioSource for ResamplingAudioSource {
     }
 }
 
-/// Audio source manager that handles source switching
 pub struct AudioSourceManager {
     current_source: Arc<Mutex<Option<Box<dyn AudioSource>>>>,
     target_sample_rate: u32,
@@ -501,8 +628,8 @@ impl AudioSourceManager {
         }
     }
 
-    pub fn switch_to_file(&self, file_path: String, loop_playback: bool) -> Result<()> {
-        let file_source = FileAudioSource::new(file_path.clone(), loop_playback)?;
+    pub async fn switch_to_file(&self, file_path: String, loop_playback: bool) -> Result<()> {
+        let file_source = FileAudioSource::new(file_path.clone(), loop_playback).await?;
         let resampling_source =
             ResamplingAudioSource::new(Box::new(file_source), self.target_sample_rate);
 
@@ -531,12 +658,10 @@ impl AudioSourceManager {
         if let Some(ref mut source) = *current {
             let read = source.read_samples(buffer);
             if read == 0 {
-                // Source is exhausted — wake any task waiting on completion.
                 self.completion_notify.notify_one();
             }
             read
         } else {
-            // No source, return silence
             for sample in buffer.iter_mut() {
                 *sample = 0;
             }
@@ -554,19 +679,6 @@ impl AudioSourceManager {
     }
 }
 
-/// Estimate the playback duration of an audio file without decoding the entire stream.
-///
-/// # Supported formats
-/// - **WAV**: reads the header to get exact duration.
-/// - **MP3**: approximates based on file size assuming 128 kbps.
-/// - **PCMU / PCMA** (extensions `.pcmu`, `.ulaw`, `.u`, `.pcma`, `.alaw`, `.a`):
-///   8000 Hz × 8-bit samples → 1 byte per millisecond per channel.
-/// - **G.722**: 8000 Hz encoded, 160 bytes per 20 ms frame.
-/// - **G.729**: 8000 Hz encoded, 10 bytes per 10 ms frame.
-/// - **Unknown**: defaults to 5 seconds.
-///
-/// Used by [`crate::proxy::proxy_call::session::CallSession::play_audio_file`] to
-/// schedule the `AudioComplete` event at the right time.
 pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
     use std::path::Path;
 
@@ -578,18 +690,20 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
 
     match ext.as_str() {
         "wav" => {
-            if let Ok(reader) = hound::WavReader::open(file_path) {
+            if let Ok(reader) = WavReader::open(file_path) {
                 let spec = reader.spec();
-                // `duration()` returns total frames (samples-per-channel), so
-                // dividing by sample_rate gives seconds.
-                let secs = reader.duration() as f64 / spec.sample_rate as f64;
+                let duration = reader.duration();
+                let secs = if spec.sample_rate > 0 {
+                    duration as f64 / spec.sample_rate as f64
+                } else {
+                    5.0
+                };
                 std::time::Duration::from_secs_f64(secs.max(0.005))
             } else {
                 std::time::Duration::from_secs(5)
             }
         }
         "mp3" => {
-            // No cheap header read for arbitrary MP3; estimate at 128 kbps.
             if let Ok(meta) = std::fs::metadata(file_path) {
                 let bits = meta.len() * 8;
                 let secs = bits as f64 / 128_000.0;
@@ -599,7 +713,6 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
             }
         }
         "pcmu" | "ulaw" | "u" | "pcma" | "alaw" | "a" => {
-            // 8000 Hz, 8-bit samples → 1 byte per millisecond.
             if let Ok(meta) = std::fs::metadata(file_path) {
                 std::time::Duration::from_millis(meta.len().max(100))
             } else {
@@ -607,7 +720,6 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
             }
         }
         "g722" => {
-            // 160 bytes per 20 ms frame at 8000 Hz half-rate encoding.
             if let Ok(meta) = std::fs::metadata(file_path) {
                 let frames = meta.len() / 160;
                 std::time::Duration::from_millis(frames.max(1) * 20)
@@ -616,7 +728,6 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
             }
         }
         "g729" => {
-            // 10 bytes per 10 ms frame.
             if let Ok(meta) = std::fs::metadata(file_path) {
                 let frames = meta.len() / 10;
                 std::time::Duration::from_millis(frames.max(1) * 10)
@@ -625,7 +736,6 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
             }
         }
         _ => {
-            // Generic raw PCM: assume 8000 Hz, 16-bit linear → 16000 bytes/sec.
             if let Ok(meta) = std::fs::metadata(file_path) {
                 let secs = meta.len() as f64 / 16_000.0;
                 std::time::Duration::from_secs_f64(secs.max(0.1))
@@ -639,25 +749,21 @@ pub fn estimate_audio_duration(file_path: &str) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::wav_reader::{SampleFormat, WavSpec, WavWriter};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    // ── helpers ──────────────────────────────────────────────────────────────
-
-    /// Write a minimal, valid WAV file with `num_samples` mono 16-bit PCM samples
-    /// at the given sample rate and return the path.
     fn write_wav(sample_rate: u32, samples: &[i16]) -> NamedTempFile {
         let mut tmp = NamedTempFile::with_suffix(".wav").expect("tempfile");
         {
-            let spec = hound::WavSpec {
+            let spec = WavSpec {
                 channels: 1,
                 sample_rate,
                 bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
+                sample_format: SampleFormat::Int,
             };
-            let mut writer =
-                hound::WavWriter::new(std::io::BufWriter::new(tmp.as_file_mut()), spec)
-                    .expect("WavWriter");
+            let mut writer = WavWriter::new(std::io::BufWriter::new(tmp.as_file_mut()), spec)
+                .expect("WavWriter");
             for &s in samples {
                 writer.write_sample(s).expect("write_sample");
             }
@@ -665,8 +771,6 @@ mod tests {
         }
         tmp
     }
-
-    // ── SilenceSource ────────────────────────────────────────────────────────
 
     #[test]
     fn test_silence_source_fills_zeros() {
@@ -690,17 +794,8 @@ mod tests {
         assert!(buffer.iter().all(|&s| s == 0));
     }
 
-    // ── ResamplingAudioSource buffer-size correctness ────────────────────────
-
-    /// The old code used `buffer.len()` for the intermediate buffer, which is
-    /// the *target* size.  When the source is at a higher rate (e.g. 44100)
-    /// and the target is lower (e.g. 8000), we must read MORE source samples
-    /// than the requested target frames.  This test verifies that read_samples
-    /// with a non-power-of-two ratio does not return 0 just because the
-    /// intermediate buffer was too small.
     #[test]
     fn test_resampling_downsample_44100_to_8000() {
-        // 44100 Hz source, 8000 Hz target.
         struct FixedRateSource {
             rate: u32,
             data: Vec<i16>,
@@ -737,14 +832,11 @@ mod tests {
         };
         let mut resampler = ResamplingAudioSource::new(Box::new(src), 8000);
 
-        // Request 160 target samples (20 ms at 8000 Hz).
-        // The source must provide ceil(160 * 44100 / 8000) = ceil(882) = 882 samples.
         let mut out = vec![0i16; 160];
         let read = resampler.read_samples(&mut out);
         assert!(
             read > 0,
-            "downsample 44100→8000: expected non-zero output, got 0 \
-             (likely intermediate buffer was too small)"
+            "downsample 44100→8000: expected non-zero output, got 0"
         );
     }
 
@@ -763,13 +855,10 @@ mod tests {
     fn test_resampling_same_rate_passthrough() {
         let silence = SilenceSource::new(8000);
         let mut resampling = ResamplingAudioSource::new(Box::new(silence), 8000);
-        // No resampler should be created.
         let mut buf = vec![0i16; 160];
         let read = resampling.read_samples(&mut buf);
         assert_eq!(read, 160);
     }
-
-    // ── AudioSourceManager ───────────────────────────────────────────────────
 
     #[test]
     fn test_audio_source_manager_silence() {
@@ -785,7 +874,6 @@ mod tests {
     #[test]
     fn test_audio_source_manager_no_source_returns_silence() {
         let manager = AudioSourceManager::new(8000);
-        // No source installed yet.
         let mut buf = vec![999i16; 160];
         let read = manager.read_samples(&mut buf);
         assert_eq!(read, 160);
@@ -797,7 +885,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_audio_source_manager_completion_notify_on_exhaustion() {
-        // A source that returns exactly one batch of samples and then EOF.
         struct OneShotSource {
             data: Vec<i16>,
             pos: usize,
@@ -826,7 +913,6 @@ mod tests {
         }
 
         let manager = Arc::new(AudioSourceManager::new(8000));
-        // Install a source with exactly 160 samples.
         {
             let src = OneShotSource {
                 data: vec![1i16; 160],
@@ -838,7 +924,7 @@ mod tests {
         }
 
         let manager_clone = manager.clone();
-        let notified = tokio::spawn(async move {
+        let notified = crate::utils::spawn(async move {
             tokio::time::timeout(
                 std::time::Duration::from_millis(500),
                 manager_clone.wait_for_completion(),
@@ -846,12 +932,10 @@ mod tests {
             .await
         });
 
-        // Drain the source completely.
         let mut buf = vec![0i16; 160];
         let read = manager.read_samples(&mut buf);
         assert_eq!(read, 160, "should read all 160 samples");
 
-        // Next read returns 0 → triggers the notify.
         let read2 = manager.read_samples(&mut buf);
         assert_eq!(read2, 0, "source should be exhausted");
 
@@ -861,14 +945,13 @@ mod tests {
             .expect("completion notify not fired within 500 ms");
     }
 
-    // ── WAV file reading ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_wav_file_source_reads_samples() {
+    #[tokio::test]
+    async fn test_wav_file_source_reads_samples() {
         let pcm: Vec<i16> = (0i16..160).collect();
         let tmp = write_wav(8000, &pcm);
 
         let mut src = FileAudioSource::new(tmp.path().to_str().unwrap().to_string(), false)
+            .await
             .expect("FileAudioSource::new for WAV");
 
         assert_eq!(src.sample_rate(), 8000);
@@ -881,54 +964,48 @@ mod tests {
         assert_eq!(&buf[..], &pcm[..], "samples must match what was written");
     }
 
-    #[test]
-    fn test_wav_file_source_eof_no_loop() {
+    #[tokio::test]
+    async fn test_wav_file_source_eof_no_loop() {
         let pcm: Vec<i16> = vec![42i16; 80];
         let tmp = write_wav(8000, &pcm);
 
         let mut src = FileAudioSource::new(tmp.path().to_str().unwrap().to_string(), false)
+            .await
             .expect("FileAudioSource::new");
 
         let mut buf = vec![0i16; 160];
-        // First read – fills 80 samples, then EOF.
         let _read1 = src.read_samples(&mut buf);
         assert!(!src.has_data(), "no loop → EOF marks source as exhausted");
 
-        // Second read returns 0.
         let read2 = src.read_samples(&mut buf);
         assert_eq!(read2, 0);
     }
 
-    #[test]
-    fn test_wav_file_source_loop() {
+    #[tokio::test]
+    async fn test_wav_file_source_loop() {
         let pcm: Vec<i16> = vec![1i16; 80];
         let tmp = write_wav(8000, &pcm);
 
         let mut src = FileAudioSource::new(tmp.path().to_str().unwrap().to_string(), true)
+            .await
             .expect("FileAudioSource::new");
 
-        // First fill might hit EOF and reset.
         let mut buf = vec![0i16; 240];
         let _read = src.read_samples(&mut buf);
-        // has_data must remain true because loop=true.
         assert!(src.has_data(), "looping source must always have data");
     }
 
-    #[test]
-    fn test_wav_file_source_missing_file() {
-        let result = FileAudioSource::new("/nonexistent/path/sample.wav".to_string(), false);
+    #[tokio::test]
+    async fn test_wav_file_source_missing_file() {
+        let result = FileAudioSource::new("/nonexistent/path/sample.wav".to_string(), false).await;
         assert!(result.is_err(), "missing file must return an error");
     }
 
-    // ── estimate_audio_duration ──────────────────────────────────────────────
-
-    #[test]
-    fn test_estimate_duration_wav_exact() {
-        // 8000 Hz, 160 samples → exactly 20 ms.
-        let pcm: Vec<i16> = vec![0i16; 8000]; // 1 second
+    #[tokio::test]
+    async fn test_estimate_duration_wav_exact() {
+        let pcm: Vec<i16> = vec![0i16; 8000];
         let tmp = write_wav(8000, &pcm);
         let dur = estimate_audio_duration(tmp.path().to_str().unwrap());
-        // Allow ±5 ms tolerance for any rounding.
         assert!(
             dur.as_millis() >= 995 && dur.as_millis() <= 1005,
             "WAV 1-second file: expected ~1000 ms, got {} ms",
@@ -938,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_estimate_duration_wav_short() {
-        let pcm: Vec<i16> = vec![0i16; 160]; // 20 ms at 8000 Hz
+        let pcm: Vec<i16> = vec![0i16; 160];
         let tmp = write_wav(8000, &pcm);
         let dur = estimate_audio_duration(tmp.path().to_str().unwrap());
         assert!(
@@ -950,8 +1027,7 @@ mod tests {
 
     #[test]
     fn test_estimate_duration_pcmu_raw() {
-        // PCMU raw: 8000 Hz, 8-bit → 1 byte per millisecond.
-        let data = vec![0u8; 8000]; // 1 second
+        let data = vec![0u8; 8000];
         let mut tmp = NamedTempFile::with_suffix(".pcmu").expect("tempfile");
         tmp.write_all(&data).unwrap();
         let dur = estimate_audio_duration(tmp.path().to_str().unwrap());
@@ -964,8 +1040,7 @@ mod tests {
 
     #[test]
     fn test_estimate_duration_g722() {
-        // G.722: 160 bytes per 20 ms frame.
-        let data = vec![0u8; 1600]; // 10 frames = 200 ms
+        let data = vec![0u8; 1600];
         let mut tmp = NamedTempFile::with_suffix(".g722").expect("tempfile");
         tmp.write_all(&data).unwrap();
         let dur = estimate_audio_duration(tmp.path().to_str().unwrap());
@@ -978,8 +1053,7 @@ mod tests {
 
     #[test]
     fn test_estimate_duration_g729() {
-        // G.729: 10 bytes per 10 ms frame.
-        let data = vec![0u8; 100]; // 10 frames = 100 ms
+        let data = vec![0u8; 100];
         let mut tmp = NamedTempFile::with_suffix(".g729").expect("tempfile");
         tmp.write_all(&data).unwrap();
         let dur = estimate_audio_duration(tmp.path().to_str().unwrap());
@@ -1002,7 +1076,6 @@ mod tests {
 
     #[test]
     fn test_estimate_duration_unknown_extension_uses_pcm_formula() {
-        // 16000 bytes / 16000 bytes_per_sec = 1 second.
         let data = vec![0u8; 16000];
         let mut tmp = NamedTempFile::with_suffix(".xyz").expect("tempfile");
         tmp.write_all(&data).unwrap();
@@ -1014,3 +1087,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod audio_source_predecode_tests;

@@ -3,6 +3,7 @@ use crate::{
     callrecord::{
         CallDetails, CallRecord, CallRecordHangupMessage, CallRecordHangupReason,
         CallRecordLastError, CallRecordMedia, CallRecordRewrite, CallRecordSender,
+        format_sipflow_media_key,
     },
     models::call_record::extract_sip_username,
     proxy::{
@@ -35,6 +36,7 @@ impl CallReporter {
             start_time
                 + Duration::from_std(at.duration_since(self.context.start_time)).unwrap_or_default()
         });
+        let call_was_accepted = snapshot.answer_time.is_some();
 
         let status_code = snapshot
             .last_error
@@ -45,7 +47,7 @@ impl CallReporter {
         let hangup_reason = snapshot.hangup_reason.clone().or_else(|| {
             if snapshot.last_error.is_some() {
                 Some(CallRecordHangupReason::Failed)
-            } else if snapshot.answer_time.is_some() {
+            } else if call_was_accepted {
                 Some(CallRecordHangupReason::BySystem)
             } else {
                 Some(CallRecordHangupReason::Failed)
@@ -122,7 +124,7 @@ impl CallReporter {
         let direction = self.context.dialplan.direction.to_string();
 
         // Helper to resolve call status (copied from proxy_call.rs logic)
-        let status = if snapshot.answer_time.is_some() {
+        let status = if call_was_accepted {
             "completed".to_string()
         } else if snapshot.last_error.is_some() {
             "failed".to_string()
@@ -147,7 +149,8 @@ impl CallReporter {
 
         let mut recorder = Vec::new();
 
-        if self.context.dialplan.recording.enabled
+        if call_was_accepted
+            && self.context.dialplan.recording.enabled
             && let Some(recorder_config) = self.context.dialplan.recording.option.as_ref()
             && !recorder_config.recorder_file.is_empty()
         {
@@ -164,6 +167,7 @@ impl CallReporter {
         tracing::info!(
             recording = ?self.context.dialplan.recording,
             has_sipflow_backend = ?has_sipflow_backend,
+            call_was_accepted,
             "Call recording files collected: {:?}",
             recorder
         );
@@ -194,7 +198,8 @@ impl CallReporter {
             ..Default::default()
         };
 
-        if details.recording_url.is_none()
+        if call_was_accepted
+            && details.recording_url.is_none()
             && self.server.proxy_config.recording.is_none()
             && let Some(crate::config::SipFlowConfig::Local {
                 upload:
@@ -202,23 +207,24 @@ impl CallReporter {
                         bucket,
                         endpoint,
                         root,
+                        media,
                         ..
                     }),
                 ..
             }) = self.server.sipflow_config.as_ref()
+            && media.unwrap_or(true)
         {
-            let date_prefix = start_time.format("%Y%m%d").to_string();
-            let key = format!("{}/{}.wav", date_prefix, self.context.session_id);
+            let mut tmp = CallRecord::default();
+            tmp.call_id = self.context.session_id.clone();
+            tmp.start_time = start_time;
+            let key = format_sipflow_media_key(&tmp);
             let full_key = if root.is_empty() {
                 key
             } else {
                 format!("{}/{}", root.trim_end_matches('/'), key)
             };
-            details.recording_url = Some(format!(
-                "{}/{}/{}",
-                endpoint.trim_end_matches('/'),
-                bucket.trim_matches('/'),
-                full_key.trim_start_matches('/')
+            details.recording_url = Some(crate::callrecord::sipflow_upload::sipflow_s3_url(
+                endpoint, bucket, &full_key,
             ));
             details.recording_duration_secs = Some((now - start_time).num_seconds().max(0) as i32);
         }

@@ -1,13 +1,12 @@
 use crate::call::{DialDirection, DialStrategy, RoutingState};
 use crate::call::{FailureAction, QueueFallbackAction};
-use crate::config::RouteResult;
+use crate::config::{MediaProxyMode, RecordingPolicy, RouteResult};
 use crate::proxy::call::q850_reason_value;
 use crate::proxy::routing::matcher::{RouteResourceLookup, match_invite};
 use crate::proxy::routing::{
-    DestConfig, MatchConditions, QueueDialMode, RejectConfig, RewriteRules, RouteAction,
-    RouteDirection, RouteQueueConfig, RouteQueueFallbackConfig, RouteQueueHoldConfig,
-    RouteQueueStrategyConfig, RouteQueueTargetConfig, RouteRule, SourceTrunk, TrunkConfig,
-    TrunkDirection,
+    DestConfig, MatchConditions, MediaMode, QueueDialMode, RejectConfig, RewriteRules, RouteAction,
+    RouteQueueConfig, RouteQueueFallbackConfig, RouteQueueHoldConfig, RouteQueueStrategyConfig,
+    RouteQueueTargetConfig, RouteRule, SourceTrunk, TrunkConfig, TrunkDirection, VideoPolicy,
 };
 use async_trait::async_trait;
 use rsipstack::dialog::invitation::InviteOption;
@@ -46,6 +45,117 @@ async fn test_match_invite_no_routes() {
             panic!("Unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+    }
+}
+
+#[tokio::test]
+async fn test_source_trunk_codecs_apply_when_no_route_handles_call() {
+    let routing_state = Arc::new(RoutingState::new());
+    let option = create_test_invite_option();
+    let origin = create_test_request();
+
+    let mut trunks = HashMap::new();
+    trunks.insert(
+        "inbound-trunk".to_string(),
+        TrunkConfig {
+            dest: "sip:192.168.3.7:5060".to_string(),
+            codec: vec!["pcma".to_string()],
+            direction: Some(TrunkDirection::Inbound),
+            inbound_hosts: vec!["192.168.3.7".to_string()],
+            ..Default::default()
+        },
+    );
+    let routes = vec![];
+    let source_trunk = SourceTrunk {
+        name: "inbound-trunk".to_string(),
+        id: None,
+        direction: Some(TrunkDirection::Inbound),
+    };
+
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        option,
+        &origin,
+        Some(&source_trunk),
+        routing_state,
+        &DialDirection::Inbound,
+    )
+    .await
+    .expect("invite should resolve to not handled with source trunk hints");
+
+    match result {
+        RouteResult::NotHandled(_, Some(hints)) => {
+            assert_eq!(hints.allow_codecs, Some(vec!["pcma".to_string()]));
+        }
+        _ => panic!("expected not handled with source trunk codec hints"),
+    }
+}
+
+#[tokio::test]
+async fn test_selected_trunk_codecs_override_source_trunk_codecs() {
+    let routing_state = Arc::new(RoutingState::new());
+    let mut trunks = HashMap::new();
+
+    trunks.insert(
+        "inbound-trunk".to_string(),
+        TrunkConfig {
+            dest: "sip:192.168.3.7:5060".to_string(),
+            codec: vec!["pcma".to_string()],
+            direction: Some(TrunkDirection::Inbound),
+            inbound_hosts: vec!["192.168.3.7".to_string()],
+            ..Default::default()
+        },
+    );
+    trunks.insert(
+        "outbound-trunk".to_string(),
+        TrunkConfig {
+            dest: "sip:gateway.rustpbx.com:5060".to_string(),
+            codec: vec!["pcmu".to_string()],
+            direction: Some(TrunkDirection::Outbound),
+            ..Default::default()
+        },
+    );
+
+    let routes = vec![RouteRule {
+        name: "forward_to_outbound".to_string(),
+        priority: 100,
+        match_conditions: MatchConditions {
+            to_user: Some("1001".to_string()),
+            ..Default::default()
+        },
+        action: RouteAction {
+            dest: Some(DestConfig::Single("outbound-trunk".to_string())),
+            select: "rr".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    let source_trunk = SourceTrunk {
+        name: "inbound-trunk".to_string(),
+        id: None,
+        direction: Some(TrunkDirection::Inbound),
+    };
+
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        Some(&source_trunk),
+        routing_state,
+        &DialDirection::Inbound,
+    )
+    .await
+    .expect("invite should match outbound route");
+
+    match result {
+        RouteResult::Forward(_, Some(hints)) => {
+            assert_eq!(hints.allow_codecs, Some(vec!["pcmu".to_string()]));
+        }
+        _ => panic!("expected forward with selected trunk codec hints"),
     }
 }
 
@@ -200,7 +310,6 @@ async fn test_match_invite_inbound_respects_source_trunk() {
     let routes = vec![RouteRule {
         name: "inbound-route".to_string(),
         priority: 10,
-        direction: RouteDirection::Inbound,
         source_trunks: vec!["ingress".to_string()],
         match_conditions: MatchConditions {
             to_user: Some("1001".to_string()),
@@ -248,7 +357,7 @@ async fn test_match_invite_inbound_respects_source_trunk() {
 }
 
 #[tokio::test]
-async fn test_match_invite_inbound_without_source_trunk() {
+async fn test_source_trunks_must_match_inbound() {
     let routing_state = Arc::new(RoutingState::new());
     let mut trunks = HashMap::new();
     trunks.insert(
@@ -263,7 +372,6 @@ async fn test_match_invite_inbound_without_source_trunk() {
     let routes = vec![RouteRule {
         name: "inbound-route".to_string(),
         priority: 10,
-        direction: RouteDirection::Inbound,
         source_trunks: vec!["ingress".to_string()],
         match_conditions: MatchConditions {
             to_user: Some("1001".to_string()),
@@ -317,6 +425,14 @@ async fn test_match_invite_exact_match() {
             username: Some("testuser".to_string()),
             password: Some("testpass".to_string()),
             transport: Some("udp".to_string()),
+            codec: vec!["pcma".to_string()],
+            media_mode: Some(MediaMode::Bypass),
+            video_policy: Some(VideoPolicy::Strip),
+            recording: Some(RecordingPolicy {
+                enabled: true,
+                auto_start: Some(false),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     );
@@ -360,7 +476,7 @@ async fn test_match_invite_exact_match() {
 
     match result {
         RouteResult::NotHandled(_, _) => panic!("Expected forward, got not handled"),
-        RouteResult::Forward(option, _) => {
+        RouteResult::Forward(option, hints) => {
             // Verify destination is set
             assert!(option.destination.is_some());
             let dest = option.destination.unwrap();
@@ -371,6 +487,16 @@ async fn test_match_invite_exact_match() {
             let cred = option.credential.unwrap();
             assert_eq!(cred.username, "testuser");
             assert_eq!(cred.password, "testpass");
+
+            let hints = hints.expect("selected trunk codec should produce dialplan hints");
+            assert_eq!(hints.allow_codecs, Some(vec!["pcma".to_string()]));
+            assert_eq!(hints.media_mode, Some(MediaProxyMode::Bypass));
+            assert_eq!(hints.video_policy, Some(VideoPolicy::Strip));
+            let recording = hints
+                .recording
+                .expect("selected trunk recording should produce recording hint");
+            assert!(recording.enabled);
+            assert_eq!(recording.auto_start, Some(false));
         }
         RouteResult::Abort(_, _) => panic!("Expected forward, got abort"),
         RouteResult::Queue { .. } => {
@@ -378,6 +504,70 @@ async fn test_match_invite_exact_match() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
     }
+}
+
+#[tokio::test]
+async fn test_route_codecs_override_selected_trunk_codecs() {
+    let routing_state = Arc::new(RoutingState::new());
+    let mut trunks = HashMap::new();
+
+    trunks.insert(
+        "pcma_trunk".to_string(),
+        TrunkConfig {
+            dest: "sip:gateway.rustpbx.com:5060".to_string(),
+            codec: vec!["pcma".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let routes = vec![RouteRule {
+        name: "route_codec_rule".to_string(),
+        priority: 100,
+        match_conditions: MatchConditions {
+            to_user: Some("1001".to_string()),
+            ..Default::default()
+        },
+        action: RouteAction {
+            dest: Some(DestConfig::Single("pcma_trunk".to_string())),
+            select: "rr".to_string(),
+            ..Default::default()
+        },
+        codecs: vec!["pcmu".to_string()],
+        ..Default::default()
+    }];
+
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        None,
+        routing_state,
+        &DialDirection::Outbound,
+    )
+    .await
+    .expect("invite should match route");
+
+    match result {
+        RouteResult::Forward(_, Some(hints)) => {
+            assert_eq!(hints.allow_codecs, Some(vec!["pcmu".to_string()]));
+        }
+        _ => panic!("expected forward with route codec hints"),
+    }
+}
+
+#[test]
+fn test_trunk_config_accepts_allow_codecs_alias() {
+    let trunk: TrunkConfig = toml::from_str(
+        r#"
+        dest = "sip:gateway.rustpbx.com:5060"
+        allow_codecs = ["pcma", "pcmu"]
+        "#,
+    )
+    .expect("trunk config should parse allow_codecs");
+
+    assert_eq!(trunk.codec, vec!["pcma".to_string(), "pcmu".to_string()]);
 }
 
 #[tokio::test]
@@ -489,7 +679,6 @@ async fn test_match_invite_queue_action_builds_hold_and_fallback() {
     let routes = vec![RouteRule {
         name: "support-queue".to_string(),
         priority: 50,
-        direction: RouteDirection::Inbound,
         match_conditions: MatchConditions {
             to_user: Some("1001".to_string()),
             ..Default::default()
@@ -550,6 +739,153 @@ async fn test_match_invite_queue_action_builds_hold_and_fallback() {
         RouteResult::Abort(..) => panic!("queue route aborted"),
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
     }
+}
+
+#[tokio::test]
+async fn test_rule_without_source_trunks_matches_any_source() {
+    let routing_state = Arc::new(RoutingState::new());
+    let trunks = HashMap::new();
+    let routes = vec![RouteRule {
+        name: "catch-all".to_string(),
+        priority: 100,
+        match_conditions: MatchConditions {
+            to_user: Some("1001".to_string()),
+            ..Default::default()
+        },
+        action: RouteAction {
+            dest: Some(DestConfig::Single("carrier".to_string())),
+            select: "rr".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+
+    let source_trunk = SourceTrunk {
+        name: "inbound-carrier".to_string(),
+        id: None,
+        direction: Some(TrunkDirection::Inbound),
+    };
+
+    // Rule should match inbound calls (with source trunk)
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        Some(&source_trunk),
+        routing_state.clone(),
+        &DialDirection::Inbound,
+    )
+    .await
+    .expect("rule should match inbound call");
+    assert!(
+        matches!(&result, RouteResult::Forward(_, _)),
+        "expected Forward for inbound call with no source_trunks restriction"
+    );
+
+    // Rule should also match outbound calls (no source trunk)
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        None,
+        routing_state.clone(),
+        &DialDirection::Outbound,
+    )
+    .await
+    .expect("rule should match outbound call");
+    assert!(
+        matches!(&result, RouteResult::Forward(_, _)),
+        "expected Forward for outbound call with no source_trunks restriction"
+    );
+}
+
+#[tokio::test]
+async fn test_source_trunks_filters_by_trunk_name() {
+    let routing_state = Arc::new(RoutingState::new());
+    let trunks = HashMap::new();
+    let routes = vec![RouteRule {
+        name: "specific-trunk-rule".to_string(),
+        priority: 100,
+        source_trunks: vec!["carrier-a".to_string()],
+        match_conditions: MatchConditions {
+            to_user: Some("1001".to_string()),
+            ..Default::default()
+        },
+        action: RouteAction {
+            dest: Some(DestConfig::Single("carrier-a".to_string())),
+            select: "rr".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+
+    // Match: call from carrier-a
+    let source_trunk = SourceTrunk {
+        name: "carrier-a".to_string(),
+        id: None,
+        direction: Some(TrunkDirection::Inbound),
+    };
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        Some(&source_trunk),
+        routing_state.clone(),
+        &DialDirection::Inbound,
+    )
+    .await
+    .expect("rule should match call from carrier-a");
+    assert!(
+        matches!(&result, RouteResult::Forward(_, _)),
+        "expected Forward for matching source_trunk"
+    );
+
+    // No match: call from carrier-b
+    let source_trunk_b = SourceTrunk {
+        name: "carrier-b".to_string(),
+        id: None,
+        direction: Some(TrunkDirection::Inbound),
+    };
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        Some(&source_trunk_b),
+        routing_state.clone(),
+        &DialDirection::Inbound,
+    )
+    .await
+    .expect("rule should resolve NotHandled for different source_trunk");
+    assert!(
+        matches!(&result, RouteResult::NotHandled(_, _)),
+        "expected NotHandled for non-matching source_trunk"
+    );
+
+    // No match: no source trunk (outbound call)
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        create_test_invite_option(),
+        &create_test_request(),
+        None,
+        routing_state.clone(),
+        &DialDirection::Outbound,
+    )
+    .await
+    .expect("rule should not match outbound call");
+    assert!(
+        matches!(&result, RouteResult::NotHandled(_, _)),
+        "expected NotHandled for outbound call (no source trunk)"
+    );
 }
 
 #[test]
@@ -615,6 +951,8 @@ fn test_queue_busy_prompt_maps_to_failure_audio() {
             busy_prompt: Some("config/sounds/queue-busy-zh.wav".to_string()),
             off_hours_prompt: None,
             no_answer_prompt: None,
+            position_prompt: None,
+            wait_time_prompt: None,
         }),
         ..RouteQueueConfig::default()
     };
@@ -1645,6 +1983,77 @@ async fn test_match_invite_application_auto_answer_false() {
         } => {
             assert_eq!(app_name, "custom_app");
             assert!(!auto_answer);
+        }
+        _ => panic!("Expected Application"),
+    }
+}
+
+#[tokio::test]
+async fn test_match_invite_application_with_rewrite_headers() {
+    let routing_state = Arc::new(RoutingState::new());
+    let routes = vec![RouteRule {
+        name: "app_with_headers".to_string(),
+        priority: 100,
+        match_conditions: MatchConditions {
+            to_user: Some("ivrapp".to_string()),
+            ..Default::default()
+        },
+        rewrite: Some(RewriteRules {
+            headers: vec![
+                ("header.X-Custom".to_string(), "custom-value".to_string()),
+                ("header.P-Asserted-Identity".to_string(), "<sip:routing@pbx.com>".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }),
+        action: RouteAction {
+            action: Some("application".to_string()),
+            app: Some("ivr".to_string()),
+            app_params: Some(serde_json::json!({"file": "config/ivr/test.toml"})),
+            auto_answer: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+
+    let option = create_invite_option(
+        "sip:alice@rustpbx.com",
+        "sip:ivrapp@rustpbx.com",
+        None,
+        Some("application/sdp"),
+        None,
+    );
+    let origin = create_test_request();
+    let trunks = HashMap::new();
+
+    let result = match_invite(
+        Some(&trunks),
+        Some(&routes),
+        None,
+        option,
+        &origin,
+        None,
+        routing_state,
+        &DialDirection::Outbound,
+    )
+    .await
+    .unwrap();
+
+    match result {
+        RouteResult::Application {
+            option,
+            app_name,
+            ..
+        } => {
+            assert_eq!(app_name, "ivr");
+            let headers = option.headers.expect("routing should carry headers");
+            assert!(headers.iter().any(|h| {
+                h.name() == "X-Custom" && h.value() == "custom-value"
+            }));
+            assert!(headers.iter().any(|h| {
+                h.name() == "P-Asserted-Identity" && h.value() == "<sip:routing@pbx.com>"
+            }));
         }
         _ => panic!("Expected Application"),
     }

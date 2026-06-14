@@ -12,7 +12,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{fs, sync::Arc};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, value};
 
 #[derive(Debug, Deserialize)]
 struct FlowQueryParams {
@@ -30,6 +30,13 @@ struct SipFlowSettingsResponse {
 }
 
 pub fn urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route("/sipflow/settings", get(get_settings).put(update_settings))
+        .route("/sipflow/flow/{call_id}", get(query_flow))
+        .route("/sipflow/media/{call_id}", get(query_media))
+}
+
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
     Router::new()
         .route("/sipflow/settings", get(get_settings).put(update_settings))
         .route("/sipflow/flow/{call_id}", get(query_flow))
@@ -58,7 +65,7 @@ async fn get_settings(
     let (enabled, backend_type, config_json) = match &config.sipflow {
         None => (false, "none".to_string(), json!({})),
         Some(sipflow_config) => {
-            use crate::config::SipFlowConfig;
+            use crate::config::{SipFlowClusterNode, SipFlowConfig};
             let (backend_type, config_data) = match sipflow_config {
                 SipFlowConfig::Local {
                     root,
@@ -66,6 +73,10 @@ async fn get_settings(
                     flush_count,
                     flush_interval_secs,
                     id_cache_size,
+                    engine,
+                    ttl_secs,
+                    memtable_size_mb,
+                    block_cache_capacity_mb,
                     ..
                 } => (
                     "local",
@@ -74,22 +85,37 @@ async fn get_settings(
                         "subdirs": subdirs,
                         "flush_count": flush_count,
                         "flush_interval_secs": flush_interval_secs,
-                        "id_cache_size": id_cache_size
+                        "id_cache_size": id_cache_size,
+                        "engine": engine,
+                        "ttl_secs": ttl_secs,
+                        "memtable_size_mb": memtable_size_mb,
+                        "block_cache_capacity_mb": block_cache_capacity_mb
                     }),
                 ),
                 SipFlowConfig::Remote {
+                    nodes,
                     udp_addr,
                     http_addr,
                     timeout_secs,
                     ..
-                } => (
-                    "remote",
-                    json!({
-                        "udp_addr": udp_addr,
-                        "http_addr": http_addr,
-                        "timeout_secs": timeout_secs
-                    }),
-                ),
+                } => {
+                    let mut resolved = nodes.clone();
+                    if resolved.is_empty() {
+                        if let (Some(udp), Some(http)) = (udp_addr, http_addr) {
+                            resolved.push(SipFlowClusterNode {
+                                udp: udp.clone(),
+                                http: http.clone(),
+                            });
+                        }
+                    }
+                    (
+                        "remote",
+                        json!({
+                            "nodes": resolved,
+                            "timeout_secs": timeout_secs
+                        }),
+                    )
+                }
             };
             (true, backend_type.to_string(), config_data)
         }
@@ -160,11 +186,37 @@ async fn update_settings(
         }
         "remote" => {
             table["type"] = value("remote");
-            if let Some(addr) = payload.config.get("udp_addr").and_then(|v| v.as_str()) {
-                table["udp_addr"] = value(addr);
-            }
-            if let Some(addr) = payload.config.get("http_addr").and_then(|v| v.as_str()) {
-                table["http_addr"] = value(addr);
+            let has_nodes = payload
+                .config
+                .get("nodes")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if has_nodes {
+                if let Some(nodes) = payload.config.get("nodes").and_then(|v| v.as_array()) {
+                    let arr: Array = nodes
+                        .iter()
+                        .filter_map(|n| {
+                            let udp = n.get("udp")?.as_str()?;
+                            let http = n.get("http")?.as_str()?;
+                            let mut t = InlineTable::new();
+                            t.insert("udp", udp.into());
+                            t.insert("http", http.into());
+                            Some(toml_edit::Value::from(t))
+                        })
+                        .collect();
+                    table["nodes"] = value(arr);
+                }
+                table.remove("udp_addr");
+                table.remove("http_addr");
+            } else {
+                if let Some(addr) = payload.config.get("udp_addr").and_then(|v| v.as_str()) {
+                    table["udp_addr"] = value(addr);
+                }
+                if let Some(addr) = payload.config.get("http_addr").and_then(|v| v.as_str()) {
+                    table["http_addr"] = value(addr);
+                }
+                table.remove("nodes");
             }
             if let Some(secs) = payload.config.get("timeout_secs").and_then(|v| v.as_i64()) {
                 table["timeout_secs"] = value(secs);
@@ -477,9 +529,18 @@ async fn query_media(
     let start_time = start_time.unwrap_or_else(|| now - chrono::Duration::hours(1));
     let end_time = end_time.unwrap_or(now);
 
-    match backend.query_media(&call_id, start_time, end_time).await {
-        Ok(data) => {
-            if data.is_empty() {
+    match backend
+        .generate_wav_file(&call_id, start_time, end_time, None)
+        .await
+    {
+        Ok(temp_file) => {
+            let temp_path = temp_file.path().to_owned();
+            let file_len = match std::fs::metadata(&temp_path) {
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            };
+
+            if file_len <= 44 {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -490,16 +551,36 @@ async fn query_media(
             }
 
             use axum::http::header;
+            use tokio_util::io::ReaderStream;
 
-            Response::builder()
+            let file = match tokio::fs::File::open(&temp_path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "Failed to open temp file" })),
+                    )
+                        .into_response();
+                }
+            };
+            let path_str = temp_path.to_string_lossy().to_string();
+            std::mem::forget(temp_file);
+
+            let stream = ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+
+            let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "audio/wav")
                 .header(
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}.wav\"", call_id),
                 )
-                .body(axum::body::Body::from(data))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+
+            let _ = std::fs::remove_file(&path_str);
+            response
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

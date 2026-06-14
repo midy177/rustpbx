@@ -41,8 +41,9 @@
 //! 3. The bridge's WebRTC side connects to the WebRTC client
 //! 4. The bridge's RTP side connects to the SIP/RTP endpoint
 
+use crate::media::ReceiveTimestampClock;
 use crate::media::recorder::{Leg as RecLeg, Recorder};
-use crate::media::transcoder::{RtpTiming, Transcoder};
+use crate::media::transcoder::{RtpTiming, Transcoder, rewrite_dtmf_duration};
 use anyhow::Result;
 use audio_codec::CodecType as AudioCodecType;
 use rustrtc::{
@@ -60,7 +61,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -245,6 +246,14 @@ struct BridgeDtmfSink {
     handler: DtmfHandler,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BridgePayloadMapping {
+    source_pt: u8,
+    target_pt: u8,
+    source_clock_rate: u32,
+    target_clock_rate: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BridgeDtmfEventKey {
     digit_code: u8,
@@ -292,6 +301,14 @@ fn frame_ticks_20ms(clock_rate: u32) -> u32 {
     (clock_rate / 50).max(1)
 }
 
+fn scale_rtp_timestamp(rtp_timestamp: u32, source_rate: u32, target_rate: u32) -> u32 {
+    if source_rate == target_rate {
+        rtp_timestamp
+    } else {
+        (rtp_timestamp as u64 * target_rate as u64 / source_rate as u64) as u32
+    }
+}
+
 /// BridgePeer manages PeerConnections to bridge media between endpoints.
 ///
 /// Supports N peers (2+). For the common 2-peer caller↔callee case,
@@ -309,8 +326,10 @@ pub struct BridgePeer {
     caller_pc: PeerConnection,
     /// Callee-side PeerConnection (plain RTP) — fast-path alias for peers["callee"]
     callee_pc: PeerConnection,
-    /// Bridge task handles
+    /// Bridge task handles (main forwarding loops)
     bridge_tasks: AsyncMutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Sub-task handles spawned from inside bridge tasks (forward_track_to_sender, pli_forwarder, etc.)
+    sub_tasks: Arc<AsyncMutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Cancellation token
     cancel_token: CancellationToken,
     forwarding_started: AtomicBool,
@@ -319,6 +338,11 @@ pub struct BridgePeer {
     caller_gate: Arc<AtomicBool>,
     /// Shared recorder for call recording (written by both bridge directions)
     recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
+    /// When true, the bridge skips writing to the recorder (recording paused).
+    recording_paused: Arc<AtomicBool>,
+    /// Non-blocking RTP capture tee for SipFlow.
+    sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+    receive_clock: ReceiveTimestampClock,
     dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
     /// Audio sender channels for forwarding — fast-path aliases
     caller_send: Arc<AsyncMutex<Option<MediaSender>>>,
@@ -361,13 +385,21 @@ pub struct BridgePeer {
 
     /// Optional transcoder for RTP→WebRTC direction (e.g. G.729→PCMU).
     /// Set dynamically via set_transcoder() when caller and callee codecs differ.
-    callee_to_caller_transcoder: Arc<parking_lot::RwLock<Option<Transcoder>>>,
+    callee_to_caller_transcoder: Arc<parking_lot::Mutex<Option<Transcoder>>>,
     /// Optional RTP timestamp/sequence rewriter for RTP→WebRTC direction.
-    callee_to_caller_timing: Arc<parking_lot::RwLock<Option<RtpTiming>>>,
+    callee_to_caller_timing: Arc<parking_lot::Mutex<Option<RtpTiming>>>,
     /// Optional transcoder for WebRTC→RTP direction (e.g. PCMU→G.729).
-    caller_to_callee_transcoder: Arc<parking_lot::RwLock<Option<Transcoder>>>,
+    caller_to_callee_transcoder: Arc<parking_lot::Mutex<Option<Transcoder>>>,
     /// Optional RTP timestamp/sequence rewriter for WebRTC→RTP direction.
-    caller_to_callee_timing: Arc<parking_lot::RwLock<Option<RtpTiming>>>,
+    caller_to_callee_timing: Arc<parking_lot::Mutex<Option<RtpTiming>>>,
+    /// Optional telephone-event mapping for RTP→WebRTC direction.
+    callee_to_caller_dtmf_mapping: Arc<parking_lot::RwLock<Option<BridgePayloadMapping>>>,
+    /// Optional telephone-event mapping for WebRTC→RTP direction.
+    caller_to_callee_dtmf_mapping: Arc<parking_lot::RwLock<Option<BridgePayloadMapping>>>,
+    /// RTP timeout per direction — if no packets received for this duration, notify via rtp_timeout_tx.
+    rtp_timeout: Option<std::time::Duration>,
+    /// Sender to notify session when RTP timeout is detected.
+    rtp_timeout_tx: Option<mpsc::Sender<String>>,
 }
 
 impl BridgePeer {
@@ -378,10 +410,14 @@ impl BridgePeer {
             caller_pc,
             callee_pc,
             bridge_tasks: AsyncMutex::new(Vec::new()),
+            sub_tasks: Arc::new(AsyncMutex::new(Vec::new())),
             cancel_token: CancellationToken::new(),
             forwarding_started: AtomicBool::new(false),
             caller_gate: Arc::new(AtomicBool::new(false)),
             recorder: None,
+            recording_paused: Arc::new(AtomicBool::new(false)),
+            sipflow_tx: None,
+            receive_clock: ReceiveTimestampClock::new(),
             dtmf_sink: Arc::new(parking_lot::RwLock::new(None)),
             caller_send: Arc::new(AsyncMutex::new(None)),
             callee_send: Arc::new(AsyncMutex::new(None)),
@@ -421,10 +457,14 @@ impl BridgePeer {
             callee_to_caller_stats: LegStats::new(),
             peers: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
             routes: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
-            callee_to_caller_transcoder: Arc::new(parking_lot::RwLock::new(None)),
-            callee_to_caller_timing: Arc::new(parking_lot::RwLock::new(None)),
-            caller_to_callee_transcoder: Arc::new(parking_lot::RwLock::new(None)),
-            caller_to_callee_timing: Arc::new(parking_lot::RwLock::new(None)),
+            callee_to_caller_transcoder: Arc::new(parking_lot::Mutex::new(None)),
+            callee_to_caller_timing: Arc::new(parking_lot::Mutex::new(None)),
+            caller_to_callee_transcoder: Arc::new(parking_lot::Mutex::new(None)),
+            caller_to_callee_timing: Arc::new(parking_lot::Mutex::new(None)),
+            callee_to_caller_dtmf_mapping: Arc::new(parking_lot::RwLock::new(None)),
+            caller_to_callee_dtmf_mapping: Arc::new(parking_lot::RwLock::new(None)),
+            rtp_timeout: None,
+            rtp_timeout_tx: None,
         }
     }
 
@@ -433,6 +473,12 @@ impl BridgePeer {
     /// endpoint that may not be ready to receive it yet.
     pub fn open_caller_gate(&self) {
         self.caller_gate.store(true, Ordering::Release);
+        debug!(bridge_id = %self.id, "Caller gate opened — WebRTC→RTP forwarding enabled");
+    }
+
+    /// Returns whether the caller gate has been opened.
+    pub fn is_caller_gate_open(&self) -> bool {
+        self.caller_gate.load(Ordering::Acquire)
     }
 
     /// Setup the bridge by adding sample tracks to both sides for forwarding
@@ -467,6 +513,8 @@ impl BridgePeer {
             self.caller_send.lock().await.clone(),
             Arc::clone(&self.caller_output_state),
             self.cancel_token.clone(),
+            self.recorder.clone(),
+            self.recording_paused.clone(),
         ));
         tasks.push(Self::spawn_file_output_clock(
             self.id.clone(),
@@ -474,6 +522,8 @@ impl BridgePeer {
             self.callee_send.lock().await.clone(),
             Arc::clone(&self.callee_output_state),
             self.cancel_token.clone(),
+            self.recorder.clone(),
+            self.recording_paused.clone(),
         ));
         drop(tasks);
 
@@ -688,15 +738,18 @@ impl BridgePeer {
             let r2w = Arc::clone(&self.callee_to_caller_stats);
             let bridge_id = self.id.clone();
             let cancel = self.cancel_token.clone();
-            let caller_pc = self.caller_pc.clone();
-            let callee_pc = self.callee_pc.clone();
-            tokio::spawn(async move {
+            let rtp_timeout = self.rtp_timeout;
+            let rtp_timeout_tx = self.rtp_timeout_tx.clone();
+            crate::utils::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // skip initial immediate tick
                 interval.tick().await;
                 let (mut prev_w_pkts, mut prev_w_lost, mut prev_w_bytes) = (0u64, 0u64, 0u64);
                 let (mut prev_r_pkts, mut prev_r_lost, mut prev_r_bytes) = (0u64, 0u64, 0u64);
+                let mut caller_silence_start: Option<std::time::Instant> = None;
+                let mut callee_silence_start: Option<std::time::Instant> = None;
+                let mut rtp_timeout_fired = false;
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -724,7 +777,7 @@ impl BridgePeer {
                                 dr_lost as f64 / (dr_pkts + dr_lost) as f64 * 100.0
                             } else { 0.0 };
 
-                            info!(
+                            debug!(
                                 bridge_id = %bridge_id,
                                 caller_to_callee_pps   = dw_pkts,
                                 caller_to_callee_kbps  = dw_bytes * 8 / 5 / 1000,
@@ -737,15 +790,32 @@ impl BridgePeer {
                                 "Bridge leg stats [5s]"
                             );
 
-                            // Dump UDP transport stats from IceConn via StatsProvider
-                            if let Ok(report) = caller_pc.get_transport_stats().await {
-                                for entry in &report.entries {
-                                    debug!(bridge_id = %bridge_id, role = "caller", %entry, "Transport stats");
+                            if !rtp_timeout_fired
+                                && let Some(timeout) = rtp_timeout
+                            {
+                                if dw_pkts == 0 {
+                                    caller_silence_start.get_or_insert(std::time::Instant::now());
+                                } else {
+                                    caller_silence_start = None;
                                 }
-                            }
-                            if let Ok(report) = callee_pc.get_transport_stats().await {
-                                for entry in &report.entries {
-                                    debug!(bridge_id = %bridge_id, role = "callee", %entry, "Transport stats");
+                                if dr_pkts == 0 {
+                                    callee_silence_start.get_or_insert(std::time::Instant::now());
+                                } else {
+                                    callee_silence_start = None;
+                                }
+
+                                if caller_silence_start.is_some_and(|s| s.elapsed() >= timeout) {
+                                    warn!(bridge_id = %bridge_id, ?timeout, "RTP timeout: caller side silent");
+                                    if let Some(ref tx) = rtp_timeout_tx {
+                                        let _ = tx.try_send("caller_silent".to_string());
+                                    }
+                                    rtp_timeout_fired = true;
+                                } else if callee_silence_start.is_some_and(|s| s.elapsed() >= timeout) {
+                                    warn!(bridge_id = %bridge_id, ?timeout, "RTP timeout: callee side silent");
+                                    if let Some(ref tx) = rtp_timeout_tx {
+                                        let _ = tx.try_send("callee_silent".to_string());
+                                    }
+                                    rtp_timeout_fired = true;
                                 }
                             }
 
@@ -816,7 +886,7 @@ impl BridgePeer {
         }
         .ok_or_else(|| anyhow::anyhow!("bridge {:?} output sender is not ready", endpoint))?;
 
-        let source = track.create_playback_source()?;
+        let source = track.create_playback_source().await?;
         let mut state = self.output_state(endpoint).lock().await;
         let old_source = state.file_source.replace(source);
         state.mode = BRIDGE_OUTPUT_FILE;
@@ -849,7 +919,7 @@ impl BridgePeer {
         let track = crate::media::FileTrack::new(format!("{}-{:?}-silence", self.id, endpoint))
             .with_loop(true)
             .with_codec_info(codec_info);
-        let source = track.create_playback_source()?;
+        let source = track.create_playback_source().await?;
         let mut state = self.output_state(endpoint).lock().await;
         let old_source = state.file_source.replace(source);
         state.mode = BRIDGE_OUTPUT_FILE;
@@ -876,7 +946,7 @@ impl BridgePeer {
             .store(BRIDGE_OUTPUT_PEER, Ordering::Release);
         drop(state);
         drop(old_source);
-        info!(
+        debug!(
             bridge_id = %self.id,
             endpoint = ?endpoint,
             "Bridge output replaced with peer source"
@@ -896,6 +966,111 @@ impl BridgePeer {
             endpoint = ?endpoint,
             "Bridge output muted"
         );
+    }
+
+    /// Expose the raw output-mode atomic for caller endpoint (tests only).
+    #[cfg(test)]
+    pub fn caller_output_mode_atomic(&self) -> &Arc<AtomicU8> {
+        &self.caller_output_mode
+    }
+
+    /// Send RFC 4733 telephone-event DTMF packets to `endpoint`.
+    ///
+    /// For each digit in `digits` the method injects three telephone-event RTP
+    /// frames into the endpoint's sender:
+    ///   1. Begin packet  (marker=true,  E=0, duration=160)
+    ///   2. Middle packet (marker=false, E=0, duration=320)
+    ///   3. End packet    (marker=false, E=1, duration=480)
+    ///
+    /// The DTMF payload type is taken from the `caller_to_callee` or
+    /// `callee_to_caller` mapping if available, falling back to the RFC
+    /// conventional default of 101.
+    pub async fn send_dtmf_to_endpoint(
+        &self,
+        endpoint: BridgeEndpoint,
+        digits: &str,
+    ) -> Result<()> {
+        let sender = match endpoint {
+            BridgeEndpoint::Caller => self.get_caller_sender().await,
+            BridgeEndpoint::Callee => self.get_callee_sender().await,
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("bridge {:?} sender not ready for DTMF injection", endpoint)
+        })?;
+
+        // Resolve DTMF payload type from negotiated mapping.
+        let dtmf_pt = {
+            let mapping = match endpoint {
+                BridgeEndpoint::Caller => self.callee_to_caller_dtmf_mapping.read(),
+                BridgeEndpoint::Callee => self.caller_to_callee_dtmf_mapping.read(),
+            };
+            mapping.as_ref().map(|m| m.target_pt).unwrap_or(101u8)
+        };
+
+        // Audio clock rate used for DTMF timing (8000 Hz ≡ 160 samples/20ms).
+        const CLOCK_RATE: u32 = 8000;
+        const TICKS_20MS: u32 = 160;
+
+        let mut rtp_timestamp: u32 = 0;
+        let mut sequence_number: u16 = 0;
+
+        for c in digits.chars() {
+            let event_code = crate::media::telephone_event::dtmf_char_to_code(c)
+                .ok_or_else(|| anyhow::anyhow!("Unknown DTMF digit: {:?}", c))?;
+
+            // RFC 4733 §2.3 — three packets per event (begin, middle, end).
+            for (packet_idx, (duration, is_end)) in [
+                (TICKS_20MS, false),
+                (TICKS_20MS * 2, false),
+                (TICKS_20MS * 3, true),
+            ]
+            .iter()
+            .enumerate()
+            {
+                // Telephone-event payload: [event, E|R|volume, duration_hi, duration_lo]
+                let mut payload = [0u8; 4];
+                payload[0] = event_code;
+                payload[1] = if *is_end { 0x80 } else { 0x00 }; // E bit
+                payload[2] = (duration >> 8) as u8;
+                payload[3] = (*duration & 0xFF) as u8;
+
+                let frame = AudioFrame {
+                    rtp_timestamp,
+                    clock_rate: CLOCK_RATE,
+                    data: bytes::Bytes::copy_from_slice(&payload),
+                    sequence_number: Some(sequence_number),
+                    payload_type: Some(dtmf_pt),
+                    marker: packet_idx == 0, // marker on first packet of each event
+                    header_extension: None,
+                    raw_packet: None,
+                    source_addr: None,
+                };
+
+                if let Err(e) = sender.send(MediaSample::Audio(frame)).await {
+                    warn!(
+                        bridge_id = %self.id,
+                        endpoint = ?endpoint,
+                        digit = %c,
+                        error = %e,
+                        "DTMF telephone-event send failed"
+                    );
+                }
+
+                sequence_number = sequence_number.wrapping_add(1);
+            }
+
+            // Advance RTP timestamp by one event duration (3 × 20ms = 60ms).
+            rtp_timestamp = rtp_timestamp.wrapping_add(TICKS_20MS * 3);
+        }
+
+        debug!(
+            bridge_id = %self.id,
+            endpoint = ?endpoint,
+            digits = %digits,
+            dtmf_pt,
+            "Sent RFC 4733 DTMF telephone-event packets"
+        );
+        Ok(())
     }
 
     /// Add a peer to the N-peer bridge.
@@ -969,11 +1144,11 @@ impl BridgePeer {
         };
         let source_cr = source.clock_rate();
         let target_cr = target.clock_rate();
-        *transcoder_slot.write() = Some(Transcoder::new(source, target, target_pt));
+        *transcoder_slot.lock() = Some(Transcoder::new(source, target, target_pt));
         if source_cr != target_cr {
-            *timing_slot.write() = Some(RtpTiming::default());
+            *timing_slot.lock() = Some(RtpTiming::default());
         } else {
-            timing_slot.write().take();
+            timing_slot.lock().take();
         }
         info!(
             bridge_id = %self.id,
@@ -996,8 +1171,49 @@ impl BridgePeer {
                 &self.caller_to_callee_timing,
             ),
         };
-        *transcoder_slot.write() = None;
-        *timing_slot.write() = None;
+        *transcoder_slot.lock() = None;
+        *timing_slot.lock() = None;
+    }
+
+    /// Configure telephone-event mapping for media received from one bridge endpoint.
+    pub fn set_dtmf_mapping(
+        &self,
+        from_endpoint: BridgeEndpoint,
+        source_pt: u8,
+        source_clock_rate: u32,
+        target_pt: u8,
+        target_clock_rate: u32,
+    ) {
+        let mapping_slot = match from_endpoint {
+            BridgeEndpoint::Callee => &self.callee_to_caller_dtmf_mapping,
+            BridgeEndpoint::Caller => &self.caller_to_callee_dtmf_mapping,
+        };
+
+        *mapping_slot.write() = Some(BridgePayloadMapping {
+            source_pt,
+            target_pt,
+            source_clock_rate,
+            target_clock_rate,
+        });
+
+        debug!(
+            bridge_id = %self.id,
+            from = ?from_endpoint,
+            source_pt,
+            source_clock_rate,
+            target_pt,
+            target_clock_rate,
+            "Bridge DTMF mapping configured"
+        );
+    }
+
+    /// Remove telephone-event mapping for media received from one bridge endpoint.
+    pub fn clear_dtmf_mapping(&self, from_endpoint: BridgeEndpoint) {
+        let mapping_slot = match from_endpoint {
+            BridgeEndpoint::Callee => &self.callee_to_caller_dtmf_mapping,
+            BridgeEndpoint::Caller => &self.caller_to_callee_dtmf_mapping,
+        };
+        mapping_slot.write().take();
     }
 
     fn output_state(&self, endpoint: BridgeEndpoint) -> &Arc<AsyncMutex<OutputState>> {
@@ -1020,8 +1236,15 @@ impl BridgePeer {
         sender: Option<MediaSender>,
         output_state: Arc<AsyncMutex<OutputState>>,
         cancel_token: CancellationToken,
+        recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
+        recording_paused: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let recorder_leg = match endpoint {
+            BridgeEndpoint::Callee => Some(RecLeg::A),
+            BridgeEndpoint::Caller => Some(RecLeg::B),
+        };
+
+        crate::utils::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1093,6 +1316,20 @@ impl BridgePeer {
                                 Some(mapped_ts.wrapping_add(frame_ticks_20ms(frame.clock_rate)));
                         }
 
+                        if let (Some(rec), Some(leg)) = (&recorder, recorder_leg)
+                            && !recording_paused.load(Ordering::Relaxed)
+                            && let Some(mut guard) = rec.try_write()
+                            && let Some(r) = guard.as_mut()
+                        {
+                            let _ = r.write_sample(
+                                leg,
+                                &sample,
+                                None,
+                                None::<u32>,
+                                None::<AudioCodecType>,
+                            );
+                        }
+
                         let Some(sender) = sender.as_ref() else {
                             warn!(
                                 bridge_id = %bridge_id,
@@ -1141,8 +1378,9 @@ impl BridgePeer {
         let bridge_id = self.id.clone();
         let dtmf_sink = Arc::clone(&self.dtmf_sink);
         let recorder = self.recorder.clone();
+        let _recording_paused = self.recording_paused.clone();
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             let peers = peers_map.lock().await;
             let extra_peers: Vec<(PeerId, PeerConnection)> = peers
                 .iter()
@@ -1159,7 +1397,7 @@ impl BridgePeer {
                 let pid = peer_id.clone();
                 let bid = bridge_id.clone();
                 let peers_ref = peers_map.clone();
-                tokio::spawn(async move {
+                crate::utils::spawn(async move {
                     let mut recv = Box::pin(pc.recv());
                     loop {
                         tokio::select! {
@@ -1182,7 +1420,7 @@ impl BridgePeer {
                                                 let dests_for_forward = route_dests.clone();
                                                 let pid_clone = pid.clone();
                                                 let bid_clone = bid.clone();
-                                                tokio::spawn(async move {
+                                                crate::utils::spawn(async move {
                                                     loop {
                                                         let sample = match track.recv().await {
                                                             Ok(s) => s,
@@ -1239,18 +1477,24 @@ impl BridgePeer {
         let w2r_stats = Arc::clone(&self.caller_to_callee_stats);
         let r2w_stats = Arc::clone(&self.callee_to_caller_stats);
         let recorder = self.recorder.clone();
+        let recording_paused = self.recording_paused.clone();
+        let sipflow_tx = self.sipflow_tx.clone();
+        let receive_clock = self.receive_clock.clone();
         let dtmf_sink = Arc::clone(&self.dtmf_sink);
         let caller_to_callee_transcoder = Arc::clone(&self.caller_to_callee_transcoder);
         let caller_to_callee_timing = Arc::clone(&self.caller_to_callee_timing);
         let callee_to_caller_transcoder = Arc::clone(&self.callee_to_caller_transcoder);
         let callee_to_caller_timing = Arc::clone(&self.callee_to_caller_timing);
+        let caller_to_callee_dtmf_mapping = Arc::clone(&self.caller_to_callee_dtmf_mapping);
+        let callee_to_caller_dtmf_mapping = Arc::clone(&self.callee_to_caller_dtmf_mapping);
         let caller_video_payload_type = Arc::clone(&self.caller_video_payload_type);
         let callee_video_payload_type = Arc::clone(&self.callee_video_payload_type);
         let caller_video_payload_map = Arc::clone(&self.caller_video_payload_map);
         let callee_video_payload_map = Arc::clone(&self.callee_video_payload_map);
         let caller_gate = Arc::clone(&self.caller_gate);
+        let sub_tasks = self.sub_tasks.clone();
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             // Create fused receivers for both directions
             let mut caller_recv = Box::pin(caller_pc.recv());
             let mut callee_recv = Box::pin(callee_pc.recv());
@@ -1273,7 +1517,7 @@ impl BridgePeer {
                                         .keys()
                                         .copied()
                                         .collect::<Vec<_>>();
-                                    info!(
+                                    debug!(
                                         bridge_id = %bridge_id,
                                         direction = "Caller->Callee",
                                         transceiver_id = transceiver.id(),
@@ -1297,22 +1541,27 @@ impl BridgePeer {
                                                         inner: track.clone(),
                                                         payload_type: Arc::clone(&callee_video_payload_type),
                                                         payload_map: Arc::clone(&callee_video_payload_map),
-                                                    });
-                                                let sender = rustrtc::RtpSender::builder(
+                                                     });
+                                                let mut sender_builder = rustrtc::RtpSender::builder(
                                                     forwarding_track,
                                                     existing_sender.ssrc(),
                                                 )
                                                 .stream_id(existing_sender.stream_id().to_string())
-                                                .params(existing_sender.params())
-                                                .build();
+                                                .params(existing_sender.params());
+                                                let cname_val = existing_sender.cname();
+                                                if !cname_val.starts_with("rustrtc-cname-") {
+                                                    sender_builder = sender_builder.cname(cname_val.to_string());
+                                                }
+                                                let sender = sender_builder.build();
                                                 target_transceiver.set_sender(Some(sender.clone()));
-                                                Self::spawn_pli_forwarder(
+                                                let h = Self::spawn_pli_forwarder(
                                                     bridge_id.clone(),
                                                     sender,
                                                     track.clone(),
                                                     cancel_token.clone(),
                                                     "Callee PLI -> Caller source",
                                                 );
+                                                sub_tasks.lock().await.push(h);
                                                 if let Err(e) = track.request_key_frame().await {
                                                     debug!(
                                                         bridge_id = %bridge_id,
@@ -1338,7 +1587,7 @@ impl BridgePeer {
                                     } else {
                                         callee_send.clone()
                                     };
-                                    Self::forward_track_to_sender(
+                                     let h = Self::forward_track_to_sender(
                                         bridge_id.clone(),
                                         track,
                                         sender,
@@ -1348,11 +1597,18 @@ impl BridgePeer {
                                         Arc::clone(&w2r_stats),
                                         if !is_video { recorder.clone() } else { None },
                                         if !is_video { Some(RecLeg::A) } else { None },
+                                        if !is_video { sipflow_tx.clone() } else { None },
+                                        receive_clock.clone(),
+                                        recording_paused.clone(),
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&caller_to_callee_transcoder)),
                                         Some(Arc::clone(&caller_to_callee_timing)),
+                                        Some(Arc::clone(&caller_to_callee_dtmf_mapping)),
                                         Some(Arc::clone(&caller_gate)),
-                                    ).await;
+                                    );
+                                    if let Ok(mut st) = sub_tasks.try_lock() {
+                                        st.push(h);
+                                    }
                                 } else {
                                     warn!(
                                         bridge_id = %bridge_id,
@@ -1386,7 +1642,7 @@ impl BridgePeer {
                                         .keys()
                                         .copied()
                                         .collect::<Vec<_>>();
-                                    info!(
+                                    debug!(
                                         bridge_id = %bridge_id,
                                         direction = "Callee->Caller",
                                         transceiver_id = transceiver.id(),
@@ -1410,22 +1666,27 @@ impl BridgePeer {
                                                         inner: track.clone(),
                                                         payload_type: Arc::clone(&caller_video_payload_type),
                                                         payload_map: Arc::clone(&caller_video_payload_map),
-                                                    });
-                                                let sender = rustrtc::RtpSender::builder(
+                                                     });
+                                                let mut sender_builder = rustrtc::RtpSender::builder(
                                                     forwarding_track,
                                                     existing_sender.ssrc(),
                                                 )
                                                 .stream_id(existing_sender.stream_id().to_string())
-                                                .params(existing_sender.params())
-                                                .build();
+                                                .params(existing_sender.params());
+                                                let cname_val = existing_sender.cname();
+                                                if !cname_val.starts_with("rustrtc-cname-") {
+                                                    sender_builder = sender_builder.cname(cname_val.to_string());
+                                                }
+                                                let sender = sender_builder.build();
                                                 target_transceiver.set_sender(Some(sender.clone()));
-                                                Self::spawn_pli_forwarder(
+                                                let h = Self::spawn_pli_forwarder(
                                                     bridge_id.clone(),
                                                     sender,
                                                     track.clone(),
                                                     cancel_token.clone(),
                                                     "Caller PLI -> Callee source",
                                                 );
+                                                sub_tasks.lock().await.push(h);
                                                 if let Err(e) = track.request_key_frame().await {
                                                     debug!(
                                                         bridge_id = %bridge_id,
@@ -1451,7 +1712,7 @@ impl BridgePeer {
                                     } else {
                                         caller_send.clone()
                                     };
-                                    Self::forward_track_to_sender(
+                                     let h = Self::forward_track_to_sender(
                                         bridge_id.clone(),
                                         track,
                                         sender,
@@ -1461,11 +1722,18 @@ impl BridgePeer {
                                         Arc::clone(&r2w_stats),
                                         if !is_video { recorder.clone() } else { None },
                                         if !is_video { Some(RecLeg::B) } else { None },
+                                        if !is_video { sipflow_tx.clone() } else { None },
+                                        receive_clock.clone(),
+                                        recording_paused.clone(),
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&callee_to_caller_transcoder)),
                                         Some(Arc::clone(&callee_to_caller_timing)),
+                                        Some(Arc::clone(&callee_to_caller_dtmf_mapping)),
                                         None, // Callee→Caller is always allowed
-                                    ).await;
+                                    );
+                                    if let Ok(mut st) = sub_tasks.try_lock() {
+                                        st.push(h);
+                                    }
                                 } else {
                                     warn!(
                                         bridge_id = %bridge_id,
@@ -1503,9 +1771,13 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
+        sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+        receive_clock: ReceiveTimestampClock,
+        recording_paused: Arc<AtomicBool>,
         dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
-        transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
-        transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        transcoder: Option<Arc<parking_lot::Mutex<Option<Transcoder>>>>,
+        transcoder_timing: Option<Arc<parking_lot::Mutex<Option<RtpTiming>>>>,
+        dtmf_mapping: Option<Arc<parking_lot::RwLock<Option<BridgePayloadMapping>>>>,
         gate: Option<Arc<AtomicBool>>,
     ) {
         // Get the sender channel from weak pointer
@@ -1558,6 +1830,39 @@ impl BridgePeer {
                     match sample_result {
                         Ok(sample) => {
                             packet_count += 1;
+                            let received_at_micros = receive_clock.now_micros();
+                            if !is_video {
+                                let (dtmf_pt, dtmf_clock_rate) = {
+                                    let sink_guard = dtmf_sink.read();
+                                    let dtmf_pt = sink_guard.as_ref()
+                                        .filter(|s| s.endpoint == path.source_endpoint())
+                                        .and_then(|s| s.payload_types.first().copied());
+                                    let dtmf_clock_rate = dtmf_pt.and_then(|pt| {
+                                        let mapping_guard = dtmf_mapping.as_ref()?.read();
+                                        mapping_guard.as_ref()
+                                            .filter(|m| m.source_pt == pt)
+                                            .map(|m| m.source_clock_rate)
+                                    }).unwrap_or(8000);
+                                    (dtmf_pt, dtmf_clock_rate)
+                                };
+                                if let (Some(rec), Some(leg)) = (&recorder, recorder_leg)
+                                    && !recording_paused.load(std::sync::atomic::Ordering::Relaxed)
+                                    && let Some(mut guard) = rec.try_write()
+                                    && let Some(r) = guard.as_mut()
+                                {
+                                    let _ = r.write_sample(
+                                        leg,
+                                        &sample,
+                                        dtmf_pt,
+                                        Some(dtmf_clock_rate),
+                                        None::<AudioCodecType>,
+                                    );
+                                }
+
+                                if let (Some(tx), Some(leg)) = (&sipflow_tx, recorder_leg) {
+                                    let _ = tx.try_send((leg, sample.clone(), received_at_micros));
+                                }
+                            }
                             if !is_video {
                                 Self::observe_dtmf_sample(
                                     &dtmf_sink,
@@ -1619,12 +1924,17 @@ impl BridgePeer {
                                         a.raw_packet = None;
                                         a.marker = false;
                                     }
+                                    let mapped_dtmf = Self::rewrite_dtmf_sample(
+                                        &mut a,
+                                        dtmf_mapping.as_deref(),
+                                        transcoder_timing.as_deref(),
+                                    );
                                     // Apply per-packet transcoding if the codec differs
                                     // between the ingress and egress legs.  The Transcoder is
                                     // set dynamically by sip_session when it detects a mismatch
                                     // (e.g. caller uses G.729, agent uses PCMU).
                                     let transcoded = transcoder.as_ref().and_then(|tx_arc| {
-                                        let mut guard = tx_arc.write();
+                                        let mut guard = tx_arc.lock();
                                         let tx = guard.as_mut()?;
                                         // Telephone-event (DTMF) MUST NOT go through
                                         // audio transcoding — it has its own codec format
@@ -1637,7 +1947,7 @@ impl BridgePeer {
                                                 a.payload_type
                                                     .is_some_and(|pt| s.payload_types.contains(&pt))
                                             });
-                                        if is_dtmf {
+                                        if mapped_dtmf || is_dtmf {
                                             return None;
                                         }
                                         let frame = AudioFrame {
@@ -1652,7 +1962,7 @@ impl BridgePeer {
                                         };
                                         let mut output = tx.transcode(&frame);
                                         if let Some(ref timing_arc) = transcoder_timing {
-                                            if let Some(ref mut timing) = *timing_arc.write() {
+                                            if let Some(ref mut timing) = *timing_arc.lock() {
                                                 timing.rewrite(
                                                     &mut output,
                                                     tx.source_clock_rate(),
@@ -1710,16 +2020,6 @@ impl BridgePeer {
                                     }
                                 }
                             };
-                            // Write audio samples to recorder (non-blocking: skip on lock contention)
-                            if let (Some(rec), Some(leg)) = (&recorder, recorder_leg) {
-                                for s in &samples_to_send {
-                                    if matches!(s, MediaSample::Audio(_))
-                                        && let Some(mut guard) = rec.try_write()
-                                            && let Some(r) = guard.as_mut() {
-                                                let _ = r.write_sample(leg, s, None, None, None::<AudioCodecType>);
-                                            }
-                                }
-                            }
                             for sample in samples_to_send {
                                 // Forward the sample using try_send first to reduce Tokio scheduling overhead
                                 match sender.try_send(sample.clone()) {
@@ -1747,6 +2047,62 @@ impl BridgePeer {
                 }
             }
         }
+    }
+
+    fn rewrite_dtmf_sample(
+        frame: &mut AudioFrame,
+        mapping_slot: Option<&parking_lot::RwLock<Option<BridgePayloadMapping>>>,
+        timing_slot: Option<&parking_lot::Mutex<Option<RtpTiming>>>,
+    ) -> bool {
+        let Some(mapping_slot) = mapping_slot else {
+            return false;
+        };
+        let Some(mapping) = mapping_slot.read().clone() else {
+            return false;
+        };
+
+        if frame.payload_type != Some(mapping.source_pt) {
+            return false;
+        }
+
+        if mapping.source_clock_rate != mapping.target_clock_rate {
+            frame.data = rewrite_dtmf_duration(
+                &frame.data,
+                mapping.source_clock_rate,
+                mapping.target_clock_rate,
+            );
+        }
+
+        let used_shared_timing = if let Some(timing_slot) = timing_slot {
+            let mut guard = timing_slot.lock();
+            if let Some(timing) = guard.as_mut() {
+                timing.rewrite(
+                    frame,
+                    mapping.source_clock_rate,
+                    mapping.target_clock_rate,
+                    mapping.target_pt,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !used_shared_timing {
+            frame.payload_type = Some(mapping.target_pt);
+            frame.clock_rate = mapping.target_clock_rate;
+            if mapping.source_clock_rate != mapping.target_clock_rate {
+                frame.rtp_timestamp = scale_rtp_timestamp(
+                    frame.rtp_timestamp,
+                    mapping.source_clock_rate,
+                    mapping.target_clock_rate,
+                );
+            }
+        }
+
+        true
     }
 
     fn observe_dtmf_sample(
@@ -1782,7 +2138,7 @@ impl BridgePeer {
         );
 
         if let Some(digit) = detector.observe(&frame.data, frame.rtp_timestamp) {
-            debug!(digit = %digit, "DTMF observe: digit detected via RFC2833");
+            info!(digit = %digit, endpoint = ?sink.endpoint, "DTMF digit detected");
             (sink.handler)(digit);
         }
     }
@@ -1795,9 +2151,9 @@ impl BridgePeer {
         source_track: Arc<dyn MediaStreamTrack>,
         cancel_token: CancellationToken,
         label: &'static str,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let mut rtcp_rx = sender.subscribe_rtcp();
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
@@ -1816,13 +2172,13 @@ impl BridgePeer {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Forward media from a track to a sender channel.
     /// Spawns a sub-task; used by the PC-event-driven start paths.
     #[allow(clippy::too_many_arguments)]
-    async fn forward_track_to_sender(
+    fn forward_track_to_sender(
         bridge_id: String,
         track: Arc<dyn MediaStreamTrack>,
         sender_weak: std::sync::Weak<AsyncMutex<Option<MediaSender>>>,
@@ -1832,12 +2188,16 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
+        sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+        receive_clock: ReceiveTimestampClock,
+        recording_paused: Arc<AtomicBool>,
         dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
-        transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
-        transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        transcoder: Option<Arc<parking_lot::Mutex<Option<Transcoder>>>>,
+        transcoder_timing: Option<Arc<parking_lot::Mutex<Option<RtpTiming>>>>,
+        dtmf_mapping: Option<Arc<parking_lot::RwLock<Option<BridgePayloadMapping>>>>,
         gate: Option<Arc<AtomicBool>>,
-    ) {
-        tokio::spawn(async move {
+    ) -> tokio::task::JoinHandle<()> {
+        crate::utils::spawn(async move {
             Self::run_forward_loop(
                 bridge_id,
                 track,
@@ -1848,13 +2208,17 @@ impl BridgePeer {
                 leg_stats,
                 recorder,
                 recorder_leg,
+                sipflow_tx,
+                receive_clock,
+                recording_paused,
                 dtmf_sink,
                 transcoder,
                 transcoder_timing,
+                dtmf_mapping,
                 gate,
             )
             .await;
-        });
+        })
     }
 
     /// Get the WebRTC PeerConnection
@@ -1874,9 +2238,15 @@ impl BridgePeer {
         self.caller_pc.close();
         self.callee_pc.close();
 
-        // Wait for tasks to complete
+        // Wait for main tasks to complete
         let mut tasks = self.bridge_tasks.lock().await;
         for task in tasks.drain(..) {
+            let _ = task.await;
+        }
+
+        // Wait for sub-tasks (forward_track_to_sender, pli_forwarder, etc.)
+        let mut sub = self.sub_tasks.lock().await;
+        for task in sub.drain(..) {
             let _ = task.await;
         }
     }
@@ -1916,6 +2286,11 @@ pub struct BridgePeerBuilder {
     rtp_sdp_compatibility: rustrtc::config::SdpCompatibilityMode,
     ice_servers: Vec<IceServer>,
     recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
+    recording_paused: Arc<AtomicBool>,
+    sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+    cname: Option<String>,
+    rtp_timeout: Option<std::time::Duration>,
+    rtp_timeout_tx: Option<mpsc::Sender<String>>,
 }
 
 impl BridgePeerBuilder {
@@ -1938,6 +2313,11 @@ impl BridgePeerBuilder {
             rtp_sdp_compatibility: rustrtc::config::SdpCompatibilityMode::LegacySip,
             ice_servers: Vec::new(),
             recorder: None,
+            recording_paused: Arc::new(AtomicBool::new(false)),
+            sipflow_tx: None,
+            cname: None,
+            rtp_timeout: None,
+            rtp_timeout_tx: None,
         }
     }
 
@@ -2048,8 +2428,36 @@ impl BridgePeerBuilder {
     /// Attach a shared recorder so that both bridge directions write audio to it.
     /// The recorder is lazily activated: once `start_recording()` puts a `Recorder`
     /// inside the `Arc<RwLock<…>>`, the bridge forward loops will start writing.
-    pub fn with_recorder(mut self, recorder: Arc<parking_lot::RwLock<Option<Recorder>>>) -> Self {
+    pub fn with_recorder(
+        mut self,
+        recorder: Arc<parking_lot::RwLock<Option<Recorder>>>,
+        recording_paused: Arc<AtomicBool>,
+    ) -> Self {
         self.recorder = Some(recorder);
+        self.recording_paused = recording_paused;
+        self
+    }
+
+    pub fn with_sipflow_capture(
+        mut self,
+        sipflow_tx: mpsc::Sender<(RecLeg, MediaSample, u64)>,
+    ) -> Self {
+        self.sipflow_tx = Some(sipflow_tx);
+        self
+    }
+
+    pub fn with_cname(mut self, cname: String) -> Self {
+        self.cname = Some(cname);
+        self
+    }
+
+    pub fn with_rtp_timeout_notify(
+        mut self,
+        tx: mpsc::Sender<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.rtp_timeout_tx = Some(tx);
+        self.rtp_timeout = Some(timeout);
         self
     }
 
@@ -2096,6 +2504,7 @@ impl BridgePeerBuilder {
                     audio,
                     video: caller_video,
                     application: None,
+                    image: vec![],
                 });
 
         let caller_config = self
@@ -2107,6 +2516,7 @@ impl BridgePeerBuilder {
                 ssrc_start: rand::random::<u32>(),
                 sdp_compatibility: rustrtc::config::SdpCompatibilityMode::Standard,
                 ice_servers: self.ice_servers,
+                cname: self.cname.clone(),
                 ..Default::default()
             });
 
@@ -2116,6 +2526,7 @@ impl BridgePeerBuilder {
                     audio,
                     video: callee_video,
                     application: None,
+                    image: vec![],
                 });
 
         let callee_config = self
@@ -2131,6 +2542,7 @@ impl BridgePeerBuilder {
                 media_capabilities: callee_media_caps,
                 ssrc_start: rand::random::<u32>(),
                 sdp_compatibility: self.rtp_sdp_compatibility,
+                cname: self.cname.clone(),
                 ..Default::default()
             });
 
@@ -2146,6 +2558,10 @@ impl BridgePeerBuilder {
         bridge.caller_sender_codec = self.caller_sender_codec;
         bridge.callee_sender_codec = self.callee_sender_codec;
         bridge.recorder = self.recorder;
+        bridge.recording_paused = self.recording_paused;
+        bridge.sipflow_tx = self.sipflow_tx;
+        bridge.rtp_timeout = self.rtp_timeout;
+        bridge.rtp_timeout_tx = self.rtp_timeout_tx;
 
         // Store video codec params for setup_bridge to create video senders
         bridge.caller_video_codec = self
@@ -2181,14 +2597,14 @@ mod tests {
     };
 
     fn create_test_wav_file(path: &str, num_samples: usize) -> Result<()> {
-        let spec = hound::WavSpec {
+        let spec = crate::media::wav_reader::WavSpec {
             channels: 1,
             sample_rate: 8000,
             bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: crate::media::wav_reader::SampleFormat::Int,
         };
-        let mut writer =
-            hound::WavWriter::create(path, spec).map_err(|e| anyhow::anyhow!("WavWriter: {e}"))?;
+        let mut writer = crate::media::wav_reader::WavWriter::create(path, spec)
+            .map_err(|e| anyhow::anyhow!("WavWriter: {e}"))?;
         for i in 0..num_samples {
             let sample = ((i as f32 / 8.0).sin() * 1000.0) as i16;
             writer
@@ -3024,34 +3440,32 @@ mod tests {
         let caller_offer = caller.local_description().await.unwrap();
         assert!(caller_offer.contains("opus"), "Caller must offer Opus");
 
-        // Build bridge codec lists from caller SDP + allow_codecs=[PCMU]
-        let codec_lists = MediaNegotiator::build_bridge_codec_lists(
+        // Build bridge side codec lists from caller SDP + allow_codecs=[PCMU]
+        let caller_side_codecs = MediaNegotiator::build_codec_list_from_offer(
             &caller_offer,
-            true,  // caller is WebRTC
-            false, // callee is RTP
+            &[CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let callee_side_codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            &caller_offer,
             &[CodecType::PCMU, CodecType::TelephoneEvent],
         );
 
         // Build bridge with computed capabilities
-        let webrtc_caps: Vec<_> = codec_lists
-            .caller_side
+        let webrtc_caps: Vec<_> = caller_side_codecs
             .iter()
             .filter_map(|c| c.to_audio_capability())
             .collect();
-        let rtp_caps: Vec<_> = codec_lists
-            .callee_side
+        let rtp_caps: Vec<_> = callee_side_codecs
             .iter()
             .filter_map(|c| c.to_audio_capability())
             .collect();
 
-        let caller_sender = codec_lists
-            .caller_side
+        let caller_sender = caller_side_codecs
             .iter()
             .find(|c| !c.is_dtmf())
             .map(|c| c.to_params())
             .unwrap();
-        let callee_sender = codec_lists
-            .callee_side
+        let callee_sender = callee_side_codecs
             .iter()
             .find(|c| !c.is_dtmf())
             .map(|c| c.to_params())
@@ -3133,10 +3547,10 @@ mod tests {
         bridge.stop().await;
     }
 
-    /// E2E: RTP caller (G729+PCMU) → Bridge → WebRTC callee
-    /// G729 is not in WebRTC supported set, so WebRTC callee side should only have PCMU.
+    /// E2E: RTP caller (G729+PCMU) → Bridge → WebRTC callee.
+    /// Generated WebRTC offers must not advertise G729.
     #[tokio::test]
-    async fn test_bridge_e2e_rtp_to_webrtc_g729_dropped() {
+    async fn test_bridge_e2e_rtp_to_webrtc_filters_g729_offer() {
         use crate::media::negotiate::MediaNegotiator;
 
         // Create RTP caller offering G729 + PCMU
@@ -3147,50 +3561,53 @@ mod tests {
             .build();
         let caller_offer = caller.local_description().await.unwrap();
 
-        // Build bridge codec lists
-        let codec_lists = MediaNegotiator::build_bridge_codec_lists(
+        // Build bridge side codec lists.
+        let caller_side_codecs = MediaNegotiator::build_codec_list_from_offer(
             &caller_offer,
-            false, // caller is RTP
-            true,  // callee is WebRTC
             &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent],
         );
+        let callee_side_codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            &caller_offer,
+            &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let callee_side_codecs =
+            MediaNegotiator::filter_webrtc_offer_codecs(&caller_offer, callee_side_codecs);
 
-        // G729 should be on caller side (RTP supports it) but NOT on callee side (WebRTC doesn't)
+        // G729 stays on the RTP side, but is removed from the generated WebRTC offer.
         assert!(
-            codec_lists
-                .caller_side
+            caller_side_codecs
                 .iter()
                 .any(|c| c.codec == CodecType::G729),
             "G729 on RTP caller side"
         );
         assert!(
-            !codec_lists
-                .callee_side
+            !callee_side_codecs
                 .iter()
                 .any(|c| c.codec == CodecType::G729),
-            "G729 dropped on WebRTC callee side"
+            "G729 must be removed from WebRTC offer codecs"
+        );
+        assert!(
+            callee_side_codecs
+                .iter()
+                .any(|c| c.codec == CodecType::PCMU)
         );
 
-        let webrtc_caps: Vec<_> = codec_lists
-            .callee_side
+        let webrtc_caps: Vec<_> = callee_side_codecs
             .iter()
             .filter_map(|c| c.to_audio_capability())
             .collect();
-        let rtp_caps: Vec<_> = codec_lists
-            .caller_side
+        let rtp_caps: Vec<_> = caller_side_codecs
             .iter()
             .filter_map(|c| c.to_audio_capability())
             .collect();
 
         // Callee side sender: first non-DTMF from caller side
-        let callee_sender = codec_lists
-            .caller_side
+        let callee_sender = caller_side_codecs
             .iter()
             .find(|c| !c.is_dtmf())
             .map(|c| c.to_params())
             .unwrap();
-        let caller_sender = codec_lists
-            .callee_side
+        let caller_sender = callee_side_codecs
             .iter()
             .find(|c| !c.is_dtmf())
             .map(|c| c.to_params())
@@ -3223,8 +3640,9 @@ mod tests {
         );
         assert!(
             !bridge_webrtc_sdp.contains("G729"),
-            "WebRTC side must NOT offer G729"
+            "WebRTC-side SDP must not offer G729"
         );
+        assert!(bridge_webrtc_sdp.contains("PCMU"));
 
         // WebRTC callee answers
         let callee = RtpTrackBuilder::new("webrtc-callee".to_string())
@@ -3317,37 +3735,37 @@ mod tests {
             .build();
 
         // Initially both directions are None
-        assert!(bridge.callee_to_caller_transcoder.read().is_none());
-        assert!(bridge.caller_to_callee_transcoder.read().is_none());
+        assert!(bridge.callee_to_caller_transcoder.lock().is_none());
+        assert!(bridge.caller_to_callee_transcoder.lock().is_none());
 
         // Set RTP→WebRTC transcoder (G.729→PCMU)
         bridge.set_transcoder(BridgeEndpoint::Callee, CodecType::G729, CodecType::PCMU, 0);
         assert!(
-            bridge.callee_to_caller_transcoder.read().is_some(),
+            bridge.callee_to_caller_transcoder.lock().is_some(),
             "RTP→WebRTC transcoder should be set"
         );
 
         // Set WebRTC→RTP transcoder (PCMU→G.729)
         bridge.set_transcoder(BridgeEndpoint::Caller, CodecType::PCMU, CodecType::G729, 18);
         assert!(
-            bridge.caller_to_callee_transcoder.read().is_some(),
+            bridge.caller_to_callee_transcoder.lock().is_some(),
             "WebRTC→RTP transcoder should be set"
         );
 
         // Clear RTP→WebRTC
         bridge.clear_transcoder(BridgeEndpoint::Callee);
         assert!(
-            bridge.callee_to_caller_transcoder.read().is_none(),
+            bridge.callee_to_caller_transcoder.lock().is_none(),
             "RTP→WebRTC should be cleared"
         );
         assert!(
-            bridge.caller_to_callee_transcoder.read().is_some(),
+            bridge.caller_to_callee_transcoder.lock().is_some(),
             "WebRTC→RTP should still be set"
         );
 
         // Clear all
         bridge.clear_transcoder(BridgeEndpoint::Caller);
-        assert!(bridge.caller_to_callee_transcoder.read().is_none());
+        assert!(bridge.caller_to_callee_transcoder.lock().is_none());
     }
 
     /// Verify that the bridge's forwarding loop applies a Transcoder when
@@ -3385,13 +3803,13 @@ mod tests {
         let sender_weak = Arc::downgrade(&sender_arc);
 
         // Configure G.729 → PCMU transcoder
-        let transcoder = Arc::new(parking_lot::RwLock::new(Some(Transcoder::new(
+        let transcoder = Arc::new(parking_lot::Mutex::new(Some(Transcoder::new(
             CodecType::G729,
             CodecType::PCMU,
             0, // PCMU PT
         ))));
-        let timing: Arc<parking_lot::RwLock<Option<RtpTiming>>> =
-            Arc::new(parking_lot::RwLock::new(None));
+        let timing: Arc<parking_lot::Mutex<Option<RtpTiming>>> =
+            Arc::new(parking_lot::Mutex::new(None));
 
         let cancel = CancellationToken::new();
         let stats: Arc<LegStats> = LegStats::new();
@@ -3407,7 +3825,7 @@ mod tests {
             let ti = Some(timing);
             let st = stats;
             let ds = dtmf;
-            tokio::spawn(async move {
+            crate::utils::spawn(async move {
                 BridgePeer::run_forward_loop(
                     "test".to_string(),
                     mt,
@@ -3418,9 +3836,13 @@ mod tests {
                     st,
                     None, // no recorder
                     None, // no recorder leg
+                    None, // no sipflow capture
+                    ReceiveTimestampClock::new(),
+                    Arc::new(AtomicBool::new(false)), // not paused
                     ds,
                     tr,
                     ti,
+                    None, // no DTMF mapping
                     None, // no gate
                 )
                 .await;
@@ -3459,6 +3881,152 @@ mod tests {
             }
             other => panic!("Expected a transcoded PCMU Audio frame, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_bridge_dtmf_mapping_rewrites_payload_type_and_clock_rate() {
+        use bytes::Bytes;
+        use rustrtc::media::track::sample_track;
+
+        let input_frame = AudioFrame {
+            rtp_timestamp: 48_000,
+            clock_rate: 48_000,
+            data: Bytes::from_static(&[0x05, 0x0A, 0x12, 0xC0]), // digit 5, 4800 ticks
+            sequence_number: Some(10),
+            payload_type: Some(110),
+            marker: true,
+            ..Default::default()
+        };
+
+        let mock_track: Arc<dyn MediaStreamTrack> = Arc::new(OneShotAudioTrack {
+            sample: tokio::sync::Mutex::new(Some(MediaSample::Audio(input_frame))),
+        });
+
+        let (output_tx, output_track, _) = sample_track(MediaKind::Audio, 10);
+        let sender_arc = Arc::new(AsyncMutex::new(Some(output_tx)));
+        let sender_weak = Arc::downgrade(&sender_arc);
+
+        let transcoder = Arc::new(parking_lot::Mutex::new(Some(Transcoder::new(
+            CodecType::PCMU,
+            CodecType::PCMA,
+            8,
+        ))));
+        let dtmf_mapping = Arc::new(parking_lot::RwLock::new(Some(BridgePayloadMapping {
+            source_pt: 110,
+            target_pt: 126,
+            source_clock_rate: 48_000,
+            target_clock_rate: 8_000,
+        })));
+
+        let cancel = CancellationToken::new();
+        let stats = LegStats::new();
+        let dtmf_sink = Arc::new(parking_lot::RwLock::new(None));
+
+        let task_handle = {
+            let c = cancel.clone();
+            let mt = mock_track.clone();
+            let sw = sender_weak.clone();
+            let st = stats;
+            let ds = dtmf_sink;
+            let tr = Some(transcoder);
+            let dm = Some(dtmf_mapping);
+            crate::utils::spawn(async move {
+                BridgePeer::run_forward_loop(
+                    "test-dtmf-mapping".to_string(),
+                    mt,
+                    sw,
+                    Arc::new(AtomicU8::new(BRIDGE_OUTPUT_PEER)),
+                    c,
+                    ForwardPath::new(LegTransport::Caller, LegTransport::Callee),
+                    st,
+                    None,
+                    None,
+                    None,
+                    ReceiveTimestampClock::new(),
+                    Arc::new(AtomicBool::new(false)),
+                    ds,
+                    tr,
+                    None,
+                    dm,
+                    None,
+                )
+                .await;
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = task_handle.await;
+
+        let captured =
+            tokio::time::timeout(std::time::Duration::from_secs(1), output_track.recv()).await;
+
+        match captured {
+            Ok(Ok(MediaSample::Audio(frame))) => {
+                assert_eq!(frame.payload_type, Some(126));
+                assert_eq!(frame.clock_rate, 8_000);
+                assert_eq!(frame.sequence_number, Some(10));
+                assert_eq!(frame.rtp_timestamp, 8_000);
+                assert_eq!(frame.data.as_ref(), &[0x05, 0x0A, 0x03, 0x20]);
+            }
+            other => panic!("Expected mapped DTMF Audio frame, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bridge_dtmf_mapping_uses_shared_timing_when_available() {
+        use bytes::Bytes;
+
+        let dtmf_mapping = parking_lot::RwLock::new(Some(BridgePayloadMapping {
+            source_pt: 110,
+            target_pt: 126,
+            source_clock_rate: 48_000,
+            target_clock_rate: 8_000,
+        }));
+        let timing = parking_lot::Mutex::new(Some(RtpTiming::default()));
+
+        let mut first = AudioFrame {
+            rtp_timestamp: 48_000,
+            clock_rate: 48_000,
+            data: Bytes::from_static(&[0x05, 0x0A, 0x12, 0xC0]),
+            sequence_number: Some(10),
+            payload_type: Some(110),
+            ..Default::default()
+        };
+        let mut second = AudioFrame {
+            rtp_timestamp: 52_800,
+            clock_rate: 48_000,
+            data: Bytes::from_static(&[0x05, 0x0A, 0x12, 0xC0]),
+            sequence_number: Some(11),
+            payload_type: Some(110),
+            ..Default::default()
+        };
+
+        assert!(BridgePeer::rewrite_dtmf_sample(
+            &mut first,
+            Some(&dtmf_mapping),
+            Some(&timing),
+        ));
+        assert!(BridgePeer::rewrite_dtmf_sample(
+            &mut second,
+            Some(&dtmf_mapping),
+            Some(&timing),
+        ));
+
+        assert_eq!(first.payload_type, Some(126));
+        assert_eq!(first.clock_rate, 8_000);
+        assert_eq!(first.data.as_ref(), &[0x05, 0x0A, 0x03, 0x20]);
+        assert_eq!(second.payload_type, Some(126));
+        assert_eq!(second.clock_rate, 8_000);
+        assert_eq!(second.data.as_ref(), &[0x05, 0x0A, 0x03, 0x20]);
+        assert_eq!(second.rtp_timestamp.wrapping_sub(first.rtp_timestamp), 800);
+        assert_eq!(
+            second
+                .sequence_number
+                .expect("second sequence")
+                .wrapping_sub(first.sequence_number.expect("first sequence")),
+            1
+        );
     }
 
     /// Verify Opus → PCMU transcoding via Transcoder produces correct output.
@@ -3678,7 +4246,7 @@ mod tests {
             let sw = sender_weak.clone();
             let st = stats;
             let ds = dtmf;
-            tokio::spawn(async move {
+            crate::utils::spawn(async move {
                 BridgePeer::run_forward_loop(
                     "test-passthrough".to_string(),
                     mt,
@@ -3689,9 +4257,13 @@ mod tests {
                     st,
                     None,
                     None,
+                    None,
+                    ReceiveTimestampClock::new(),
+                    Arc::new(AtomicBool::new(false)),
                     ds,
                     None, // no transcoder
                     None, // no timing
+                    None, // no DTMF mapping
                     None, // no gate
                 )
                 .await;

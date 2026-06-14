@@ -72,6 +72,15 @@ impl SipSession {
                 }
             }
         }
+
+        self.emit_dn_event(
+            "PARTYCHANGED",
+            Some(self.context.session_id.clone()),
+            Some(&self.context.original_callee),
+            Some(&self.context.original_caller),
+            Some(&self.context.original_callee),
+            None,
+        );
     }
 
     pub(super) async fn start_conference_media_bridge_for_peer(
@@ -103,7 +112,7 @@ impl SipSession {
             );
 
             let cancel_token = self.cancel_token.child_token();
-            let forwarder_handle = tokio::spawn(async move {
+            let forwarder_handle = crate::utils::spawn(async move {
                 loop {
                     tokio::select! {
                         biased;
@@ -123,7 +132,8 @@ impl SipSession {
                     }
                 }
             });
-            self.legs.tasks
+            self.legs
+                .tasks
                 .entry(leg_id.clone())
                 .or_default()
                 .push(forwarder_handle);
@@ -246,7 +256,7 @@ impl SipSession {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
 
         let cancel_token = self.cancel_token.child_token();
-        let forwarder_handle = tokio::spawn(async move {
+        let forwarder_handle = crate::utils::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -266,7 +276,8 @@ impl SipSession {
                 }
             }
         });
-        self.legs.tasks
+        self.legs
+            .tasks
             .entry(leg_id.clone())
             .or_default()
             .push(forwarder_handle);
@@ -356,18 +367,15 @@ impl SipSession {
     pub(super) fn leg_negotiated_codec(&self, leg_id: &LegId) -> audio_codec::CodecType {
         use crate::media::negotiate::MediaNegotiator;
 
-        let sdp = self
-            .legs
-            .get_answer(leg_id)
-            .or_else(|| {
-                if leg_id.as_str() == "caller" {
-                    self.media.answer.as_deref()
-                } else if leg_id.as_str() == "callee" {
-                    self.media.callee_answer_sdp.as_deref()
-                } else {
-                    None
-                }
-            });
+        let sdp = self.legs.get_answer(leg_id).or_else(|| {
+            if leg_id.as_str() == "caller" {
+                self.media.answer.as_deref()
+            } else if leg_id.as_str() == "callee" {
+                self.media.callee_answer_sdp.as_deref()
+            } else {
+                None
+            }
+        });
 
         match sdp.and_then(|s| MediaNegotiator::extract_leg_profile(s).audio) {
             Some(audio) => {
@@ -441,12 +449,41 @@ impl SipSession {
             return Err(anyhow!("Leg not found: {}", leg_id));
         }
 
-        self.server
-            .conference_manager
-            .add_participant(&conf_id.into(), leg_id)
-            .await?;
+        let peer = self.legs.peers.get(&leg_id).cloned();
+        let bridge_result = if let Some(peer) = peer {
+            self.start_conference_media_bridge_for_peer(&conf_id, &leg_id, &peer)
+                .await
+        } else {
+            self.start_conference_media_bridge(&conf_id, &leg_id)
+                .await
+        };
 
-        Ok(())
+        match bridge_result {
+            Ok(handle) => {
+                info!(%conf_id, %leg_id, "Conference media bridge started for added leg");
+                self.legs
+                    .set_conference_bridge_handle(leg_id.clone(), handle);
+                self.emit_dn_event(
+                    "PARTYADDED",
+                    Some(self.context.session_id.clone()),
+                    Some(&leg_id.to_string()),
+                    Some(&self.context.original_caller),
+                    Some(&self.context.original_callee),
+                    None,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(%conf_id, %leg_id, error = %e, "Failed to start conference media bridge, cleaning up participant");
+                let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+                let _ = self
+                    .server
+                    .conference_manager
+                    .remove_participant(&conf_id_obj, &leg_id)
+                    .await;
+                Err(e)
+            }
+        }
     }
 
     pub(super) async fn handle_conference_remove(
@@ -456,10 +493,24 @@ impl SipSession {
     ) -> Result<()> {
         info!(%conf_id, %leg_id, "Removing leg from conference");
 
+        if let Some(handle) = self.legs.remove_conference_bridge_handle(&leg_id) {
+            handle.stop();
+            info!(%leg_id, "Stopped conference media bridge for removed leg");
+        }
+
         self.server
             .conference_manager
             .remove_participant(&conf_id.into(), &leg_id)
             .await?;
+
+        self.emit_dn_event(
+            "PARTYDELETED",
+            Some(self.context.session_id.clone()),
+            Some(&leg_id.to_string()),
+            Some(&self.context.original_caller),
+            Some(&self.context.original_callee),
+            None,
+        );
 
         Ok(())
     }
@@ -497,12 +548,90 @@ impl SipSession {
     pub(super) async fn handle_conference_destroy(&mut self, conf_id: String) -> Result<()> {
         info!(%conf_id, "Destroying conference");
 
+        self.legs.stop_all_conference_bridge_handles();
+
         self.server
             .conference_manager
             .destroy_conference(&conf_id.into())
             .await?;
 
         Ok(())
+    }
+
+    pub(super) async fn handle_conference_end(
+        &mut self,
+        conf_id: String,
+        host_leg_id: LegId,
+    ) -> Result<()> {
+        info!(%conf_id, %host_leg_id, "Host ending conference");
+
+        self.legs.stop_all_conference_bridge_handles();
+
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+
+        let removed = self
+            .server
+            .conference_manager
+            .end_by_host(&conf_id_obj, &host_leg_id)
+            .await?;
+
+        info!(
+            %conf_id,
+            %host_leg_id,
+            removed_count = removed.len(),
+            "Conference ended by host, all participants removed"
+        );
+
+        Ok(())
+    }
+
+    pub(super) async fn handle_conference_kick(
+        &mut self,
+        conf_id: String,
+        leg_id: LegId,
+    ) -> Result<()> {
+        info!(%conf_id, %leg_id, "Kicking leg from conference");
+        self.handle_conference_remove(conf_id, leg_id).await
+    }
+
+    pub(super) async fn handle_conference_mute_all(&mut self, conf_id: String) -> Result<()> {
+        info!(%conf_id, "Muting all participants in conference");
+
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+        let conf = self
+            .server
+            .conference_manager
+            .get_conference(&conf_id_obj)
+            .await
+            .ok_or_else(|| anyhow!("Conference {} not found", conf_id))?;
+
+        for leg_id in conf.participant_ids() {
+            let _ = self
+                .server
+                .conference_manager
+                .mute_participant(&conf_id_obj, &leg_id)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn handle_conference_info(
+        &self,
+        conf_id: String,
+    ) -> Result<crate::call::runtime::ConferenceRoom> {
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+        self.server
+            .conference_manager
+            .get_conference(&conf_id_obj)
+            .await
+            .ok_or_else(|| anyhow!("Conference {} not found", conf_id))
+    }
+
+    pub(super) async fn handle_conference_list(
+        &self,
+    ) -> Vec<crate::call::runtime::ConferenceRoom> {
+        self.server.conference_manager.list_conferences_detail().await
     }
 
     pub(super) async fn handle_join_mixer(&mut self, mixer_id: String) -> Result<()> {

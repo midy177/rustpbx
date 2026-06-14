@@ -6,11 +6,12 @@ use crate::{
 };
 use anyhow::{Error, Result};
 use clap::Parser;
+use ipnetwork::IpNetwork;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::StatusCode;
 use rustrtc::IceServer;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -86,6 +87,10 @@ fn default_enable_latching() -> bool {
 
 fn default_latching_probation_max_packets() -> Option<u8> {
     Some(6)
+}
+
+fn default_rtp_timeout() -> Option<u64> {
+    Some(30)
 }
 
 fn default_generated_config_dir() -> String {
@@ -173,6 +178,12 @@ pub struct RecordingPolicy {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// When true, always use the legacy WAV file recorder for media capture
+    /// even if SipFlow backend is available. SipFlow will capture SIP
+    /// signalling only (no RTP). Media upload is handled by the
+    /// `[recording]` upload path, not `[sipflow.upload]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_file: Option<bool>,
 }
 
 impl RecordingPolicy {
@@ -180,6 +191,7 @@ impl RecordingPolicy {
         crate::call::CallRecordingConfig {
             enabled: self.enabled,
             auto_start: self.auto_start.unwrap_or(true),
+            force_file: self.force_file.unwrap_or(false),
             option: None,
         }
     }
@@ -229,6 +241,7 @@ pub struct Config {
     pub proxy: ProxyConfig,
 
     pub external_ip: Option<String>,
+    pub auto_external_ip: Option<String>,
     #[serde(default = "default_config_rtp_start_port")]
     pub rtp_start_port: Option<u16>,
     #[serde(default = "default_config_rtp_end_port")]
@@ -260,6 +273,8 @@ pub struct Config {
     pub licenses: Option<LicenseConfig>,
     #[serde(default)]
     pub rwi: Option<RwiConfig>,
+    #[serde(default)]
+    pub rwi_webhook: Option<LocatorWebhookConfig>,
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
 }
@@ -360,6 +375,19 @@ pub struct ConsoleConfig {
     pub locales: std::collections::HashMap<String, LocaleInfo>,
     /// Static files HTTP path prefix (default: "/static")
     pub static_path: Option<String>,
+    /// Static API tokens for authenticating to /api endpoints.
+    /// Each token has an optional list of scopes (e.g. ["call.control", "recording"]).
+    #[serde(default)]
+    pub api_tokens: Vec<ApiTokenConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ApiTokenConfig {
+    pub token: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl Default for ConsoleConfig {
@@ -377,6 +405,7 @@ impl Default for ConsoleConfig {
             locale_default: default_locale(),
             locales: default_locales(),
             static_path: None,
+            api_tokens: Vec::new(),
         }
     }
 }
@@ -393,6 +422,7 @@ pub enum UserBackendConfig {
         method: Option<String>,
         username_field: Option<String>,
         realm_field: Option<String>,
+        request_uri_field: Option<String>,
         headers: Option<HashMap<String, String>>,
         sip_headers: Option<Vec<String>>,
     },
@@ -438,10 +468,25 @@ pub enum LocatorConfig {
 
 pub use crate::storage::S3Vendor;
 
+pub const DEFAULT_CALL_RECORD_MAX_CONCURRENT: usize = 64;
+
+fn default_call_record_max_concurrent() -> usize {
+    DEFAULT_CALL_RECORD_MAX_CONCURRENT
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct CallRecordConfig {
+    /// Maximum concurrent call record save/hook tasks (minimum: 1).
+    #[serde(default = "default_call_record_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(flatten)]
+    pub storage: CallRecordStorageConfig,
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub enum CallRecordConfig {
+pub enum CallRecordStorageConfig {
     Local {
         root: String,
     },
@@ -467,7 +512,7 @@ pub enum CallRecordConfig {
         keep_media_copy: Option<bool>,
     },
     Database {
-        /// Database URL for call records. If not set, uses the global database_url.
+        /// Database URL for call records.
         database_url: Option<String>,
         /// Table name for call records (default: "call_records")
         #[serde(default = "default_call_record_table")]
@@ -480,9 +525,8 @@ fn default_call_record_table() -> String {
 }
 
 /// Directory structure for sipflow storage
-#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-#[derive(Default)]
 pub enum SipFlowSubdirs {
     /// No subdirectory structure - all files in root
     None,
@@ -491,6 +535,18 @@ pub enum SipFlowSubdirs {
     Daily,
     /// Hourly subdirectories (YYYYMMDD/HH)
     Hourly,
+}
+
+/// Storage engine selection for the Local sipflow backend.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub enum SipFlowEngine {
+    /// Use FlowDB LSM-tree engine (default).
+    #[default]
+    #[serde(rename = "flowdb")]
+    FlowDb,
+    /// Use the legacy SQLite + raw-file engine.
+    #[serde(rename = "sqlite")]
+    Sqlite,
 }
 
 /// Upload configuration for SipFlow recordings
@@ -506,11 +562,29 @@ pub enum SipFlowUploadConfig {
         secret_key: String,
         endpoint: String,
         root: String,
+        #[serde(default)]
+        signaling: Option<bool>,
+        #[serde(default = "default_true")]
+        media: Option<bool>,
     },
     Http {
         url: String,
         headers: Option<HashMap<String, String>>,
+        #[serde(default)]
+        signaling: Option<bool>,
+        #[serde(default = "default_true")]
+        media: Option<bool>,
     },
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct SipFlowClusterNode {
+    pub udp: String,
+    pub http: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -527,12 +601,29 @@ pub enum SipFlowConfig {
         flush_interval_secs: u64,
         #[serde(default = "default_sipflow_id_cache_size")]
         id_cache_size: usize,
+        /// Storage engine: "flowdb" (default) or "sqlite".
+        #[serde(default)]
+        engine: SipFlowEngine,
+        /// TTL in seconds for FlowDB records (optional). When set,
+        /// expired records are automatically garbage-collected.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+        /// FlowDB memtable size in MB (default 64).
+        #[serde(default = "default_flowdb_memtable_mb")]
+        memtable_size_mb: usize,
+        /// FlowDB block cache capacity in MB (default 128).
+        #[serde(default = "default_flowdb_block_cache_mb")]
+        block_cache_capacity_mb: usize,
         #[serde(default)]
         upload: Option<SipFlowUploadConfig>,
     },
     Remote {
-        udp_addr: String,
-        http_addr: String,
+        #[serde(default)]
+        nodes: Vec<SipFlowClusterNode>,
+        #[serde(default)]
+        udp_addr: Option<String>,
+        #[serde(default)]
+        http_addr: Option<String>,
         #[serde(default = "default_sipflow_timeout")]
         timeout_secs: u64,
         #[serde(default)]
@@ -554,6 +645,14 @@ fn default_sipflow_timeout() -> u64 {
 
 fn default_sipflow_id_cache_size() -> usize {
     8192
+}
+
+fn default_flowdb_memtable_mb() -> usize {
+    64
+}
+
+fn default_flowdb_block_cache_mb() -> usize {
+    128
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Serialize)]
@@ -593,6 +692,7 @@ impl SessionTimerMode {
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct RtpConfig {
     pub external_ip: Option<String>,
+    pub auto_external_ip: Option<String>,
     pub bind_ip: Option<String>,
     pub start_port: Option<u16>,
     pub end_port: Option<u16>,
@@ -644,6 +744,7 @@ pub struct ProxyConfig {
     pub ua_black_list: Option<Vec<String>>,
     pub max_concurrency: Option<usize>,
     pub registrar_expires: Option<u32>,
+    pub max_registrar_expires: Option<u32>,
     pub ensure_user: Option<bool>,
     #[serde(default = "default_user_backends")]
     pub user_backends: Vec<UserBackendConfig>,
@@ -659,6 +760,7 @@ pub struct ProxyConfig {
     pub realms: Option<Vec<String>>,
     pub ws_handler: Option<String>,
     pub ami_path: Option<String>,
+    pub rwi_path: Option<String>,
     pub ice_servers_path: Option<String>,
     pub http_router: Option<HttpRouterConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -671,6 +773,16 @@ pub struct ProxyConfig {
     pub session_timer_always: bool,
     #[serde(default)]
     pub session_expires: Option<u64>,
+    #[serde(default = "default_rtp_timeout")]
+    pub rtp_timeout: Option<u64>,
+    #[serde(default = "default_session_cmd_channel_capacity")]
+    pub session_cmd_channel_capacity: usize,
+    #[serde(default = "default_session_state_channel_capacity")]
+    pub session_state_channel_capacity: usize,
+    #[serde(default = "default_media_cmd_channel_capacity")]
+    pub media_cmd_channel_capacity: usize,
+    #[serde(default = "default_media_event_channel_capacity")]
+    pub media_event_channel_capacity: usize,
     #[serde(default)]
     pub queues: HashMap<String, RouteQueueConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -685,6 +797,10 @@ pub struct ProxyConfig {
     pub trunks_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivr_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ivr_files: Vec<String>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
     #[serde(default = "default_generated_config_dir")]
@@ -718,9 +834,12 @@ pub struct ProxyConfig {
     pub uri_max_length: usize,
     #[serde(default)]
     pub uri_reject_malformed: bool,
-
     #[serde(default)]
     pub emergency: Option<EmergencyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_cname: Option<String>,
 }
 
 /// Emergency number routing configuration.
@@ -758,6 +877,18 @@ fn default_dos_scan_block_secs() -> u64 {
 }
 fn default_uri_max_length() -> usize {
     256
+}
+fn default_session_cmd_channel_capacity() -> usize {
+    256
+}
+fn default_session_state_channel_capacity() -> usize {
+    256
+}
+fn default_media_cmd_channel_capacity() -> usize {
+    512
+}
+fn default_media_event_channel_capacity() -> usize {
+    1024
 }
 
 fn default_auth_cache_size() -> usize {
@@ -806,6 +937,7 @@ fn default_passthrough_failure() -> bool {
 #[derive(Default, Clone)]
 pub struct DialplanHints {
     pub enable_recording: Option<bool>,
+    pub recording: Option<RecordingPolicy>,
     pub bypass_media: Option<bool>,
     pub max_duration: Option<std::time::Duration>,
     pub enable_sipflow: Option<bool>,
@@ -816,12 +948,15 @@ pub struct DialplanHints {
     pub media_mode: Option<MediaProxyMode>,
     /// Video policy from trunk config
     pub video_policy: Option<crate::proxy::routing::VideoPolicy>,
+    /// Per-trunk ringback/early-media audio configuration
+    pub ringback: Option<crate::proxy::routing::RingbackAudio>,
 }
 
 impl std::fmt::Debug for DialplanHints {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DialplanHints")
             .field("enable_recording", &self.enable_recording)
+            .field("recording", &self.recording)
             .field("bypass_media", &self.bypass_media)
             .field("max_duration", &self.max_duration)
             .field("enable_sipflow", &self.enable_sipflow)
@@ -858,7 +993,19 @@ pub struct AmiConfig {
 impl AmiConfig {
     pub fn is_allowed(&self, addr: &str) -> bool {
         if let Some(allows) = &self.allows {
-            allows.iter().any(|a| a == addr || a == "*")
+            let ip = addr.parse::<IpAddr>().ok();
+
+            allows.iter().any(|allow| {
+                let allow = allow.trim();
+
+                allow == addr
+                    || allow == "*"
+                    || ip.is_some_and(|ip| {
+                        allow
+                            .parse::<IpNetwork>()
+                            .is_ok_and(|network| network.contains(ip))
+                    })
+            })
         } else {
             addr == "127.0.0.1" || addr == "::1" || addr == "localhost"
         }
@@ -942,6 +1089,19 @@ impl ProxyConfig {
         }
     }
 
+    pub fn generated_ivr_dir(&self) -> PathBuf {
+        if let Some(dir) = self
+            .ivr_dir
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+        {
+            PathBuf::from(dir)
+        } else {
+            self.generated_root_dir().join("ivr")
+        }
+    }
+
     pub fn generated_acl_dir(&self) -> PathBuf {
         self.generated_root_dir().join("acl")
     }
@@ -1000,7 +1160,8 @@ impl Default for ProxyConfig {
             tls_port: None,
             ws_port: None,
             max_concurrency: None,
-            registrar_expires: Some(60),
+            registrar_expires: Some(30),
+            max_registrar_expires: Some(50),
             ensure_user: Some(true),
             enable_latching: true,
             latching_probation_max_packets: default_latching_probation_max_packets(),
@@ -1013,6 +1174,7 @@ impl Default for ProxyConfig {
             realms: Some(vec![]),
             ws_handler: None,
             ami_path: None,
+            rwi_path: None,
             ice_servers_path: None,
             http_router: None,
             routes_files: Vec::new(),
@@ -1021,11 +1183,18 @@ impl Default for ProxyConfig {
             session_timer: false,
             session_timer_always: false,
             session_expires: None,
+            rtp_timeout: default_rtp_timeout(),
+            session_cmd_channel_capacity: default_session_cmd_channel_capacity(),
+            session_state_channel_capacity: default_session_state_channel_capacity(),
+            media_cmd_channel_capacity: default_media_cmd_channel_capacity(),
+            media_event_channel_capacity: default_media_event_channel_capacity(),
             queues: HashMap::new(),
             queues_files: Vec::new(),
             trunks: HashMap::new(),
             trunks_files: Vec::new(),
             queue_dir: None,
+            ivr_dir: None,
+            ivr_files: Vec::new(),
             recording: None,
             generated_dir: default_generated_config_dir(),
             nat_fix: true,
@@ -1043,6 +1212,8 @@ impl Default for ProxyConfig {
             uri_max_length: default_uri_max_length(),
             uri_reject_malformed: false,
             emergency: None,
+            contact_username: None,
+            rtc_cname: None,
         }
     }
 }
@@ -1055,11 +1226,14 @@ impl Default for UserBackendConfig {
 
 impl Default for CallRecordConfig {
     fn default() -> Self {
-        Self::Local {
-            #[cfg(target_os = "windows")]
-            root: "./config/cdr".to_string(),
-            #[cfg(not(target_os = "windows"))]
-            root: "./config/cdr".to_string(),
+        Self {
+            max_concurrent: default_call_record_max_concurrent(),
+            storage: CallRecordStorageConfig::Local {
+                #[cfg(target_os = "windows")]
+                root: "./config/cdr".to_string(),
+                #[cfg(not(target_os = "windows"))]
+                root: "./config/cdr".to_string(),
+            },
         }
     }
 }
@@ -1081,6 +1255,7 @@ impl Default for Config {
             ice_servers: None,
             ami: Some(AmiConfig::default()),
             external_ip: None,
+            auto_external_ip: None,
             rtp_start_port: default_config_rtp_start_port(),
             rtp_end_port: default_config_rtp_end_port(),
             webrtc_port_start: default_config_webrtc_start_port(),
@@ -1095,6 +1270,7 @@ impl Default for Config {
             sipflow: None,
             #[cfg(feature = "commerce")]
             licenses: None,
+            rwi_webhook: None,
             cluster: None,
         }
     }
@@ -1127,6 +1303,7 @@ impl Config {
     pub fn rtp_config(&self) -> RtpConfig {
         RtpConfig {
             external_ip: self.external_ip.clone(),
+            auto_external_ip: self.auto_external_ip.clone(),
             bind_ip: Some(self.proxy.addr.clone()),
             start_port: self.rtp_start_port,
             end_port: self.rtp_end_port,
@@ -1184,6 +1361,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_callrecord_max_concurrent_is_shared_config() {
+        let callrecord: CallRecordConfig = toml::from_str(
+            r#"
+            type = "http"
+            url = "https://example.com/cdr"
+            max_concurrent = 7
+            "#,
+        )
+        .unwrap();
+        assert_eq!(callrecord.max_concurrent, 7);
+        assert!(matches!(
+            callrecord.storage,
+            CallRecordStorageConfig::Http { .. }
+        ));
+
+        let defaulted: CallRecordConfig = toml::from_str(
+            r#"
+            type = "local"
+            root = "./cdr"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(defaulted.max_concurrent, DEFAULT_CALL_RECORD_MAX_CONCURRENT);
+    }
 
     #[test]
     fn test_select_realm() {

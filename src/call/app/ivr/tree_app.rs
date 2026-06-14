@@ -17,10 +17,10 @@
 //!       Webhook → (response determines next action)
 //! ```
 
-use super::{
+use super::config::{EntryAction, IvrDefinition, WebhookResponse};
+use crate::call::app::{
     AppAction, ApplicationContext, CallApp, CallAppType, CallController, DtmfCollectConfig,
 };
-use crate::call::app::ivr_config::{EntryAction, IvrDefinition, WebhookResponse};
 use crate::callrecord::CallRecordHangupReason;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,12 @@ pub struct IvrApp {
     pending_unknown_digit: Option<String>,
     /// Optional TTS service synthesized from the IVR's own TTS config.
     tts_service: Option<Arc<crate::tts::TtsService>>,
+    /// Number of nodes traversed (for IvrFlowCompleted).
+    nodes_traversed: u32,
+    /// Timestamp when IVR flow started (for total_duration_ms).
+    flow_started_at: Option<std::time::Instant>,
+    /// Timestamp when the current node was entered (for IvrNodeExited.duration_ms).
+    node_entered_at: Option<std::time::Instant>,
 }
 
 impl IvrApp {
@@ -108,6 +114,9 @@ impl IvrApp {
             collected_variables: std::collections::HashMap::new(),
             pending_unknown_digit: None,
             tts_service,
+            nodes_traversed: 0,
+            flow_started_at: None,
+            node_entered_at: None,
         }
     }
 
@@ -121,7 +130,7 @@ impl IvrApp {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read IVR config '{}': {}", path, e))?;
-        let file_config: crate::call::app::ivr_config::IvrFileConfig = toml::from_str(&content)
+        let file_config: super::config::IvrFileConfig = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse IVR config '{}': {}", path, e))?;
         file_config
             .ivr
@@ -130,8 +139,38 @@ impl IvrApp {
         Ok(Self::new(file_config.ivr))
     }
 
+    /// Emit an RWI event via the gateway in the application context, if configured.
+    fn emit_rwi_event_typed(&self, ctx: &ApplicationContext, event: &impl crate::rwi::RwiEventSpec) {
+        if let Some(ref gw) = ctx.rwi_gateway {
+            let gw = gw.read();
+            gw.fan_out(&ctx.call_info.session_id, event);
+        }
+    }
+
+    /// Emit IvrFlowCompleted when the IVR flow ends via a terminal action.
+    async fn ivr_flow_completed(
+        &self,
+        ctx: &ApplicationContext,
+        final_result: &str,
+        target: Option<&str>,
+    ) {
+        let total_duration_ms = self
+            .flow_started_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        self.emit_rwi_event_typed(ctx, &crate::rwi::IvrFlowCompleted {
+            call_id: ctx.call_info.session_id.clone(),
+            app_id: self.definition.name.clone(),
+            total_nodes_traversed: self.nodes_traversed,
+            total_duration_ms: total_duration_ms as u32,
+            final_result: final_result.to_string(),
+            completion_time: chrono::Utc::now().to_rfc3339(),
+            final_routing_target: target.map(|s| s.to_string()),
+        });
+    }
+
     /// Check if the current time falls within business hours.
-    fn is_within_business_hours(&self, bh: &crate::call::app::ivr_config::BusinessHours) -> bool {
+    fn is_within_business_hours(&self, bh: &super::config::BusinessHours) -> bool {
         use chrono::{Datelike, Utc};
 
         let tz: chrono_tz::Tz = match bh.timezone.parse() {
@@ -310,15 +349,35 @@ impl IvrApp {
         &mut self,
         menu_key: &str,
         ctrl: &mut CallController,
-        _ctx: &ApplicationContext,
+        ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         self.navigate_to_menu(menu_key);
+        if self.flow_started_at.is_none() {
+            self.flow_started_at = Some(std::time::Instant::now());
+        }
+        self.node_entered_at = Some(std::time::Instant::now());
+        self.nodes_traversed += 1;
         info!(
             ivr = %self.definition.name,
             menu = menu_key,
             menu_stack = ?self.menu_stack,
             "IVR entering menu"
         );
+
+        // Emit IvrNodeEntered event
+        let previous_node = self.menu_stack.iter().rev().nth(1).cloned();
+        self.emit_rwi_event_typed(ctx, &crate::rwi::IvrNodeEntered {
+            call_id: ctx.call_info.session_id.clone(),
+            node_id: menu_key.to_string(),
+            node_name: menu_key.to_string(),
+            node_type: "menu".to_string(),
+            app_id: self.definition.name.clone(),
+            entry_time: chrono::Utc::now().to_rfc3339(),
+            caller_name: Some(ctx.call_info.caller.clone()),
+            callee_name: Some(ctx.call_info.callee.clone()),
+            routing_target: Some(menu_key.to_string()),
+            previous_node_id: previous_node,
+        });
         let menu = self
             .definition
             .get_menu(menu_key)
@@ -373,9 +432,41 @@ impl IvrApp {
         ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         ctrl.cancel_timeout("ivr_dtmf_timeout");
+
+        // Emit IvrNodeExited event when leaving a menu node.
+        if let IvrState::WaitingDtmf { ref menu_key, .. }
+        | IvrState::PlayingGreeting { ref menu_key } = self.state
+        {
+            let node_name = menu_key.clone();
+            let duration_ms = self
+                .node_entered_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let action_type = match action {
+                EntryAction::Transfer { .. } => "transfer",
+                EntryAction::Queue { .. } => "queue",
+                EntryAction::Menu { .. } => "menu",
+                EntryAction::JumpIvr { .. } => "jump_ivr",
+                EntryAction::RouteToAgent { .. } => "route_to_agent",
+                _ => "other",
+            };
+            self.emit_rwi_event_typed(ctx, &crate::rwi::IvrNodeExited {
+                call_id: ctx.call_info.session_id.clone(),
+                node_id: menu_key.clone(),
+                node_name,
+                result_value: Some(action_type.to_string()),
+                duration_ms: duration_ms as u32,
+                exit_time: chrono::Utc::now().to_rfc3339(),
+                next_node_id: None,
+                hangup_reason: None,
+                call_result: None,
+            });
+        }
         match action {
             EntryAction::Transfer { target } => {
                 info!(ivr = %self.definition.name, target, "IVR transferring call");
+                self.ivr_flow_completed(ctx, "transferred", Some(target))
+                    .await;
                 self.state = IvrState::Done;
                 Ok(AppAction::Transfer(target.clone()))
             }
@@ -389,6 +480,7 @@ impl IvrApp {
                     return_to_ivr = ?return_to_ivr,
                     "IVR sending to queue"
                 );
+                self.ivr_flow_completed(ctx, "queue", Some(target)).await;
                 self.state = IvrState::Done;
                 if return_to_ivr.unwrap_or(false) {
                     // Encode return IVR name so the queue can come back on failure
@@ -411,6 +503,8 @@ impl IvrApp {
             }
             EntryAction::Voicemail { target } => {
                 info!(ivr = %self.definition.name, target, "IVR transferring to voicemail");
+                self.ivr_flow_completed(ctx, "voicemail", Some(target))
+                    .await;
                 self.state = IvrState::Done;
                 Ok(AppAction::Transfer(format!("voicemail:{}", target)))
             }
@@ -448,6 +542,7 @@ impl IvrApp {
                 prompt,
                 prompt_text,
                 prompt_voice,
+                ..
             } => {
                 if let Some(path) = self
                     .resolve_audio(
@@ -457,12 +552,13 @@ impl IvrApp {
                     )
                     .await
                 {
-                    self.state = IvrState::PlayingHangup;
-                    debug!(ivr = %self.definition.name, prompt = %path, "Playing hangup prompt");
+                    self.state = IvrState::PlayingAndHangup { code: None };
+                    debug!(ivr = %self.definition.name, prompt = %path, "Playing prompt before hangup");
                     ctrl.play_audio(&path, false).await?;
                     Ok(AppAction::Continue)
                 } else {
                     info!(ivr = %self.definition.name, "IVR hanging up");
+                    self.ivr_flow_completed(ctx, "hangup", None).await;
                     self.state = IvrState::Done;
                     Ok(AppAction::Hangup {
                         reason: None,
@@ -695,6 +791,21 @@ impl IvrApp {
                     }
                 }
             }
+
+            EntryAction::Prompt { .. }
+            | EntryAction::DtmfMenu { .. }
+            | EntryAction::CollectDtmf { .. }
+            | EntryAction::InputPhone { .. }
+            | EntryAction::InputVoice { .. }
+            | EntryAction::Api { .. }
+            | EntryAction::Torecord { .. }
+            | EntryAction::JumpIvr { .. }
+            | EntryAction::RouteToAgent { .. }
+            | EntryAction::VoipBridge { .. } => {
+                error!(ivr = %self.definition.name, action = ?std::mem::discriminant(action),
+                    "Tree mode IVR received unsupported step-mode action");
+                Err(anyhow::anyhow!("unsupported action type for tree mode"))
+            }
         }
     }
 
@@ -730,7 +841,7 @@ impl IvrApp {
         // Build the request with custom headers.
         // For GET: send context as query params to avoid a JSON body.
         // For POST (and everything else): serialize the full payload as JSON.
-        let mut req_builder = if method.eq_ignore_ascii_case("GET") {
+        let req_builder = if method.eq_ignore_ascii_case("GET") {
             let mut params = vec![
                 ("session_id", ctx.call_info.session_id.as_str()),
                 ("caller", ctx.call_info.caller.as_str()),
@@ -757,24 +868,13 @@ impl IvrApp {
             ctx.http_client.post(url).json(&payload)
         };
 
-        for (key, value) in headers {
-            req_builder = req_builder.header(key, value);
-        }
-
-        let response = tokio::time::timeout(Duration::from_secs(timeout_secs), req_builder.send())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("Webhook request timed out after {} seconds", timeout_secs)
-            })?
-            .map_err(|e| anyhow::anyhow!("Webhook request failed: {}", e))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Webhook returned non-success status: {}",
-                status
-            ));
-        }
+        let response = crate::http_util::execute_request(
+            req_builder,
+            headers,
+            Some(Duration::from_secs(timeout_secs)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Webhook request failed: {}", e))?;
 
         let webhook_response: WebhookResponse = response
             .json()
@@ -995,7 +1095,7 @@ impl CallApp for IvrApp {
     async fn on_enter(
         &mut self,
         ctrl: &mut CallController,
-        _ctx: &ApplicationContext,
+        ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         info!(ivr = %self.definition.name, "IVR application started");
         ctrl.answer().await?;
@@ -1027,7 +1127,7 @@ impl CallApp for IvrApp {
 
         if let Some(action) = closed_action {
             if let Some(action) = action {
-                return self.execute_action(&action, ctrl, _ctx).await;
+                return self.execute_action(&action, ctrl, ctx).await;
             }
             // Default: hang up
             self.state = IvrState::Done;
@@ -1037,7 +1137,7 @@ impl CallApp for IvrApp {
             });
         }
 
-        self.enter_menu("root", ctrl, _ctx).await
+        self.enter_menu("root", ctrl, ctx).await
     }
 
     async fn on_dtmf(

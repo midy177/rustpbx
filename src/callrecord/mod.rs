@@ -1,17 +1,29 @@
 use crate::{
-    config::{CallRecordConfig, S3Vendor},
+    config::{CallRecordConfig, CallRecordStorageConfig, DEFAULT_CALL_RECORD_MAX_CONCURRENT},
     utils::sanitize_id,
 };
-use anyhow::{Error, Result};
+use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest;
-use sea_orm::prelude::DateTimeUtc;
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection,
+    prelude::DateTimeUtc,
+    sea_query::{Alias, ColumnDef, Expr, Query, Table},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, future::Future, path::Path, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    future::{Future, pending},
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    time::sleep,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -22,6 +34,9 @@ pub mod sipflow_upload;
 pub mod storage;
 #[cfg(test)]
 mod tests;
+
+const CALL_RECORD_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CALL_RECORD_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -192,6 +207,7 @@ pub enum CallRecordHangupReason {
     Canceled,
     Rejected,
     Failed,
+    RtpTimeout,
     Other(String),
 }
 
@@ -298,6 +314,7 @@ impl std::fmt::Display for CallRecordHangupReason {
             Self::Canceled => write!(f, "canceled"),
             Self::Rejected => write!(f, "rejected"),
             Self::Failed => write!(f, "failed"),
+            Self::RtpTimeout => write!(f, "rtpTimeout"),
             Self::Other(s) => write!(f, "{}", s),
         }
     }
@@ -311,31 +328,9 @@ pub trait CallRecordHook: Send + Sync {
 pub type CallRecordSender = tokio::sync::mpsc::UnboundedSender<CallRecord>;
 pub type CallRecordReceiver = tokio::sync::mpsc::UnboundedReceiver<CallRecord>;
 
-pub type FnSaveCallRecord = Arc<
-    Box<
-        dyn Fn(
-                CancellationToken,
-                Arc<dyn CallRecordFormatter>,
-                Arc<CallRecordConfig>,
-                CallRecord,
-            ) -> Pin<Box<dyn Future<Output = CallRecordSaveResult> + Send>>
-            + Send
-            + Sync,
-    >,
->;
-
-type CallRecordSaveResult = std::result::Result<(CallRecord, String), (CallRecord, Error)>;
-
-/// A no-op saver that immediately returns success without writing any files.
-/// Use this when you only need hooks to run (e.g. `DatabaseHook`, `SipFlowUploadHook`)
-/// but do not want CDR JSON files on disk.
-pub fn noop_saver(
-    _cancel_token: CancellationToken,
-    _formatter: Arc<dyn CallRecordFormatter>,
-    _config: Arc<CallRecordConfig>,
-    record: CallRecord,
-) -> Pin<Box<dyn Future<Output = CallRecordSaveResult> + Send>> {
-    Box::pin(async move { Ok((record, String::new())) })
+#[async_trait::async_trait]
+pub trait CallRecordSaver: Send + Sync {
+    async fn save(&self, record: &CallRecord) -> Result<String>;
 }
 
 pub async fn write_call_record_event<T: Serialize>(
@@ -365,105 +360,100 @@ pub fn default_transcript_file_name(record: &CallRecord) -> String {
     format!("{}.transcript.json", sanitize_id(&record.call_id))
 }
 
-pub trait CallRecordFormatter: Send + Sync {
-    fn format(&self, record: &CallRecord) -> Result<String> {
-        Ok(serde_json::to_string(record)?)
-    }
-    fn format_file_name(&self, record: &CallRecord) -> String;
-    fn format_transcript_path(&self, record: &CallRecord) -> String;
-    fn format_media_path(&self, record: &CallRecord, media: &CallRecordMedia) -> String;
+pub fn format_call_record(record: &CallRecord) -> Result<String> {
+    Ok(serde_json::to_string(record)?)
 }
 
-pub struct DefaultCallRecordFormatter {
-    pub root: String,
-}
-
-impl Default for DefaultCallRecordFormatter {
-    fn default() -> Self {
-        Self {
-            root: "./config/cdr".to_string(),
-        }
-    }
-}
-
-impl DefaultCallRecordFormatter {
-    pub fn new_with_config(config: &CallRecordConfig) -> Self {
-        let root = match config {
-            CallRecordConfig::Local { root } => root.clone(),
-            CallRecordConfig::S3 { root, .. } => root.clone(),
-            CallRecordConfig::Database { .. } => "./config/cdr".to_string(),
-            _ => "./config/cdr".to_string(),
-        };
-        Self { root }
-    }
-}
-
-impl CallRecordFormatter for DefaultCallRecordFormatter {
-    fn format_file_name(&self, record: &CallRecord) -> String {
-        let trimmed_root = self.root.trim_end_matches('/');
-        let file_name = default_cdr_file_name(record);
-        if trimmed_root.is_empty() {
-            file_name
-        } else {
-            format!(
-                "{}/{}/{}",
-                trimmed_root,
-                record.start_time.format("%Y%m%d"),
-                file_name
-            )
-        }
-    }
-
-    fn format_transcript_path(&self, record: &CallRecord) -> String {
-        let trimmed_root = self.root.trim_end_matches('/');
-        let file_name = default_transcript_file_name(record);
-        if trimmed_root.is_empty() {
-            file_name
-        } else {
-            format!(
-                "{}/{}/{}",
-                trimmed_root,
-                record.start_time.format("%Y%m%d"),
-                file_name
-            )
-        }
-    }
-    fn format_media_path(&self, record: &CallRecord, media: &CallRecordMedia) -> String {
-        let file_name = Path::new(&media.path)
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-            .to_string_lossy()
-            .to_string();
-
+pub fn format_file_name(root: &str, record: &CallRecord) -> String {
+    let trimmed_root = root.trim_end_matches('/');
+    let file_name = default_cdr_file_name(record);
+    if trimmed_root.is_empty() {
+        file_name
+    } else {
         format!(
-            "{}/{}/{}_{}_{}",
-            self.root.trim_end_matches('/'),
+            "{}/{}/{}",
+            trimmed_root,
             record.start_time.format("%Y%m%d"),
-            record.call_id,
-            media.track_id,
             file_name
         )
     }
+}
+
+pub fn format_transcript_path(root: &str, record: &CallRecord) -> String {
+    let trimmed_root = root.trim_end_matches('/');
+    let file_name = default_transcript_file_name(record);
+    if trimmed_root.is_empty() {
+        file_name
+    } else {
+        format!(
+            "{}/{}/{}",
+            trimmed_root,
+            record.start_time.format("%Y%m%d"),
+            file_name
+        )
+    }
+}
+
+pub fn format_media_path(root: &str, record: &CallRecord, media: &CallRecordMedia) -> String {
+    let trimmed_root = root.trim_end_matches('/');
+    let file_name = Path::new(&media.path)
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
+        .to_string_lossy()
+        .to_string();
+
+    let key = format!(
+        "{}/{}_{}_{}",
+        record.start_time.format("%Y%m%d"),
+        record.call_id,
+        media.track_id,
+        file_name
+    );
+    if trimmed_root.is_empty() {
+        key
+    } else {
+        format!("{}/{}", trimmed_root, key)
+    }
+}
+
+pub fn format_sipflow_media_key(record: &CallRecord) -> String {
+    format!(
+        "{}/{}.wav",
+        record.start_time.format("%Y%m%d"),
+        record.call_id
+    )
+}
+
+pub fn format_sipflow_signaling_key(record: &CallRecord) -> String {
+    format!(
+        "{}/{}.jsonl",
+        record.start_time.format("%Y%m%d"),
+        record.call_id
+    )
+}
+
+pub fn format_sipflow_media_file_name(record: &CallRecord) -> String {
+    format!("{}.wav", record.call_id)
+}
+
+pub fn format_sipflow_signaling_file_name(record: &CallRecord) -> String {
+    format!("{}.jsonl", record.call_id)
 }
 
 pub struct CallRecordManager {
     pub max_concurrent: usize,
     pub sender: CallRecordSender,
     pub stats: Arc<CallRecordStats>,
-    config: Arc<CallRecordConfig>,
     cancel_token: CancellationToken,
     receiver: CallRecordReceiver,
-    saver_fn: FnSaveCallRecord,
-    formatter: Arc<dyn CallRecordFormatter>,
-    hooks: Arc<Vec<Box<dyn CallRecordHook>>>,
+    saver: Box<dyn CallRecordSaver>,
+    hooks: Vec<Box<dyn CallRecordHook>>,
 }
 
 pub struct CallRecordManagerBuilder {
     pub cancel_token: Option<CancellationToken>,
     pub config: Option<CallRecordConfig>,
     pub max_concurrent: Option<usize>,
-    saver_fn: Option<FnSaveCallRecord>,
-    formatter: Option<Arc<dyn CallRecordFormatter>>,
     hooks: Vec<Box<dyn CallRecordHook>>,
 }
 
@@ -479,8 +469,6 @@ impl CallRecordManagerBuilder {
             cancel_token: None,
             config: None,
             max_concurrent: None,
-            saver_fn: None,
-            formatter: None,
             hooks: Vec::new(),
         }
     }
@@ -495,41 +483,29 @@ impl CallRecordManagerBuilder {
         self
     }
 
-    pub fn with_saver(mut self, saver: FnSaveCallRecord) -> Self {
-        self.saver_fn = Some(saver);
-        self
-    }
-
-    pub fn with_formatter(mut self, formatter: Arc<dyn CallRecordFormatter>) -> Self {
-        self.formatter = Some(formatter);
-        self
-    }
-
     pub fn with_hook(mut self, hook: Box<dyn CallRecordHook>) -> Self {
         self.hooks.push(hook);
         self
     }
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
-        self.max_concurrent = Some(max_concurrent);
+        self.max_concurrent = Some(max_concurrent.max(1));
         self
     }
 
-    pub fn build(self) -> CallRecordManager {
-        let cancel_token = self.cancel_token.unwrap_or_default();
-        let config = Arc::new(self.config.unwrap_or_default());
+    pub async fn build(self) -> Result<CallRecordManager> {
+        let Self {
+            cancel_token,
+            config,
+            max_concurrent,
+            hooks,
+        } = self;
+        let cancel_token = cancel_token.unwrap_or_default();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let saver_fn = self
-            .saver_fn
-            .unwrap_or_else(|| Arc::new(Box::new(CallRecordManager::default_saver)));
-        let formatter = self
-            .formatter
-            .unwrap_or_else(|| Arc::new(DefaultCallRecordFormatter::default()));
-        let max_concurrent = self.max_concurrent.unwrap_or(64);
-
-        match config.as_ref() {
-            CallRecordConfig::Local { root } => {
+        let saver: Box<dyn CallRecordSaver> = match config.map(|config| config.storage) {
+            None => Box::new(NoopCallRecordSaver),
+            Some(CallRecordStorageConfig::Local { root }) => {
                 if !Path::new(&root).exists() {
-                    match std::fs::create_dir_all(root) {
+                    match std::fs::create_dir_all(&root) {
                         Ok(_) => {
                             info!("CallRecordManager created directory: {}", root);
                         }
@@ -538,93 +514,138 @@ impl CallRecordManagerBuilder {
                         }
                     }
                 }
+                Box::new(LocalCallRecordSaver { root })
             }
-            CallRecordConfig::Database { .. } => {
-                // Database backend doesn't need directory creation
-            }
-            _ => {}
-        }
+            Some(CallRecordStorageConfig::S3 {
+                root,
+                vendor,
+                bucket,
+                region,
+                access_key,
+                secret_key,
+                endpoint,
+                ..
+            }) => {
+                let storage = crate::storage::Storage::new(&crate::storage::StorageConfig::S3 {
+                    vendor,
+                    bucket: bucket.clone(),
+                    region,
+                    access_key,
+                    secret_key,
+                    endpoint: Some(endpoint.clone()),
+                    prefix: None,
+                })
+                .map_err(|e| {
+                    warn!(
+                        bucket,
+                        endpoint,
+                        "CallRecordManager failed to initialize S3 storage: {}", e
+                    );
+                    e
+                })?;
 
-        CallRecordManager {
+                Box::new(S3CallRecordSaver {
+                    root,
+                    bucket,
+                    endpoint,
+                    storage,
+                })
+            }
+            Some(CallRecordStorageConfig::Http { url, headers, .. }) => {
+                Box::new(HttpCallRecordSaver {
+                    url,
+                    headers,
+                    client: reqwest::Client::builder()
+                        .timeout(CALL_RECORD_HTTP_TIMEOUT)
+                        .connect_timeout(CALL_RECORD_HTTP_CONNECT_TIMEOUT)
+                        .build()?,
+                })
+            }
+            Some(CallRecordStorageConfig::Database {
+                database_url: callrecord_database_url,
+                table_name,
+                ..
+            }) => {
+                let Some(db_url) = callrecord_database_url else {
+                    return Err(anyhow::anyhow!(
+                        "database call record saver requires database_url"
+                    ));
+                };
+                let db = crate::models::connect_db(&db_url).await.map_err(|e| {
+                    warn!(
+                        database_url = %db_url,
+                        "CallRecordManager failed to initialize database saver: {}", e
+                    );
+                    e
+                })?;
+                let create_table = Table::create()
+                    .table(Alias::new(table_name.as_str()))
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .integer()
+                            .not_null()
+                            .primary_key()
+                            .auto_increment(),
+                    )
+                    .col(ColumnDef::new(Alias::new("call_id")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("caller")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("callee")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("start_time")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("end_time")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("status_code")).integer())
+                    .col(ColumnDef::new(Alias::new("hangup_reason")).text())
+                    .col(ColumnDef::new(Alias::new("details")).text())
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned();
+                db.execute(db.get_database_backend().build(&create_table))
+                    .await?;
+
+                Box::new(DatabaseCallRecordSaver {
+                    db,
+                    db_url,
+                    table_name,
+                })
+            }
+        };
+        let max_concurrent = max_concurrent
+            .unwrap_or(DEFAULT_CALL_RECORD_MAX_CONCURRENT)
+            .max(1);
+
+        Ok(CallRecordManager {
             max_concurrent,
             stats: Arc::new(CallRecordStats::new()),
             cancel_token,
             sender,
             receiver,
-            config,
-            saver_fn,
-            formatter,
-            hooks: Arc::new(self.hooks),
-        }
+            saver,
+            hooks,
+        })
     }
 }
 
-impl CallRecordManager {
-    fn default_saver(
-        _cancel_token: CancellationToken,
-        formatter: Arc<dyn CallRecordFormatter>,
-        config: Arc<CallRecordConfig>,
-        record: CallRecord,
-    ) -> Pin<Box<dyn Future<Output = CallRecordSaveResult> + Send>> {
-        Box::pin(async move {
-            let mut record = record;
-            let start_time = Instant::now();
-            let result = match config.as_ref() {
-                CallRecordConfig::Local { .. } => {
-                    Self::save_local_record(formatter.clone(), &mut record).await
-                }
-                CallRecordConfig::S3 {
-                    vendor,
-                    bucket,
-                    region,
-                    access_key,
-                    secret_key,
-                    endpoint,
-                    ..
-                } => {
-                    Self::save_with_s3_like(
-                        formatter.clone(),
-                        vendor,
-                        bucket,
-                        region,
-                        access_key,
-                        secret_key,
-                        endpoint,
-                        &mut record,
-                    )
-                    .await
-                }
-                CallRecordConfig::Http { url, headers, .. } => {
-                    Self::save_with_http(formatter.clone(), url, headers, &record).await
-                }
-                CallRecordConfig::Database {
-                    database_url,
-                    table_name,
-                } => {
-                    Self::save_to_database(database_url.clone(), table_name.clone(), &record).await
-                }
-            };
-            let file_name = match result {
-                Ok(file_name) => file_name,
-                Err(e) => return Err((record, e)),
-            };
-            let elapsed = start_time.elapsed();
-            info!(
-                ?elapsed,
-                call_id = record.call_id,
-                file_name,
-                "CallRecordManager saved"
-            );
-            Ok((record, file_name))
-        })
-    }
+pub struct NoopCallRecordSaver;
 
-    async fn save_local_record(
-        formatter: Arc<dyn CallRecordFormatter>,
-        record: &mut CallRecord,
-    ) -> Result<String> {
-        let file_content = formatter.format(record)?;
-        let file_name = formatter.format_file_name(record);
+#[async_trait::async_trait]
+impl CallRecordSaver for NoopCallRecordSaver {
+    async fn save(&self, _record: &CallRecord) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
+struct LocalCallRecordSaver {
+    root: String,
+}
+
+#[async_trait::async_trait]
+impl CallRecordSaver for LocalCallRecordSaver {
+    async fn save(&self, record: &CallRecord) -> Result<String> {
+        let file_content = format_call_record(record)?;
+        let file_name = format_file_name(&self.root, record);
 
         // Ensure parent directory exists
         if let Some(parent) = Path::new(&file_name).parent() {
@@ -638,19 +659,22 @@ impl CallRecordManager {
         file.flush().await?;
         Ok(file_name.to_string())
     }
+}
 
-    async fn save_with_http(
-        formatter: Arc<dyn CallRecordFormatter>,
-        url: &String,
-        headers: &Option<HashMap<String, String>>,
-        record: &CallRecord,
-    ) -> Result<String> {
-        let client = reqwest::Client::new();
-        let call_log_json = formatter.format(record)?;
+struct HttpCallRecordSaver {
+    url: String,
+    headers: Option<HashMap<String, String>>,
+    client: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl CallRecordSaver for HttpCallRecordSaver {
+    async fn save(&self, record: &CallRecord) -> Result<String> {
+        let call_log_json = format_call_record(record)?;
         let form = reqwest::multipart::Form::new().text("calllog.json", call_log_json);
 
-        let mut request = client.post(url).multipart(form);
-        if let Some(headers_map) = headers {
+        let mut request = self.client.post(&self.url).multipart(form);
+        if let Some(headers_map) = &self.headers {
             for (key, value) in headers_map {
                 request = request.header(key, value);
             }
@@ -667,34 +691,23 @@ impl CallRecordManager {
             ))
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    async fn save_with_s3_like(
-        formatter: Arc<dyn CallRecordFormatter>,
-        vendor: &S3Vendor,
-        bucket: &str,
-        region: &str,
-        access_key: &str,
-        secret_key: &str,
-        endpoint: &str,
-        record: &mut CallRecord,
-    ) -> Result<String> {
+struct S3CallRecordSaver {
+    root: String,
+    bucket: String,
+    endpoint: String,
+    storage: crate::storage::Storage,
+}
+
+#[async_trait::async_trait]
+impl CallRecordSaver for S3CallRecordSaver {
+    async fn save(&self, record: &CallRecord) -> Result<String> {
         let start_time = Instant::now();
-        let storage_config = crate::storage::StorageConfig::S3 {
-            vendor: vendor.clone(),
-            bucket: bucket.to_string(),
-            region: region.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
-            endpoint: Some(endpoint.to_string()),
-            prefix: None,
-        };
-        let storage = crate::storage::Storage::new(&storage_config)?;
-
-        let call_log_json = formatter.format(record)?;
-        let filename = formatter.format_file_name(record);
+        let call_log_json = format_call_record(record)?;
+        let filename = format_file_name(&self.root, record);
         let buf_size = call_log_json.len();
-        match storage.write(&filename, call_log_json.into()).await {
+        match self.storage.write(&filename, call_log_json.into()).await {
             Ok(_) => {
                 info!(
                     elapsed = start_time.elapsed().as_secs_f64(),
@@ -708,67 +721,38 @@ impl CallRecordManager {
 
         Ok(format!(
             "{}/{}/{}",
-            endpoint.trim_end_matches('/'),
-            bucket.trim_matches('/'),
+            self.endpoint.trim_end_matches('/'),
+            self.bucket.trim_matches('/'),
             filename.trim_start_matches('/')
         ))
     }
+}
 
-    async fn save_to_database(
-        database_url: Option<String>,
-        table_name: String,
-        record: &CallRecord,
-    ) -> Result<String> {
-        let db_url = database_url.unwrap_or_else(|| {
-            // Use global database_url from config
-            // This is a placeholder - in production you'd access the global config
-            "sqlite::memory:".to_string()
-        });
+struct DatabaseCallRecordSaver {
+    db: DatabaseConnection,
+    db_url: String,
+    table_name: String,
+}
 
-        let db = crate::models::connect_db(&db_url).await?;
-
-        // Create table if not exists
-        let create_table_sql = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_id TEXT NOT NULL,
-                caller TEXT NOT NULL,
-                callee TEXT NOT NULL,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL,
-                status_code INTEGER,
-                hangup_reason TEXT,
-                details TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            table_name
-        );
-
-        use sea_orm::ConnectionTrait;
-        db.execute(sea_orm::Statement::from_string(
-            db.get_database_backend(),
-            create_table_sql,
-        ))
-        .await?;
-
-        // Insert record
+#[async_trait::async_trait]
+impl CallRecordSaver for DatabaseCallRecordSaver {
+    async fn save(&self, record: &CallRecord) -> Result<String> {
         let details_json = serde_json::to_string(&record.details)?;
         let hangup_reason = record.hangup_reason.as_ref().map(|r| r.to_string());
-
-        let insert_sql = format!(
-            r#"
-            INSERT INTO {} (call_id, caller, callee, start_time, end_time, status_code, hangup_reason, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            table_name
-        );
-
-        db.execute(sea_orm::Statement::from_sql_and_values(
-            db.get_database_backend(),
-            insert_sql,
-            vec![
+        let mut insert = Query::insert();
+        insert
+            .into_table(Alias::new(self.table_name.as_str()))
+            .columns([
+                Alias::new("call_id"),
+                Alias::new("caller"),
+                Alias::new("callee"),
+                Alias::new("start_time"),
+                Alias::new("end_time"),
+                Alias::new("status_code"),
+                Alias::new("hangup_reason"),
+                Alias::new("details"),
+            ])
+            .values_panic([
                 record.call_id.clone().into(),
                 record.caller.clone().into(),
                 record.callee.clone().into(),
@@ -777,63 +761,85 @@ impl CallRecordManager {
                 (record.status_code as i32).into(),
                 hangup_reason.into(),
                 details_json.into(),
-            ],
-        ))
-        .await?;
+            ]);
+        self.db
+            .execute(self.db.get_database_backend().build(&insert))
+            .await?;
 
-        Ok(format!("database:{}/{}", db_url, record.call_id))
+        Ok(format!("database:{}/{}", self.db_url, record.call_id))
     }
+}
 
+impl CallRecordManager {
     pub async fn serve(&mut self) {
         let token = self.cancel_token.clone();
         info!("CallRecordManager serving");
-        tokio::select! {
-            _ = token.cancelled() => {}
-            _ = self.recv_loop() => {}
-        }
-        info!("CallRecordManager served");
-    }
-
-    async fn recv_loop(&mut self) -> Result<()> {
+        let max_concurrent = self.max_concurrent.max(1);
+        let receiver = &mut self.receiver;
+        let saver = self.saver.as_ref();
+        let hooks = &self.hooks;
         let mut futures = FuturesUnordered::new();
+        let mut receiver_closed = false;
+        let mut shutting_down = false;
+        let mut shutdown_timeout: Pin<Box<dyn Future<Output = ()> + Send>> =
+            Box::pin(pending());
+
         loop {
-            let limit = self.max_concurrent - futures.len();
-            if limit == 0 {
-                let _ = futures.next().await;
-                continue;
-            }
-            let mut buffer = Vec::with_capacity(limit);
-            if self.receiver.recv_many(&mut buffer, limit).await == 0 {
+            if (receiver_closed || shutting_down) && futures.is_empty() {
                 break;
             }
 
-            for record in buffer {
-                let cancel_token_ref = self.cancel_token.clone();
-                let save_fn_ref = self.saver_fn.clone();
-                let config_ref = self.config.clone();
-                let formatter_ref = self.formatter.clone();
-                let hooks_ref = self.hooks.clone();
+            let can_receive =
+                !receiver_closed && !shutting_down && futures.len() < max_concurrent;
 
-                futures.push(async move {
-                    let save_outcome =
-                        save_fn_ref(cancel_token_ref, formatter_ref, config_ref, record).await;
-                    let mut record = match save_outcome {
-                        Ok((record, _file_name)) => record,
-                        Err((record, err)) => {
-                            warn!("Failed to save call record: {}", err);
-                            record
-                        }
+            tokio::select! {
+                record = receiver.recv(), if can_receive => {
+                    let Some(record) = record else {
+                        receiver_closed = true;
+                        continue;
                     };
 
-                    for hook in hooks_ref.iter() {
-                        if let Err(e) = hook.on_record_completed(&mut record).await {
-                            warn!("CallRecordHook failed: {}", e);
+                    futures.push(async move {
+                        let mut record = record;
+                        let start_time = Instant::now();
+                        match saver.save(&record).await {
+                            Ok(file_name) => {
+                                let elapsed = start_time.elapsed();
+                                info!(
+                                    ?elapsed,
+                                    call_id = record.call_id,
+                                    file_name,
+                                    "CallRecordManager saved"
+                                );
+                            }
+                            Err(err) => {
+                                warn!("Failed to save call record: {}", err);
+                            }
                         }
-                    }
-                });
+
+                        for hook in hooks.iter() {
+                            if let Err(e) = hook.on_record_completed(&mut record).await {
+                                warn!("CallRecordHook failed: {}", e);
+                            }
+                        }
+                    });
+                }
+                Some(()) = futures.next(), if !futures.is_empty() => {}
+                _ = token.cancelled(), if !shutting_down => {
+                    shutting_down = true;
+                    let pending = futures.len();
+                    info!(pending, "CallRecordManager received shutdown");
+                    shutdown_timeout = Box::pin(sleep(Duration::from_secs(5)));
+                }
+                _ = &mut shutdown_timeout, if shutting_down => {
+                    warn!(
+                        pending = futures.len(),
+                        "CallRecordManager shutdown timed out before all tasks finished"
+                    );
+                    break;
+                }
             }
-            while futures.next().await.is_some() {}
         }
-        Ok(())
+        info!(pending = futures.len(), "CallRecordManager exiting");
     }
 }

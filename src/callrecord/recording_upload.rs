@@ -8,18 +8,63 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::{
-    callrecord::{CallRecord, CallRecordHook},
+    callrecord::{
+        CALL_RECORD_HTTP_CONNECT_TIMEOUT, CALL_RECORD_HTTP_TIMEOUT, CallRecord, CallRecordHook,
+    },
     config::{RecordingPolicy, RecordingType},
+    rwi::RwiGatewayRef,
     storage::{Storage, StorageConfig},
 };
 
 pub struct RecordingUploadHook {
     policy: RecordingPolicy,
+    rwi_gateway: Option<RwiGatewayRef>,
+    client: reqwest::Client,
+    s3_storage: Option<Storage>,
 }
 
 impl RecordingUploadHook {
-    pub fn new(policy: RecordingPolicy) -> Self {
-        Self { policy }
+    pub fn new(policy: RecordingPolicy) -> Result<Self> {
+        let s3_storage = if policy.recording_type == RecordingType::S3 {
+            let bucket = Self::required(&policy.bucket, "bucket")?;
+            let region = Self::required(&policy.region, "region")?;
+            let access_key = Self::required(&policy.access_key, "access_key")?;
+            let secret_key = Self::required(&policy.secret_key, "secret_key")?;
+            let endpoint = policy
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(str::to_string);
+            let vendor = policy.vendor.clone().unwrap_or_default();
+            let storage = Storage::new(&StorageConfig::S3 {
+                vendor,
+                bucket: bucket.clone(),
+                region,
+                access_key,
+                secret_key,
+                endpoint: endpoint.clone(),
+                prefix: None,
+            })?;
+            Some(storage)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            policy,
+            rwi_gateway: None,
+            client: reqwest::Client::builder()
+                .timeout(CALL_RECORD_HTTP_TIMEOUT)
+                .connect_timeout(CALL_RECORD_HTTP_CONNECT_TIMEOUT)
+                .build()?,
+            s3_storage,
+        })
+    }
+
+    pub fn with_rwi_gateway(mut self, gw: RwiGatewayRef) -> Self {
+        self.rwi_gateway = Some(gw);
+        self
     }
 
     fn required(value: &Option<String>, name: &str) -> Result<String> {
@@ -71,29 +116,13 @@ impl RecordingUploadHook {
     }
 
     async fn upload_s3(&self, key: &str, data: Vec<u8>) -> Result<String> {
+        let storage = self
+            .s3_storage
+            .as_ref()
+            .ok_or_else(|| anyhow!("recording S3 storage is not initialized"))?;
         let bucket = Self::required(&self.policy.bucket, "bucket")?;
-        let region = Self::required(&self.policy.region, "region")?;
-        let access_key = Self::required(&self.policy.access_key, "access_key")?;
-        let secret_key = Self::required(&self.policy.secret_key, "secret_key")?;
-        let endpoint = self
-            .policy
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty())
-            .map(str::to_string);
-        let vendor = self.policy.vendor.clone().unwrap_or_default();
-        let storage = Storage::new(&StorageConfig::S3 {
-            vendor,
-            bucket: bucket.clone(),
-            region,
-            access_key,
-            secret_key,
-            endpoint: endpoint.clone(),
-            prefix: None,
-        })?;
         storage.write(key, Bytes::from(data)).await?;
-        Ok(Self::s3_url(endpoint.as_deref(), &bucket, key))
+        Ok(Self::s3_url(self.policy.endpoint.as_deref(), &bucket, key))
     }
 
     async fn upload_http(
@@ -116,8 +145,7 @@ impl RecordingUploadHook {
             .text("call_id", record.call_id.clone())
             .text("track_id", track_id.to_string())
             .part("recording", part);
-        let client = reqwest::Client::new();
-        let mut request = client.post(&url).multipart(form);
+        let mut request = self.client.post(&url).multipart(form);
         if let Some(headers) = self.policy.headers.as_ref() {
             for (key, value) in headers {
                 request = request.header(key.as_str(), value.as_str());
@@ -145,7 +173,7 @@ impl RecordingUploadHook {
 #[async_trait]
 impl CallRecordHook for RecordingUploadHook {
     async fn on_record_completed(&self, record: &mut CallRecord) -> anyhow::Result<()> {
-        if !self.policy.uploads_recording() {
+        if record.answer_time.is_none() {
             return Ok(());
         }
 
@@ -213,10 +241,76 @@ impl CallRecordHook for RecordingUploadHook {
             }
         }
 
-        if let Some(url) = first_uploaded_url {
-            record.details.recording_url = Some(url);
+        // Determine the url/path for RecordEnd (upload URL or local file path).
+        let recording_url = first_uploaded_url
+            .clone()
+            .or_else(|| record.recorder.first().map(|m| m.path.clone()));
+
+        if let Some(ref url) = first_uploaded_url {
+            record.details.recording_url = Some(url.clone());
             record.details.recording_duration_secs =
                 Some((record.end_time - record.start_time).num_seconds().max(0) as i32);
+
+            // Emit RecordingMetadataAvailable webhook so external systems
+            // (e.g. MQ consumers) are notified that the recording is ready.
+            if let Some(ref gw) = self.rwi_gateway {
+                use crate::rwi::proto::RecordingMetadata;
+                let metadata = RecordingMetadata {
+                    filename: record
+                        .recorder
+                        .first()
+                        .and_then(|m| {
+                            Path::new(&m.path)
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_default(),
+                    unique_id: record.call_id.clone(),
+                    file_size: record
+                        .recorder
+                        .first()
+                        .map(|m| m.size)
+                        .unwrap_or(0),
+                    download_url: Some(url.clone()),
+                    caller_name: Some(record.caller.clone()),
+                    callee_name: Some(record.callee.clone()),
+                    called_phone: Some(record.callee.clone()),
+                    call_type: record.details.direction.clone(),
+                    agent_id: None,
+                    agent_name: None,
+                    call_start_time: Some(record.start_time.to_rfc3339()),
+                    call_end_time: Some(record.end_time.to_rfc3339()),
+                    upload_time: Some(chrono::Utc::now().to_rfc3339()),
+                    switch_flag: None,
+                    process_flag: None,
+                    root_call_id: None,
+                };
+                let gw_ref = gw.read();
+                gw_ref.send_to_owner(&crate::rwi::RecordingMetadataAvailable {
+                    call_id: record.call_id.clone(),
+                    metadata,
+                });
+                info!(
+                    call_id = %record.call_id,
+                    url = %url,
+                    "RecordingMetadataAvailable event emitted"
+                );
+            }
+        }
+
+        // Emit RecordEnd with url (upload URL or local path), duration and file size.
+        if let Some(ref gw) = self.rwi_gateway {
+            let gw_ref = gw.read();
+            gw_ref.send_to_owner(&crate::rwi::RecordEnd {
+                call_id: record.call_id.clone(),
+                url: recording_url,
+                duration_secs: (record.end_time - record.start_time).num_seconds().max(0) as u64,
+                file_size: record.recorder.first().map(|m| m.size).unwrap_or(0),
+            });
+            info!(
+                call_id = %record.call_id,
+                "RecordEnd event emitted"
+            );
         }
 
         Ok(())

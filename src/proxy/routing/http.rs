@@ -4,7 +4,7 @@ use crate::call::{
     TrunkContext,
 };
 use crate::config::{HttpRouterConfig, MediaProxyMode, RtpConfig};
-use crate::proxy::call::{CallRouter, RouteError};
+use crate::proxy::call::{CallRouter, RouteError, apply_allowed_codecs};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rsipstack::sip::prelude::*;
@@ -84,10 +84,17 @@ struct HttpResponsePayload {
     pub timeout: Option<u32>,
     /// Max ring time for call setup/ringback phase (in seconds)
     pub max_ring_time: Option<u32>,
+    /// RTP timeout per direction in seconds — if no audio is received for this
+    /// duration on either direction, the call is terminated. Overrides proxy-level
+    /// `rtp_timeout`. Set to 0 to explicitly disable.
+    pub rtp_timeout: Option<u32>,
     pub media_proxy: Option<MediaProxyMode>,
     pub headers: Option<HashMap<String, String>>,
     pub with_original_headers: Option<bool>,
     pub extensions: Option<HashMap<String, String>>,
+    /// Allowed audio codecs. If set, restricts the audio codecs used for this call.
+    /// Values are codec names like "pcma", "pcmu", "g722", "opus", "g729".
+    pub allow_codecs: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -149,56 +156,40 @@ impl CallRouter for HttpCallRouter {
             body,
         };
 
-        let mut request = self.client.post(&self.config.url).json(&payload);
-
-        if let Some(config_headers) = &self.config.headers {
-            for (k, v) in config_headers {
-                request = request.header(k, v);
-            }
-        }
+        let req = self.client.post(&self.config.url).json(&payload);
+        let config_headers = self.config.headers.clone().unwrap_or_default();
 
         let start = Instant::now();
-        let response = request.send().await.map_err(|e| {
-            let elapsed = start.elapsed();
-            warn!(
-                %call_id,
-                from = %payload.from,
-                to = %payload.to,
-                elapsed_ms = elapsed.as_millis(),
-                "HTTP router request failed: {}",
-                e
-            );
-            RouteError {
-                error: anyhow!("HTTP router request failed: {}", e),
-                status: Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                extensions: None,
-            }
-        })?;
-
-        let elapsed = start.elapsed();
-        if !response.status().is_success() {
-            if self.config.fallback_to_static {
+        let response = match crate::http_util::execute_request(req, &config_headers, None).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let elapsed = start.elapsed();
+                let err_str = e.to_string();
+                let is_status_error = err_str.contains("HTTP returned");
                 warn!(
                     %call_id,
                     from = %payload.from,
                     to = %payload.to,
                     elapsed_ms = elapsed.as_millis(),
-                    status = %response.status(),
-                    "HTTP router returned error, falling back to static"
+                    "HTTP router error: {}",
+                    err_str
                 );
+                if is_status_error && self.config.fallback_to_static {
+                    return Err(RouteError {
+                        error: anyhow!("HTTP router returned error"),
+                        status: None,
+                        extensions: None,
+                    });
+                }
                 return Err(RouteError {
-                    error: anyhow!("HTTP router returned error"),
-                    status: None,
+                    error: anyhow!("HTTP router failed: {}", err_str),
+                    status: Some(rsipstack::sip::StatusCode::ServiceUnavailable),
                     extensions: None,
                 });
             }
-            return Err(RouteError {
-                error: anyhow!("HTTP router returned error: {}", response.status()),
-                status: Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                extensions: None,
-            });
-        }
+        };
 
+        let elapsed = start.elapsed();
         let result: HttpResponsePayload = response.json().await.map_err(|e| RouteError {
             error: anyhow!("Failed to parse HTTP router response: {}", e),
             status: Some(rsipstack::sip::StatusCode::ServerInternalError),
@@ -314,6 +305,16 @@ impl CallRouter for HttpCallRouter {
                 if let Some(max_ring_time) = result.max_ring_time {
                     dialplan.max_ring_time = Duration::from_secs(max_ring_time as u64);
                 }
+
+                if let Some(rtp_timeout) = result.rtp_timeout {
+                    if rtp_timeout > 0 {
+                        dialplan.rtp_timeout = Some(Duration::from_secs(rtp_timeout as u64));
+                    } else {
+                        dialplan.rtp_timeout = None;
+                    }
+                }
+
+                apply_allowed_codecs(&mut dialplan, result.allow_codecs.as_deref(), None);
 
                 Ok(dialplan)
             }

@@ -1,11 +1,8 @@
+use super::test_helpers;
 use super::test_ua::{TestUa, TestUaConfig, TestUaEvent};
-use crate::call::user::SipUser;
 use crate::config::ProxyConfig;
 use crate::proxy::{
-    auth::AuthModule,
-    call::CallModule,
     locator::MemoryLocator,
-    registrar::RegistrarModule,
     server::{SipServer, SipServerBuilder},
     user::MemoryUserBackend,
 };
@@ -19,26 +16,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 fn create_test_proxy_config(port: u16) -> ProxyConfig {
-    ProxyConfig {
-        addr: "127.0.0.1".to_string(),
-        udp_port: Some(port),
-        tcp_port: None,
-        tls_port: None,
-        ws_port: None,
-        useragent: Some("RustPBX-Test/0.1.0".to_string()),
-        modules: Some(vec![
-            "auth".to_string(),
-            "registrar".to_string(),
-            "call".to_string(),
-        ]),
-        ..Default::default()
-    }
+    test_helpers::test_proxy_config(port)
 }
 
 async fn create_test_ua(username: &str, proxy_addr: SocketAddr, local_port: u16) -> Result<TestUa> {
+    let password = match username {
+        "alice" => "password123",
+        "bob" => "password456",
+        "charlie" => "password789",
+        _ => "password123",
+    };
     let config = TestUaConfig {
         username: username.to_string(),
-        password: "password".to_string(),
+        password: password.to_string(),
         realm: "127.0.0.1".to_string(),
         local_port,
         proxy_addr,
@@ -57,53 +47,22 @@ async fn setup_proxy_and_users_with_config(
     config: Arc<ProxyConfig>,
 ) -> (Arc<SipServer>, CancellationToken) {
     let user_backend = MemoryUserBackend::new(None);
-    user_backend
-        .create_user(SipUser {
-            id: 1,
-            username: "alice".to_string(),
-            password: Some("password".to_string()),
-            enabled: true,
-            realm: Some("127.0.0.1".to_string()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    user_backend
-        .create_user(SipUser {
-            id: 2,
-            username: "bob".to_string(),
-            password: Some("password".to_string()),
-            enabled: true,
-            realm: Some("127.0.0.1".to_string()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    for user in test_helpers::standard_test_users() {
+        user_backend.create_user(user).await.unwrap();
+    }
 
     let locator = MemoryLocator::new();
     let cancel_token = CancellationToken::new();
-    let mut builder = SipServerBuilder::new(config)
-        .with_user_backend(Box::new(user_backend))
-        .with_locator(Box::new(locator))
-        .with_cancel_token(cancel_token.clone());
-
-    builder = builder
-        .register_module("registrar", |inner, config| {
-            Ok(Box::new(RegistrarModule::new(inner, config)))
-        })
-        .register_module("auth", |inner, _config| {
-            Ok(Box::new(AuthModule::new(
-                inner.clone(),
-                inner.proxy_config.clone(),
-            )))
-        })
-        .register_module("call", |inner, config| {
-            Ok(Box::new(CallModule::new(config, inner)))
-        });
+    let builder = test_helpers::register_standard_modules(
+        SipServerBuilder::new(config)
+            .with_user_backend(Box::new(user_backend))
+            .with_locator(Box::new(locator))
+            .with_cancel_token(cancel_token.clone()),
+    );
 
     let server = Arc::new(builder.build().await.unwrap());
     let server_clone = server.clone();
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         if let Err(e) = server_clone.serve().await {
             warn!("Proxy server error: {:?}", e);
         }
@@ -122,7 +81,7 @@ async fn establish_call(
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let alice_clone = alice.clone();
     let offer = offer_sdp.to_string();
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         let res = alice_clone.make_call("bob", Some(offer)).await;
         let _ = tx.send(res).await;
     });
@@ -174,7 +133,7 @@ async fn test_reinvite_audio_hold_unhold() {
 
     // Alice sends re-INVITE with sendonly (hold)
     let bob_clone = bob.clone();
-    let bob_handle = tokio::spawn(async move {
+    let bob_handle = crate::utils::spawn(async move {
         for _ in 0..50 {
             if let Ok(events) = bob_clone.process_dialog_events().await {
                 for event in &events {
@@ -256,14 +215,8 @@ async fn test_reinvite_audio_to_video_add_via_bridge() {
     use rustrtc::sdp::{SdpType, SessionDescription};
 
     let caller_sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
-    let codec_lists = MediaNegotiator::build_bridge_codec_lists(
-        caller_sdp,
-        false,
-        true,
-        &[],
-    );
-    let audio_caps: Vec<_> = codec_lists
-        .caller_side
+    let caller_codecs = MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[]);
+    let audio_caps: Vec<_> = caller_codecs
         .iter()
         .filter_map(|c| c.to_audio_capability())
         .collect();

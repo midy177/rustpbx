@@ -1,12 +1,10 @@
+use super::test_helpers;
 use super::test_ua::{TestUa, TestUaConfig, TestUaEvent};
 use crate::call::user::SipUser;
 
 use crate::config::ProxyConfig;
 use crate::proxy::{
-    auth::AuthModule,
-    call::CallModule,
     locator::{Locator, MemoryLocator},
-    registrar::RegistrarModule,
     server::SipServerBuilder,
     user::MemoryUserBackend,
 };
@@ -18,27 +16,12 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-/// Create a proxy server configuration for testing
 fn create_test_proxy_config(port: u16) -> ProxyConfig {
-    ProxyConfig {
-        addr: "127.0.0.1".to_string(),
-        udp_port: Some(port),
-        tcp_port: None,
-        tls_port: None,
-        ws_port: None,
-        useragent: Some("RustPBX-Test/0.1.0".to_string()),
-        modules: Some(vec![
-            "auth".to_string(),
-            "registrar".to_string(),
-            "call".to_string(),
-        ]),
-        ..Default::default()
-    }
+    test_helpers::test_proxy_config(port)
 }
 
-/// Create test user data
 fn create_test_users() -> Vec<SipUser> {
-    vec![
+    let mut users = vec![
         SipUser {
             id: 1,
             username: "alice".to_string(),
@@ -63,23 +46,24 @@ fn create_test_users() -> Vec<SipUser> {
             realm: Some("127.0.0.1".to_string()),
             ..Default::default()
         },
-        SipUser {
-            id: 4,
-            username: "david".to_string(),
-            password: Some("password789".to_string()),
-            enabled: true,
-            realm: Some("other.com".to_string()),
-            ..Default::default()
-        },
-        SipUser {
-            id: 5,
-            username: "testuser".to_string(),
-            password: Some("testpassword".to_string()),
-            enabled: true,
-            realm: Some("127.0.0.1".to_string()),
-            ..Default::default()
-        },
-    ]
+    ];
+    users.push(SipUser {
+        id: 4,
+        username: "david".to_string(),
+        password: Some("password789".to_string()),
+        enabled: true,
+        realm: Some("other.com".to_string()),
+        ..Default::default()
+    });
+    users.push(SipUser {
+        id: 5,
+        username: "testuser".to_string(),
+        password: Some("testpassword".to_string()),
+        enabled: true,
+        realm: Some("127.0.0.1".to_string()),
+        ..Default::default()
+    });
+    users
 }
 
 /// Test Proxy server manager
@@ -104,31 +88,17 @@ impl TestProxyServer {
 
         let locator = MemoryLocator::new();
         let cancel_token = CancellationToken::new();
-        // Build server
-        let mut builder = SipServerBuilder::new(config)
-            .with_user_backend(Box::new(user_backend))
-            .with_locator(Box::new(locator))
-            .with_cancel_token(cancel_token.clone());
-
-        // Register modules
-        builder = builder
-            .register_module("registrar", |inner, config| {
-                Ok(Box::new(RegistrarModule::new(inner, config)))
-            })
-            .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(
-                    inner.clone(),
-                    inner.proxy_config.clone(),
-                )))
-            })
-            .register_module("call", |inner, config| {
-                Ok(Box::new(CallModule::new(config, inner)))
-            });
+        let builder = test_helpers::register_standard_modules(
+            SipServerBuilder::new(config)
+                .with_user_backend(Box::new(user_backend))
+                .with_locator(Box::new(locator))
+                .with_cancel_token(cancel_token.clone()),
+        );
         let server = Arc::new(builder.build().await?);
 
         // Start server
         let server_clone = server.clone();
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             if let Err(e) = server_clone.serve().await {
                 warn!("Proxy server error: {:?}", e);
             }
@@ -306,10 +276,10 @@ async fn test_call_success() {
     let dummy_sdp = "v=0\r\no=- 123456 123456 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n".to_string();
 
     let alice_sdp = dummy_sdp.clone();
-    let call_task = tokio::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
+    let call_task = crate::utils::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
 
     let bob_sdp = dummy_sdp.clone();
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -418,10 +388,10 @@ async fn test_call_rejection() {
     let alice_sdp = "v=0\r\no=- 123456 123456 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n".to_string();
 
     // Alice calls Bob
-    let call_task = tokio::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
+    let call_task = crate::utils::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
 
     // Bob waits for incoming call and rejects it
-    let reject_task = tokio::spawn(async move {
+    let reject_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -477,10 +447,10 @@ async fn test_call_hangup_flow() {
     let dummy_sdp = "v=0\r\no=- 123456 123456 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n".to_string();
 
     let alice_sdp = dummy_sdp.clone();
-    let call_task = tokio::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
+    let call_task = crate::utils::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
 
     let bob_sdp = dummy_sdp.clone();
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {

@@ -1,5 +1,8 @@
 pub mod backend;
+pub mod flowdb_backend;
+pub mod flowdb_codec;
 pub mod protocol;
+pub mod rtp_stats;
 pub mod sdp_utils;
 pub mod storage;
 pub mod wav_utils;
@@ -24,6 +27,8 @@ pub struct SipFlowItem {
     pub timestamp: u64,
     #[serde(default)]
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg: Option<i32>,
     #[serde(default = "default_msg_type")]
     pub msg_type: SipFlowMsgType,
     #[serde(default)]
@@ -31,6 +36,28 @@ pub struct SipFlowItem {
     #[serde(default)]
     pub dst_addr: String,
     pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SipFlowMediaStats {
+    pub leg: i32,
+    pub src: String,
+    #[serde(default, alias = "count")]
+    pub packet_count: usize,
+    #[serde(default)]
+    pub lost_packets: u64,
+    #[serde(default)]
+    pub expected_packets: u64,
+    #[serde(default)]
+    pub loss_percent: f64,
+    #[serde(default)]
+    pub jitter_ms: Option<f64>,
+    #[serde(default)]
+    pub ssrc: Option<u32>,
+    #[serde(default)]
+    pub payload_type: Option<u8>,
+    #[serde(default)]
+    pub clock_rate: Option<u32>,
 }
 
 fn default_msg_type() -> SipFlowMsgType {
@@ -79,7 +106,19 @@ impl SipFlowQuery {
 
     pub fn export_jsonl(flow: &[SipFlowItem]) -> String {
         flow.iter()
-            .filter_map(|item| serde_json::to_string(item).ok())
+            .filter_map(|item| {
+                let payload_str = String::from_utf8_lossy(&item.payload);
+                let obj = serde_json::json!({
+                    "timestamp": item.timestamp,
+                    "seq": item.seq,
+                    "leg": item.leg,
+                    "msg_type": item.msg_type,
+                    "src_addr": item.src_addr,
+                    "dst_addr": item.dst_addr,
+                    "payload": payload_str,
+                });
+                serde_json::to_string(&obj).ok()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }

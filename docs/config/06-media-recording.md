@@ -17,6 +17,12 @@ codecs = ["opus", "pcmu", "pcma", "g729"]
 ```
 
 ## Recording Policy
+
+> **[recording] and [sipflow] are mutually exclusive for RTP capture.**
+> The default configuration uses `[sipflow]` for both SIP signalling and RTP
+> audio capture. Only configure `[recording]` when you specifically need the
+> legacy live WAV recorder. See [08-sipflow.md](08-sipflow.md) for details.
+
 Control when calls are recorded. Can be set at top-level `[recording]` or per-proxy `[proxy.recording]` (proxy-level overrides top-level).
 
 `[recording]` controls the live WAV recorder. When enabled, the recorder always writes a local WAV first. Set `type = "http"` or `type = "s3"` only to upload that local WAV after the call completes.
@@ -28,7 +34,7 @@ Recording configuration has priority over SipFlow RTP recording. If a top-level 
 - SipFlow SIP message capture still works when `[sipflow]` is enabled.
 - SipFlow RTP capture and `[sipflow.upload]` recording export are disabled for that call.
 
-Only omit the recording section entirely when you want `[sipflow.upload]` to act as the recording source.
+Only omit the recording section entirely when you want SipFlow to capture RTP audio and/or `[sipflow.upload]` to act as the recording source.
 
 ```toml
 # Top-level recording config (applies to all proxies unless overridden)
@@ -94,11 +100,14 @@ When `[recording] type = "http"` or `type = "s3"` is used, the CDR may be writte
 ## CDR Storage (`[callrecord]`)
 Configure where post-call CDR JSON is stored or sent. This does not control recording media upload.
 
+`max_concurrent` controls how many post-call CDR save/upload/hook tasks may run at once. The default is `64`; values below `1` are clamped to `1`.
+
 ### Local Filesystem
 ```toml
 [callrecord]
 type = "local"
 root = "./cdr_archive"
+max_concurrent = 64
 ```
 
 ### S3 Compatible Object Storage
@@ -115,6 +124,7 @@ access_key = "MINIO_ACCESS_KEY"
 secret_key = "MINIO_SECRET_KEY"
 endpoint = "http://minio:9000" # needed for non-AWS
 root = "/daily-records"
+max_concurrent = 64
 
 # Deprecated and ignored. Recording media upload is configured by [recording].
 with_media = true
@@ -127,6 +137,7 @@ Send CDR JSON to an endpoint.
 [callrecord]
 type = "http"
 url = "http://my-crm/cdr-hook"
+max_concurrent = 64
 
 # Deprecated and ignored. Recording media upload is configured by [recording].
 with_media = true

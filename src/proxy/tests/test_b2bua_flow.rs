@@ -1,10 +1,9 @@
+use super::e2e_test_server::E2eTestServer;
+use super::test_helpers;
 use super::test_ua::{TestUa, TestUaConfig, TestUaEvent};
 use crate::call::user::SipUser;
 use crate::config::ProxyConfig;
-use crate::proxy::{
-    auth::AuthModule, call::CallModule, locator::MemoryLocator, registrar::RegistrarModule,
-    server::SipServerBuilder, user::MemoryUserBackend,
-};
+use crate::proxy::{locator::MemoryLocator, server::SipServerBuilder, user::MemoryUserBackend};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,103 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 fn create_test_proxy_config(port: u16) -> ProxyConfig {
-    ProxyConfig {
-        addr: "127.0.0.1".to_string(),
-        udp_port: Some(port),
-        tcp_port: None,
-        tls_port: None,
-        ws_port: None,
-        useragent: Some("RustPBX-Test/0.1.0".to_string()),
-        modules: Some(vec![
-            "auth".to_string(),
-            "registrar".to_string(),
-            "call".to_string(),
-        ]),
-        ..Default::default()
-    }
-}
-
-fn create_test_users() -> Vec<SipUser> {
-    vec![
-        SipUser {
-            id: 1,
-            username: "alice".to_string(),
-            password: Some("password123".to_string()),
-            enabled: true,
-            realm: Some("127.0.0.1".to_string()),
-            ..Default::default()
-        },
-        SipUser {
-            id: 2,
-            username: "bob".to_string(),
-            password: Some("password456".to_string()),
-            enabled: true,
-            realm: Some("127.0.0.1".to_string()),
-            ..Default::default()
-        },
-    ]
-}
-
-pub struct TestProxyServer {
-    cancel_token: CancellationToken,
-    port: u16,
-    pub server: Arc<crate::proxy::server::SipServer>,
-}
-
-impl TestProxyServer {
-    pub async fn start() -> Result<Self> {
-        let port = portpicker::pick_unused_port().unwrap_or(15060);
-        let config = Arc::new(create_test_proxy_config(port));
-
-        let user_backend = MemoryUserBackend::new(None);
-        for user in create_test_users() {
-            user_backend.create_user(user).await?;
-        }
-
-        let locator = MemoryLocator::new();
-        let cancel_token = CancellationToken::new();
-        let mut builder = SipServerBuilder::new(config)
-            .with_user_backend(Box::new(user_backend))
-            .with_locator(Box::new(locator))
-            .with_cancel_token(cancel_token.clone());
-
-        builder = builder
-            .register_module("registrar", |inner, config| {
-                Ok(Box::new(RegistrarModule::new(inner, config)))
-            })
-            .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(
-                    inner.clone(),
-                    inner.proxy_config.clone(),
-                )))
-            })
-            .register_module("call", |inner, config| {
-                Ok(Box::new(CallModule::new(config, inner)))
-            });
-        let server = Arc::new(builder.build().await?);
-        let server_clone = server.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = server_clone.serve().await {
-                warn!("Proxy server error: {:?}", e);
-            }
-        });
-
-        sleep(Duration::from_millis(100)).await;
-        Ok(Self {
-            cancel_token,
-            port,
-            server,
-        })
-    }
-
-    pub fn get_addr(&self) -> SocketAddr {
-        format!("127.0.0.1:{}", self.port).parse().unwrap()
-    }
-
-    pub fn stop(&self) {
-        self.cancel_token.cancel();
-    }
+    test_helpers::test_proxy_config(port)
 }
 
 async fn create_test_ua(
@@ -134,8 +37,8 @@ async fn create_test_ua(
 #[tokio::test]
 async fn test_b2bua_full_flow() {
     let _ = tracing_subscriber::fmt::try_init();
-    let proxy = TestProxyServer::start().await.unwrap();
-    let proxy_addr = proxy.get_addr();
+    let proxy = E2eTestServer::start().await.unwrap();
+    let proxy_addr = proxy.proxy_addr;
 
     let alice_port = portpicker::pick_unused_port().unwrap_or(25030);
     let bob_port = portpicker::pick_unused_port().unwrap_or(25031);
@@ -156,11 +59,11 @@ async fn test_b2bua_full_flow() {
 
     // Alice calls Bob
     let alice_sdp = dummy_sdp.clone();
-    let call_task = tokio::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
+    let call_task = crate::utils::spawn(async move { alice.make_call("bob", Some(alice_sdp)).await });
 
     // Bob waits for incoming call and answers it
     let bob_sdp = dummy_sdp.clone();
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -186,7 +89,7 @@ async fn test_b2bua_full_flow() {
     );
 
     // Verify active call in registry
-    let registry = &proxy.server.inner.active_call_registry;
+    let registry = &proxy.registry;
 
     // Wait for registry to be updated
     let mut calls = Vec::new();
@@ -255,28 +158,16 @@ async fn test_rtp_to_webrtc_bridge() {
 
     let locator = MemoryLocator::new();
     let cancel_token = CancellationToken::new();
-    let mut builder = SipServerBuilder::new(config)
-        .with_user_backend(Box::new(user_backend))
-        .with_locator(Box::new(locator))
-        .with_cancel_token(cancel_token.clone());
-
-    builder = builder
-        .register_module("registrar", |inner, config| {
-            Ok(Box::new(RegistrarModule::new(inner, config)))
-        })
-        .register_module("auth", |inner, _config| {
-            Ok(Box::new(AuthModule::new(
-                inner.clone(),
-                inner.proxy_config.clone(),
-            )))
-        })
-        .register_module("call", |inner, config| {
-            Ok(Box::new(CallModule::new(config, inner)))
-        });
+    let builder = test_helpers::register_standard_modules(
+        SipServerBuilder::new(config)
+            .with_user_backend(Box::new(user_backend))
+            .with_locator(Box::new(locator))
+            .with_cancel_token(cancel_token.clone()),
+    );
 
     let server = Arc::new(builder.build().await.unwrap());
     let server_clone = server.clone();
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         if let Err(e) = server_clone.serve().await {
             warn!("Proxy server error: {:?}", e);
         }
@@ -302,10 +193,10 @@ async fn test_rtp_to_webrtc_bridge() {
     // Bob (RTP) calls Alice (WebRTC)
     let bob_rtp_sdp = "v=0\r\no=- 123456 123456 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n".to_string();
 
-    let call_task = tokio::spawn(async move { bob_ua.make_call("alice", Some(bob_rtp_sdp)).await });
+    let call_task = crate::utils::spawn(async move { bob_ua.make_call("alice", Some(bob_rtp_sdp)).await });
 
     // Alice should receive incoming call and answer
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = alice_ua.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -377,28 +268,16 @@ async fn test_webrtc_to_rtp_bridge() {
 
     let locator = MemoryLocator::new();
     let cancel_token = CancellationToken::new();
-    let mut builder = SipServerBuilder::new(config)
-        .with_user_backend(Box::new(user_backend))
-        .with_locator(Box::new(locator))
-        .with_cancel_token(cancel_token.clone());
-
-    builder = builder
-        .register_module("registrar", |inner, config| {
-            Ok(Box::new(RegistrarModule::new(inner, config)))
-        })
-        .register_module("auth", |inner, _config| {
-            Ok(Box::new(AuthModule::new(
-                inner.clone(),
-                inner.proxy_config.clone(),
-            )))
-        })
-        .register_module("call", |inner, config| {
-            Ok(Box::new(CallModule::new(config, inner)))
-        });
+    let builder = test_helpers::register_standard_modules(
+        SipServerBuilder::new(config)
+            .with_user_backend(Box::new(user_backend))
+            .with_locator(Box::new(locator))
+            .with_cancel_token(cancel_token.clone()),
+    );
 
     let server = Arc::new(builder.build().await.unwrap());
     let server_clone = server.clone();
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         if let Err(e) = server_clone.serve().await {
             warn!("Proxy server error: {:?}", e);
         }
@@ -424,7 +303,7 @@ async fn test_webrtc_to_rtp_bridge() {
     // Alice (WebRTC) calls Bob (RTP)
     let alice_webrtc_sdp = "v=0\r\no=- 654321 654321 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5678 UDP/TLS/RTP/SAVPF 111 101\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n".to_string();
 
-    let call_task = tokio::spawn(async move {
+    let call_task = crate::utils::spawn(async move {
         timeout(
             Duration::from_secs(30),
             alice_ua.make_call("bob", Some(alice_webrtc_sdp)),
@@ -434,7 +313,7 @@ async fn test_webrtc_to_rtp_bridge() {
     });
 
     // Bob should receive incoming call and answer
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..300 {
             let events = bob_ua.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -474,8 +353,8 @@ async fn test_webrtc_to_rtp_bridge() {
 #[tokio::test]
 async fn test_callee_reject_passthrough_486_busy_here() {
     let _ = tracing_subscriber::fmt::try_init();
-    let proxy = TestProxyServer::start().await.unwrap();
-    let proxy_addr = proxy.get_addr();
+    let proxy = E2eTestServer::start().await.unwrap();
+    let proxy_addr = proxy.proxy_addr;
 
     let alice_port = portpicker::pick_unused_port().unwrap_or(25040);
     let bob_port = portpicker::pick_unused_port().unwrap_or(25041);
@@ -495,7 +374,7 @@ async fn test_callee_reject_passthrough_486_busy_here() {
     let dummy_sdp = "v=0\r\no=- 123456 123456 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n".to_string();
 
     // Bob rejects the call with 486 BusyHere
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
@@ -520,7 +399,7 @@ async fn test_callee_reject_passthrough_486_busy_here() {
     // Alice makes a call to Bob
     let alice_sdp = dummy_sdp.clone();
     let alice_clone = alice.clone();
-    let call_task = tokio::spawn(async move {
+    let call_task = crate::utils::spawn(async move {
         timeout(
             Duration::from_secs(10),
             alice_clone.make_call("bob", Some(alice_sdp)),

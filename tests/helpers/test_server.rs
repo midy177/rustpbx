@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use rustpbx::{
     call::app::agent_registry::AgentRegistry,
     config::ProxyConfig,
+    media::engine::MediaEngine,
     proxy::{
         active_call_registry::ActiveProxyCallRegistry,
         auth::AuthModule,
@@ -57,6 +58,7 @@ pub struct TestPbxInject {
 /// A running in-process PBX with a real SIP stack and an RWI WebSocket endpoint.
 pub struct TestPbx {
     /// Base WebSocket URL for connecting RWI clients, e.g. `ws://127.0.0.1:<port>/rwi/v1`.
+    #[allow(dead_code)]
     pub rwi_url: String,
     /// SIP port this server is listening on (UDP).
     #[allow(dead_code)]
@@ -72,6 +74,9 @@ pub struct TestPbx {
     pub registry: Arc<ActiveProxyCallRegistry>,
     /// Cancellation token — cancel to shut everything down.
     pub cancel_token: CancellationToken,
+    /// In-process media engine — can send InjectAudio / StopPlayback etc.
+    #[allow(dead_code)]
+    pub media_engine: MediaEngine,
 }
 
 impl TestPbx {
@@ -134,7 +139,7 @@ impl TestPbx {
         // Spawn the SIP serving loop
         {
             let ct = cancel_token.child_token();
-            tokio::spawn(async move {
+            rustpbx::utils::spawn(async move {
                 tokio::select! {
                     _ = ct.cancelled() => {}
                     res = sip_server.serve() => {
@@ -156,7 +161,7 @@ impl TestPbx {
             ..Default::default()
         };
         let auth: RwiAuthRef = Arc::new(tokio::sync::RwLock::new(RwiAuth::new(&rwi_config)));
-        let gateway: RwiGatewayRef = Arc::new(tokio::sync::RwLock::new(RwiGateway::new()));
+        let gateway: RwiGatewayRef = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
 
         // ── Build Axum router with RWI endpoint ──────────────────────────────
         let auth_c = auth.clone();
@@ -196,7 +201,7 @@ impl TestPbx {
         let http_port = listener.local_addr().unwrap().port();
 
         let ct = cancel_token.child_token();
-        tokio::spawn(async move {
+        rustpbx::utils::spawn(async move {
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move { ct.cancelled().await })
                 .await
@@ -205,6 +210,8 @@ impl TestPbx {
 
         let rwi_url = format!("ws://127.0.0.1:{}/rwi/v1", http_port);
 
+        let media_engine = sip_server_ref.media_engine.clone();
+
         Self {
             rwi_url,
             sip_port,
@@ -212,6 +219,7 @@ impl TestPbx {
             gateway,
             registry,
             cancel_token,
+            media_engine,
         }
     }
 

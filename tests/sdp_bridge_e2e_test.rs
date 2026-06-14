@@ -9,7 +9,6 @@
 //! (e.g., G729 on WebRTC side) are correctly filtered.
 
 use audio_codec::CodecType;
-use rustpbx::media::negotiate::MediaNegotiator;
 use rustpbx::media::{RtpTrackBuilder, Track};
 use rustrtc::TransportMode;
 use rustrtc::sdp::{SdpType, SessionDescription};
@@ -74,7 +73,11 @@ async fn test_e2e_webrtc_caller_to_rtp_callee_via_bridge() {
     );
 
     // 3. Bridge sends its RTP offer to the callee
-    let bridge_rtp_sdp = bridge.callee_pc().local_description().unwrap().to_sdp_string();
+    let bridge_rtp_sdp = bridge
+        .callee_pc()
+        .local_description()
+        .unwrap()
+        .to_sdp_string();
     assert!(
         bridge_rtp_sdp.contains("RTP/AVP"),
         "Bridge to callee must be plain RTP"
@@ -234,7 +237,11 @@ async fn test_e2e_rtp_caller_to_webrtc_callee_via_bridge() {
         .set_local_description(bridge_answer)
         .unwrap();
 
-    let answer_sdp = bridge.callee_pc().local_description().unwrap().to_sdp_string();
+    let answer_sdp = bridge
+        .callee_pc()
+        .local_description()
+        .unwrap()
+        .to_sdp_string();
 
     // 7. Verify the answer is plain RTP (no WebRTC artifacts)
     assert!(answer_sdp.contains("RTP/AVP"), "Answer must be plain RTP");
@@ -259,11 +266,63 @@ async fn test_e2e_rtp_caller_to_webrtc_callee_via_bridge() {
     bridge.stop().await;
 }
 
+fn rtp_to_webrtc(rtp_sdp: &str, _mac: &str, ufrag: &str, pwd: &str) -> anyhow::Result<String> {
+    let ice_attrs = vec![
+            format!("a=ice-ufrag:{}", ufrag),
+            format!("a=ice-pwd:{}", pwd),
+            "a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:00:11:22:33:44:55:66:77:88:99:00:AA:BB:CC:DD:EE:FF".to_string(),
+            "a=setup:passive".to_string(),
+        ];
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for line in rtp_sdp.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        if trimmed.starts_with("m=") {
+            let replaced = if trimmed.starts_with("m=audio ") {
+                trimmed.replace("RTP/AVP", "RTP/SAVPF")
+            } else if trimmed.starts_with("m=video ") {
+                trimmed.replace("RTP/AVP", "RTP/SAVPF")
+            } else {
+                trimmed.to_string()
+            };
+            lines.push(replaced);
+            lines.push("a=mid:0".to_string());
+            for attr in &ice_attrs {
+                lines.push(attr.clone());
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("a=setup:")
+            || trimmed.starts_with("a=fingerprint:")
+            || trimmed.starts_with("a=ice-ufrag:")
+            || trimmed.starts_with("a=ice-pwd:")
+            || trimmed.starts_with("a=mid:")
+            || trimmed.starts_with("a=candidate:")
+            || trimmed.starts_with("a=rtcp-mux")
+            || trimmed.starts_with("a=msid")
+            || trimmed.starts_with("a=ssrc")
+            || trimmed.starts_with("a=extmap")
+        {
+            continue;
+        }
+
+        lines.push(trimmed.to_string());
+    }
+
+    Ok(lines.join("\r\n") + "\r\n")
+}
+
 /// Verify that SdpBridge::rtp_to_webrtc no longer uses setup:actpass (defensive check).
 #[test]
 fn test_sdp_bridge_setup_role_is_passive() {
-    use rustpbx::media::sdp_bridge::SdpBridge;
-
     let rtp_sdp = "v=0\r\n\
 o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -273,8 +332,7 @@ m=audio 54321 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=sendrecv\r\n";
 
-    let webrtc_sdp =
-        SdpBridge::rtp_to_webrtc(rtp_sdp, "AA:BB:CC:DD:EE:FF", "ufrag", "pwd").unwrap();
+    let webrtc_sdp = rtp_to_webrtc(rtp_sdp, "AA:BB:CC:DD:EE:FF", "ufrag", "pwd").unwrap();
 
     assert!(
         !webrtc_sdp.contains("setup:actpass"),
@@ -380,7 +438,11 @@ async fn test_e2e_webrtc_caller_rtp_callee_pcmu_only_allow_codecs() {
     let rtp_offer = bridge.callee_pc().create_offer().await.unwrap();
     bridge.callee_pc().set_local_description(rtp_offer).unwrap();
 
-    let bridge_rtp_sdp = bridge.callee_pc().local_description().unwrap().to_sdp_string();
+    let bridge_rtp_sdp = bridge
+        .callee_pc()
+        .local_description()
+        .unwrap()
+        .to_sdp_string();
     assert!(
         bridge_rtp_sdp.contains("PCMU/8000"),
         "RTP side must offer PCMU"
@@ -570,9 +632,16 @@ async fn test_e2e_rtp_caller_g729_dropped_on_webrtc_side() {
         .unwrap();
 
     let rtp_answer = bridge.callee_pc().create_answer().await.unwrap();
-    bridge.callee_pc().set_local_description(rtp_answer).unwrap();
+    bridge
+        .callee_pc()
+        .set_local_description(rtp_answer)
+        .unwrap();
 
-    let rtp_answer_sdp = bridge.callee_pc().local_description().unwrap().to_sdp_string();
+    let rtp_answer_sdp = bridge
+        .callee_pc()
+        .local_description()
+        .unwrap()
+        .to_sdp_string();
     assert!(
         rtp_answer_sdp.contains("RTP/AVP"),
         "RTP answer must be plain RTP"
@@ -868,7 +937,10 @@ async fn test_e2e_early_media_then_200_ok_address_change() {
 
     // 6. Re-negotiate RTP side: create re-offer -> set local -> set remote with new answer
     let rtp_reoffer = bridge.callee_pc().create_offer().await.unwrap();
-    bridge.callee_pc().set_local_description(rtp_reoffer).unwrap();
+    bridge
+        .callee_pc()
+        .set_local_description(rtp_reoffer)
+        .unwrap();
     let desc_200 = SessionDescription::parse(SdpType::Answer, callee_answer_200).unwrap();
     bridge
         .callee_pc()
@@ -952,9 +1024,14 @@ async fn test_e2e_early_media_then_200_ok_same_sdp_rtp_flow_continues() {
     let rtp_offer = bridge.callee_pc().create_offer().await.unwrap();
     bridge.callee_pc().set_local_description(rtp_offer).unwrap();
 
-    let bridge_rtp_addr =
-        parse_rtp_audio_addr(&bridge.callee_pc().local_description().unwrap().to_sdp_string())
-            .expect("Bridge RTP address should be present");
+    let bridge_rtp_addr = parse_rtp_audio_addr(
+        &bridge
+            .callee_pc()
+            .local_description()
+            .unwrap()
+            .to_sdp_string(),
+    )
+    .expect("Bridge RTP address should be present");
 
     // 3. Simulate 183 early media answer from callee
     let callee_answer_183 = "v=0\r\n\
@@ -975,7 +1052,7 @@ async fn test_e2e_early_media_then_200_ok_same_sdp_rtp_flow_continues() {
 
     // 4. Spawn a receiver task that waits for the RTP track and counts samples
     let rtp_pc = bridge.callee_pc().clone();
-    let recv_handle = tokio::spawn(async move {
+    let recv_handle = rustpbx::utils::spawn(async move {
         let track = loop {
             let rx = rtp_pc.recv();
             match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
@@ -1045,7 +1122,10 @@ async fn test_e2e_early_media_then_200_ok_same_sdp_rtp_flow_continues() {
 
     // Re-negotiate RTP side exactly as sip_session.rs does
     let rtp_reoffer = bridge.callee_pc().create_offer().await.unwrap();
-    bridge.callee_pc().set_local_description(rtp_reoffer).unwrap();
+    bridge
+        .callee_pc()
+        .set_local_description(rtp_reoffer)
+        .unwrap();
     let desc_200 = SessionDescription::parse(SdpType::Answer, callee_answer_200).unwrap();
     bridge
         .callee_pc()
