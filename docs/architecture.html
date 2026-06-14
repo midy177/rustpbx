@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>RustPBX 多租户分布式云原生架构 - 可视化设计</title>
+        <!-- Mermaid.js 用于图表渲染 -->
+        <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                background: linear-gradient(145deg, #f6f9fc 0%, #eef2f5 100%);
+                font-family:
+                    "Segoe UI",
+                    "Roboto",
+                    "Inter",
+                    system-ui,
+                    -apple-system,
+                    sans-serif;
+                padding: 2rem;
+                color: #1a2c3e;
+            }
+
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+
+            h1 {
+                font-size: 2.2rem;
+                font-weight: 700;
+                background: linear-gradient(135deg, #0b3b5f, #1b6b87);
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+                margin-bottom: 0.5rem;
+                letter-spacing: -0.3px;
+            }
+
+            .subhead {
+                color: #2c5a6e;
+                border-left: 4px solid #2c9b9b;
+                padding-left: 1rem;
+                margin-bottom: 2rem;
+                font-weight: 500;
+            }
+
+            .card {
+                background: rgba(255, 255, 255, 0.92);
+                backdrop-filter: blur(2px);
+                border-radius: 2rem;
+                box-shadow: 0 20px 35px -12px rgba(0, 0, 0, 0.15);
+                margin-bottom: 2.5rem;
+                padding: 1.5rem;
+                transition: transform 0.2s;
+                border: 1px solid rgba(99, 179, 189, 0.25);
+            }
+
+            .card:hover {
+                transform: translateY(-3px);
+            }
+
+            .card-title {
+                font-size: 1.5rem;
+                font-weight: 600;
+                margin-bottom: 1rem;
+                display: flex;
+                align-items: center;
+                gap: 0.6rem;
+                border-bottom: 2px solid #cbdde6;
+                padding-bottom: 0.5rem;
+            }
+
+            .card-title .badge {
+                background: #1f7b7b;
+                color: white;
+                font-size: 0.7rem;
+                border-radius: 40px;
+                padding: 0.2rem 0.7rem;
+                font-weight: normal;
+            }
+
+            .mermaid {
+                background: #ffffffec;
+                border-radius: 1.2rem;
+                padding: 1rem;
+                margin-top: 0.5rem;
+                text-align: center;
+                overflow-x: auto;
+            }
+
+            .caption {
+                font-size: 0.85rem;
+                color: #3a6b7e;
+                text-align: center;
+                margin-top: 0.75rem;
+                border-top: 1px dashed #bdd3df;
+                padding-top: 0.75rem;
+            }
+
+            footer {
+                text-align: center;
+                margin-top: 2rem;
+                font-size: 0.8rem;
+                color: #5e7e8c;
+                border-top: 1px solid #caddf0;
+                padding-top: 1.5rem;
+            }
+
+            @media (max-width: 760px) {
+                body {
+                    padding: 1rem;
+                }
+                .card {
+                    padding: 1rem;
+                }
+                .card-title {
+                    font-size: 1.2rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>☎️ RustPBX · 云原生多租户架构</h1>
+            <div class="subhead">
+                PSTN固定IP + Raft共享状态 + 分布式媒体集群 · 运营商级高可用设计
+            </div>
+
+            <!-- 图1：总体部署架构图 (flowchart) -->
+            <div class="card">
+                <div class="card-title">
+                    📡 总体部署架构图
+                    <span class="badge">云原生 + 多租户隔离</span>
+                </div>
+                <div class="mermaid">
+                    flowchart TB subgraph Internet["🌍 Internet / PSTN"]
+                    PSTN["📞 PSTN / ITSP<br />SIP/UDP · 固定公网IP要求"]
+                    WebRTC["🌐 WebRTC Browser<br />SIP/WSS"] Softphone["📱 SIP
+                    Softphone<br />SIP/UDP or WSS"] end subgraph K8s["☸
+                    Kubernetes Cluster (多可用区)"] subgraph EdgeZone["🔒 Edge
+                    Gateway Zone (固定公网IP)"] NodeE["🎯 专用节点 + EIP<br />203.0.113.5"]
+                    TG["🚪 Trunk Gateway Pod<br />hostNetwork: true<br />SIP:5060/UDP
+                    | RTP:10000-20000/UDP<br />★ 源IP固定 + 1:1端口映射"] end
+                    subgraph CoreZone["⚙️ Core Services (无状态水平扩展)"]
+                    IngressSIP["🔀 SIP Ingress Controller<br />SIP/UDP ·
+                    SIP/WSS"] Core1["🧠 RustPBX Core Pod<br />B2BUA · 路由 ·
+                    租户识别"] Core2["🧠 RustPBX Core Pod"] Media["🎙️ Media
+                    Fabric Pod<br />RTP Proxy / SRTP / Transcoding"] end
+                    subgraph BizZone["📦 Business Logic (租户级)"] HTTPDial["📄
+                    HTTP DialPlan Handler<br />Play/Collect · TTS · DTMF · CRM"]
+                    AIAgent["🤖 AI Voice Agent<br />ASR → LLM → TTS · RWI注入"]
+                    end subgraph StateZone["🗃️ 状态与持久化"] direction LR
+                    Raft1["📀 Raft Node 1<br />Leader"] Raft2["📀 Raft Node 2<br />Follower"]
+                    Raft3["📀 Raft Node 3<br />Follower"] Redis[(⚡ Redis
+                    Cache<br />注册/会话/临时状态)] S3[(🗄️ S3 Storage<br />录音
+                    · CDR · 通话记录)] end subgraph Observability["📊
+                    Observability"] Prom["Prometheus"] Jaeger["Jaeger Tracing"]
+                    end end PSTN -->|SIP/UDP 固定源IP| TG WebRTC -->|WSS|
+                    IngressSIP Softphone -->|SIP/UDP or WSS| IngressSIP
+                    IngressSIP -->|内部路由| Core1 TG -->|内部gRPC/SIP| Core1
+                    Core1 <-->|媒体代理| Media Core1 <-->|租户业务调用| HTTPDial
+                    Core1 <-->|AI 能力| AIAgent Core1 -->|租户配置/Trunk/路由表|
+                    Raft1 Core1 -->|热数据/注册信息| Redis Core1 -->|CDR/录音|
+                    S3 Raft1 <--> Raft2 Raft1 <--> Raft3 Core2 -.->|同样接入|
+                    Raft1 Core1 -.-> Prom Core1 -.-> Jaeger style TG
+                    fill:#e1f0e8,stroke:#1f8a4c,stroke-width:2px style Raft1
+                    fill:#ffe6cc,stroke:#cc7a2c style NodeE
+                    fill:#d9eaf5,stroke:#2c6e9e
+                </div>
+                <div class="caption">
+                    ✅ Trunk Gateway 采用 hostNetwork 绑定专用节点 +
+                    公网固定IP，完美满足运营商对源IP和端口范围的要求。<br />
+                    ✅ Raft 集群只存储租户全局配置(低频变化)，注册/会话走
+                    Redis。业务逻辑完全外置HTTP DialPlan，支持多租户动态路由。
+                </div>
+            </div>
+
+            <!-- 图2：核心呼叫流程序列图（租户A外呼PSTN） -->
+            <div class="card">
+                <div class="card-title">
+                    🔄 核心呼叫流程序列图
+                    <span class="badge">租户外呼 PSTN · 完整信令+媒体路径</span>
+                </div>
+                <div class="mermaid">
+                    sequenceDiagram autonumber participant U as 📞
+                    租户A软电话<br />(SIP) participant I as 🚪 Ingress<br />SIP/WSS
+                    participant Core as ⚙️ RustPBX Core participant Raft as 📀
+                    Raft Cluster participant Redis as ⚡ Redis (注册/会话)
+                    participant DialPlan as 📄 HTTP DialPlan<br />(租户A逻辑)
+                    participant Media as 🎙️ Media Fabric participant TG as 🔒
+                    Trunk Gateway<br />(固定公网IP 203.0.113.5) participant PSTN
+                    as 📡 运营商/ITSP U->>I: INVITE (To: +123456789)<br />X-Tenant-ID:
+                    tenant_a I->>Core: 转发 INVITE + tenant 元数据 Core->>Core:
+                    解析租户ID，鉴权 Core->>Redis: 查询租户A的注册状态/会话
+                    Redis-->>Core: 有效 ✔️ Core->>Raft: 查询租户A的默认Trunk配置
+                    & LCR Raft-->>Core: trunk_gateway_addr, 公网映射规则
+                    Core->>DialPlan: POST /dialplan/tenant_a<br />{called:+123456789,
+                    tenant_custom} DialPlan-->>Core: 决策: use_trunk=trunk_gw_1,
+                    LCR选中 Core->>TG: INVITE (to +123456789) 内部网络 Note over
+                    TG: 重写 SIP Via/Contact<br />源IP改为固定公网 IP
+                    203.0.113.5<br />SDP 地址改为公网IP<br />RTP端口 1:1
+                    映射预留 TG->>PSTN: INVITE (源IP=203.0.113.5) PSTN-->>TG:
+                    100 Trying / 183 Session Progress TG-->>Core: 转发响应
+                    Core-->>U: 100 Trying / 183 PSTN-->>TG: 200 OK (SDP with RTP
+                    port 10000) TG-->>Core: 200 OK (SDP重写为内部地址)
+                    Core-->>U: 200 OK U->>Core: ACK Core->>TG: ACK TG->>PSTN:
+                    ACK Note over U,PSTN: 🎵 RTP 媒体流路径 U->>Media: RTP (SRTP
+                    / plain) Media->>TG: RTP (内部网络) TG->>PSTN: RTP
+                    (公网IP:端口，映射表转换) Note over U,PSTN: 通话结束
+                    PSTN-->>TG: BYE TG-->>Core: BYE Core-->>U: BYE U-->>Core:
+                    200 OK Core-->>TG: 200 OK TG-->>PSTN: 200 OK Core->>S3: 生成
+                    CDR + 录音元数据<br />(tenant_a 分区)
+                </div>
+                <div class="caption">
+                    🧩 多租户标识从 SIP 头或 Domain
+                    传递，贯穿整个呼叫生命周期。<br />
+                    🔁 Trunk Gateway 作为信令+媒体代理，保证出局 SIP 源 IP
+                    固定，RTP 端口映射满足运营商要求。<br />
+                    📼 CDR 与录音按 tenant_id 分桶存入 S3。
+                </div>
+            </div>
+
+            <!-- 图3：端口一对一映射内部实现图（Trunk Gateway细节） -->
+            <div class="card">
+                <div class="card-title">
+                    🔌 端口一对一映射内部实现
+                    <span class="badge"
+                        >Trunk Gateway · RTP Proxy + 映射表</span
+                    >
+                </div>
+                <div class="mermaid">
+                    flowchart LR subgraph TG_Pod ["Trunk Gateway Pod
+                    (hostNetwork)"] SIP_Proxy["📡 SIP Proxy (UDP 5060)<br />•
+                    解析 INVITE<br />• 记录 Call-ID<br />•
+                    保存租户端口映射请求"] RTP_Proxy["🎛️ RTP Proxy (UDP
+                    10000-20000)<br />• 动态端口分配器<br />• 对称 NAT 支持"]
+                    MapTable[("🗺️ 端口映射表<br />public:internal<br />call-id /
+                    tenant")] end PSTN[("🌐 运营商要求<br />固定源IP +
+                    端口范围")] Core_Internal["⚙️ RustPBX Core<br />(内部集群)"]
+                    PSTN -- "SIP/UDP → 203.0.113.5:5060" --> SIP_Proxy SIP_Proxy
+                    -- "重写 SDP c= line & m= line<br />公网IP + 分配公网端口"
+                    --> MapTable SIP_Proxy -- "转发至 Core (内部 SIP)" -->
+                    Core_Internal Core_Internal -- "RTP 流 (内部IP:port)" -->
+                    RTP_Proxy RTP_Proxy -- "查询 MapTable 获得公网端口" -->
+                    MapTable RTP_Proxy -- "RTP 流 (203.0.113.5:公网端口)<br />1:1
+                    端口映射 或 保留相同端口" --> PSTN style SIP_Proxy
+                    fill:#c5e0d6,stroke:#2b6f4f style RTP_Proxy
+                    fill:#ffefc0,stroke:#cc7a2c style MapTable
+                    fill:#d5e8f2,stroke:#2c6e9e
+                </div>
+                <div class="caption">
+                    📌 SIP Proxy
+                    解析会话描述后，为每个媒体流分配公网端口（优先保持跟内部端口一致），建立映射条目。<br />
+                    📌 RTP Proxy 使用 conntrack
+                    风格的双向转发，确保运营商收到的媒体源IP固定为
+                    203.0.113.5，端口在允许范围内。
+                </div>
+            </div>
+
+            <!-- 额外的辅助说明：分布式Raft同步机制简图（可选） -->
+            <div class="card">
+                <div class="card-title">
+                    🤝 Raft 集群共享状态机
+                    <span class="badge">强一致配置 · 租户/Trunk/LCR</span>
+                </div>
+                <div class="mermaid">
+                    stateDiagram-v2 [*] --> Leader选举 Leader选举 --> Leader:
+                    多数派确认 Leader --> Follower: 心跳维持 Follower -->
+                    Candidate: 选举超时 Candidate --> Leader: 赢得选举 state
+                    Leader { [*] --> 接收写请求 接收写请求 --> 日志复制:
+                    追加自身日志 日志复制 --> 提交: 过半确认 提交 -->
+                    应用状态机: 应用到 Raft State Machine 应用状态机 -->
+                    响应客户端 } state Follower { 同步日志 --> 提交: 来自Leader
+                    提交 --> 应用状态机: 持久化配置 } note right of Leader :
+                    存储关键全局资源:<br />• 租户信息(tenant_id, domain)<br />•
+                    Trunk绑定与网关地址<br />• LCR路由表<br />• ACL / 企业策略
+                </div>
+                <div class="caption">
+                    🧠 Raft 集群仅存储低频变更的全局配置，高频注册数据使用 Redis
+                    缓存，降低压力。所有 RustPBX Core 节点通过 gRPC 与 Raft
+                    Leader 交互。
+                </div>
+            </div>
+
+            <footer>
+                🚀 架构设计基于 RustPBX 改造：多租户隔离 + 分布式云原生 +
+                固定公网IP Trunk Gateway + Raft 状态共享。<br />
+                满足运营商对接要求，支持水平扩展、租户动态配置、AI
+                语音注入等高阶能力。
+            </footer>
+        </div>
+
+        <script>
+            // 初始化 mermaid，配置主题和样式
+            mermaid.initialize({
+                startOnLoad: true,
+                theme: "base",
+                themeVariables: {
+                    background: "#ffffff",
+                    primaryColor: "#e1f0e8",
+                    primaryBorderColor: "#2a7f6e",
+                    primaryTextColor: "#1a3e4c",
+                    lineColor: "#3f7e8c",
+                    secondaryColor: "#ffe6cc",
+                    tertiaryColor: "#d9eaf5",
+                    fontFamily: 'Inter, "Segoe UI", system-ui',
+                },
+                sequence: {
+                    diagramMarginX: 50,
+                    diagramMarginY: 20,
+                    actorMargin: 80,
+                    width: 180,
+                    height: 65,
+                    boxMargin: 10,
+                    boxTextMargin: 5,
+                    noteMargin: 10,
+                    messageMargin: 35,
+                    mirrorActors: false,
+                    useMaxWidth: true,
+                },
+                flowchart: {
+                    useMaxWidth: true,
+                    htmlLabels: true,
+                    curve: "basis",
+                    padding: 15,
+                },
+            });
+        </script>
+    </body>
+</html>
