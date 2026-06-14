@@ -1,0 +1,21 @@
+# RustPBX SIP Edge Gateway — example configuration
+# Deploy on a node with a fixed public IP for carrier SIP trunk registration.
+
+control_plane_addr = "http://127.0.0.1:9090"
+sip_addr = "0.0.0.0"
+udp_port = 5060
+# tcp_port = 5060
+# tls_port = 5061
+
+# Fixed public IP assigned to this node — advertised in SIP Contact/Via headers.
+# Carriers whitelist this IP for SIP registration and inbound calls.
+public_ip = "203.0.113.10"
+
+# RTP port range (Edge is signaling-only in bypass mode; these are reserved
+# but media flows directly between carrier and worker).
+rtp_start_port = 12000
+rtp_end_port = 42000
+
+edge_id = "edge-prod-01"
+config_poll_secs = 30
+log = "info"

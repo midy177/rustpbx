@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/rustpbx-core", "crates/rustpbx-control", "crates/rustpbx-edge", "crates/rustpbx-worker"]
+
 [package]
 name = "rustpbx"
 version = "0.4.4"
