@@ -45,7 +45,7 @@ fn make_auth() -> RwiAuthRef {
 
 async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegistry>) {
     let auth = make_auth();
-    let gateway: RwiGatewayRef = Arc::new(tokio::sync::RwLock::new(RwiGateway::new()));
+    let gateway: RwiGatewayRef = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
     let registry = Arc::new(ActiveProxyCallRegistry::new());
 
     let auth_c = auth.clone();
@@ -81,7 +81,7 @@ async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegis
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    rustpbx::utils::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
@@ -422,12 +422,13 @@ async fn test_pcm_frame_does_not_break_session_state() {
 
     // Verify subscription still works by pushing an event
     {
-        let gw = gateway.read().await;
-        let event = rustpbx::rwi::RwiEvent::CallRinging {
+        let gw = gateway.read();
+        let event = rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
             call_id: "test".to_string(),
-        };
+        }, None);
         gw.fan_out_event_to_context("pcm-test", &event, &"test".to_string());
-    }
+    }, None);
+
 
     // Should receive the event
     let msg = timeout(Duration::from_secs(2), ws.next())

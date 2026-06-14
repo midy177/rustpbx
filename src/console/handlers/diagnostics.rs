@@ -59,6 +59,16 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route("/diagnostics/locator/clear", post(locator_clear))
 }
 
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route("/diagnostics/dialogs", get(list_dialogs))
+        .route("/diagnostics/trunks/test", post(test_trunk))
+        .route("/diagnostics/trunks/options", post(probe_trunk_options))
+        .route("/diagnostics/routes/evaluate", post(route_evaluate))
+        .route("/diagnostics/locator/lookup", post(locator_lookup))
+        .route("/diagnostics/locator/clear", post(locator_clear))
+}
+
 const DEFAULT_OPTIONS_TIMEOUT_MS: u64 = 1_500;
 const MIN_OPTIONS_TIMEOUT_MS: u64 = 100;
 const MAX_OPTIONS_TIMEOUT_MS: u64 = 20_000;
@@ -276,6 +286,30 @@ async fn diagnostics_bootstrap(state: &Arc<ConsoleState>) -> JsonValue {
         ("/ws".to_string(), "/iceservers".to_string())
     };
 
+    #[allow(unused_mut)]
+    let mut destination_samples: Vec<JsonValue> = Vec::new();
+
+    // Load IVR projects as destination samples from file scan
+    {
+        if let Some(app_state) = state.app_state() {
+            let proxy_config = &app_state.config().proxy;
+            let ivr_dir = proxy_config.generated_ivr_dir();
+            let ivr_entries =
+                crate::console::catalog::scan_ivr_catalog(&ivr_dir, &proxy_config.ivr_files);
+            for entry in &ivr_entries {
+                let mode_tag = if entry.ivr_mode == "step" {
+                    " (step)"
+                } else {
+                    " (tree)"
+                };
+                destination_samples.push(serde_json::json!({
+                    "label": format!("{}{}", entry.name, mode_tag),
+                    "value": format!("ivr:{}", entry.name),
+                }));
+            }
+        }
+    }
+
     json!({
         "last_audit": last_audit,
         "trunks": trunks,
@@ -283,7 +317,7 @@ async fn diagnostics_bootstrap(state: &Arc<ConsoleState>) -> JsonValue {
         "dialer": {
             "default_source": JsonValue::Null,
             "source_options": JsonValue::Array(vec![]),
-            "destination_samples": JsonValue::Array(vec![]),
+            "destination_samples": JsonValue::Array(destination_samples),
             "trunk_options": trunk_options,
         },
         "connection": connection,
@@ -689,6 +723,7 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
         media_mode: None,
         video_policy: None,
         did_numbers: vec![],
+        ringback: None,
     })
 }
 
@@ -1137,24 +1172,25 @@ async fn route_evaluate(
         return bad_request("callee is required");
     }
 
-    let direction_label = payload
-        .direction
-        .as_ref()
-        .map(|d| d.trim().to_ascii_lowercase())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "outbound".to_string());
-
-    let direction = match direction_label.as_str() {
-        "inbound" => DialDirection::Inbound,
-        "internal" => DialDirection::Internal,
-        "outbound" => DialDirection::Outbound,
-        other => {
-            return bad_request(format!(
-                "unsupported direction '{}': use inbound/outbound/internal",
-                other
-            ));
+    let direction = if let Some(ref raw) = payload.direction {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inbound" => DialDirection::Inbound,
+            "internal" => DialDirection::Internal,
+            "outbound" => DialDirection::Outbound,
+            other => {
+                return bad_request(format!(
+                    "unsupported direction '{}': use inbound/outbound/internal",
+                    other
+                ));
+            }
         }
+    } else if payload.source_trunk.is_some() || payload.source_ip.is_some() {
+        DialDirection::Inbound
+    } else {
+        DialDirection::Outbound
     };
+
+    let direction_label = direction.to_string();
 
     let dataset_label = payload
         .dataset
@@ -1262,7 +1298,11 @@ async fn route_evaluate(
                 }
             }
 
-            let routes = match load_routes_from_db(db, &trunk_lookup).await {
+            let ivr_dir = state.app_state().and_then(|app| {
+                let dir = app.config().proxy.generated_ivr_dir();
+                Some(dir)
+            });
+            let routes = match load_routes_from_db(db, &trunk_lookup, ivr_dir.as_deref()).await {
                 Ok(routes) => routes,
                 Err(err) => {
                     return (
@@ -2023,7 +2063,7 @@ async fn send_options_udp(
             attempt.raw_response = summary.preview;
             attempt.success = summary
                 .status_code
-                .map(|code| (200..300).contains(&code))
+                .map(|code| rsipstack::sip::StatusCode::from(code).kind() == rsipstack::sip::StatusCodeKind::Successful)
                 .unwrap_or(false);
         }
         Ok(Err(err)) => {
@@ -2519,7 +2559,7 @@ mod tests {
         let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             let mut buffer = [0u8; 2048];
             if let Ok((_, peer)) = server_socket.recv_from(&mut buffer).await {
                 let response = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";

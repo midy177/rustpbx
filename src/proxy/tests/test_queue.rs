@@ -1,11 +1,9 @@
+use super::test_helpers;
 use super::test_ua::{TestUa, TestUaEvent};
 use crate::call::user::SipUser;
 use crate::config::ProxyConfig;
 use crate::proxy::{
-    auth::AuthModule,
-    call::CallModule,
     locator::MemoryLocator,
-    registrar::RegistrarModule,
     routing::{
         MatchConditions, RouteAction, RouteQueueConfig, RouteQueueStrategyConfig,
         RouteQueueTargetConfig, RouteRule,
@@ -108,28 +106,16 @@ impl TestQueueServer {
         let locator = MemoryLocator::new();
         let cancel_token = CancellationToken::new();
 
-        let mut builder = SipServerBuilder::new(config)
-            .with_user_backend(Box::new(user_backend))
-            .with_locator(Box::new(locator))
-            .with_cancel_token(cancel_token.clone());
-
-        builder = builder
-            .register_module("registrar", |inner, config| {
-                Ok(Box::new(RegistrarModule::new(inner, config)))
-            })
-            .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(
-                    inner.clone(),
-                    inner.proxy_config.clone(),
-                )))
-            })
-            .register_module("call", |inner, config| {
-                Ok(Box::new(CallModule::new(config, inner)))
-            });
+        let builder = test_helpers::register_standard_modules(
+            SipServerBuilder::new(config)
+                .with_user_backend(Box::new(user_backend))
+                .with_locator(Box::new(locator))
+                .with_cancel_token(cancel_token.clone()),
+        );
 
         let server = builder.build().await?;
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             if let Err(e) = server.serve().await {
                 warn!("Server error: {:?}", e);
             }
@@ -190,7 +176,7 @@ async fn test_call_queue_routing() {
     caller.start().await.unwrap();
 
     // 4. Caller dials "support" (triggers routing to queue)
-    let call_task = tokio::spawn(async move {
+    let call_task = crate::utils::spawn(async move {
         info!("Caller dialing support...");
 
         // Generate a minimal SDP offer from caller
@@ -223,7 +209,7 @@ async fn test_call_queue_routing() {
     });
 
     // 5. Agent waits for incoming call and answers
-    let answer_task = tokio::spawn(async move {
+    let answer_task = crate::utils::spawn(async move {
         for _ in 0..50 {
             // Try for 5 seconds
             let events = agent.process_dialog_events().await.unwrap_or_default();

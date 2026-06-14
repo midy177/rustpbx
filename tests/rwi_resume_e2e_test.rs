@@ -45,7 +45,7 @@ fn make_auth() -> RwiAuthRef {
 
 async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegistry>) {
     let auth = make_auth();
-    let gateway: RwiGatewayRef = Arc::new(tokio::sync::RwLock::new(RwiGateway::new()));
+    let gateway: RwiGatewayRef = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
     let registry = Arc::new(ActiveProxyCallRegistry::new());
 
     let auth_c = auth.clone();
@@ -81,7 +81,7 @@ async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegis
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    rustpbx::utils::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
@@ -183,29 +183,39 @@ async fn test_full_session_resume_flow() {
 
         // Push some events via gateway
         {
-            let gw = gateway.read().await;
+            let gw = gateway.read();
             let events = vec![
-                rustpbx::rwi::RwiEvent::CallIncoming(rustpbx::rwi::CallIncomingData {
+                rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallIncoming {
                     call_id: "resume-call-1".to_string(),
                     context: "resume-test".to_string(),
                     caller: "sip:alice@test.com".to_string(),
                     callee: "sip:bob@test.com".to_string(),
-                    direction: "inbound".to_string(),
+                    dial_direction: "inbound".to_string(),
                     trunk: None,
                     sip_headers: std::collections::HashMap::new(),
-                }),
-                rustpbx::rwi::RwiEvent::CallRinging {
+                    root_call_id: None,
+                    caller_name: None,
+                    callee_name: None,
+                    called_phone: None,
+                    app_id: None,
+                    routing_target: None,
+                    uuid: None,
+                    routing_path: None,
+                }, None),
+                rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
                     call_id: "resume-call-1".to_string(),
-                },
-                rustpbx::rwi::RwiEvent::CallAnswered {
+                }, None),
+                rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallAnswered  { 
                     call_id: "resume-call-1".to_string(),
-                },
+                }, None),
             ];
 
             for event in events {
                 gw.fan_out_event_to_context("resume-test", &event, &"resume-call-1".to_string());
-            }
-        }
+            }, None);
+
+        }, None);
+
 
         // Give time for events to be cached
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -218,7 +228,7 @@ async fn test_full_session_resume_flow() {
 
         ws.close(None).await.unwrap();
         initial_count
-    };
+    }, None);
 
     // Wait for disconnect to complete
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -261,7 +271,8 @@ async fn test_full_session_resume_flow() {
             assert!(event["timestamp"].is_u64(), "Event should have timestamp");
             assert!(event["call_id"].is_string(), "Event should have call_id");
             assert!(event["event"].is_object(), "Event should have event data");
-        }
+        }, None);
+
 
         ws.close(None).await.unwrap();
     }
@@ -278,13 +289,14 @@ async fn test_incremental_resume_with_sequence() {
 
     // Push events to gateway cache
     {
-        let gw = gateway.read().await;
+        let gw = gateway.read();
         for i in 0..5 {
-            let event = rustpbx::rwi::RwiEvent::CallRinging {
+            let event = rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
                 call_id: format!("seq-call-{}", i),
-            };
+            }, None);
             gw.cache_event(&format!("seq-call-{}", i), &event);
-        }
+        }, None);
+
     }
 
     // Resume without sequence (get all)
@@ -319,18 +331,18 @@ async fn test_call_resume_filters_by_call_id() {
 
     // Push events for multiple calls
     {
-        let gw = gateway.read().await;
+        let gw = gateway.read();
 
         // Call A events
         gw.cache_event(
             &"call-a".to_string(),
-            &rustpbx::rwi::RwiEvent::CallRinging {
+            &rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
                 call_id: "call-a".to_string(),
             },
         );
         gw.cache_event(
             &"call-a".to_string(),
-            &rustpbx::rwi::RwiEvent::CallAnswered {
+            &rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallAnswered  { 
                 call_id: "call-a".to_string(),
             },
         );
@@ -338,18 +350,19 @@ async fn test_call_resume_filters_by_call_id() {
         // Call B events
         gw.cache_event(
             &"call-b".to_string(),
-            &rustpbx::rwi::RwiEvent::CallRinging {
+            &rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
                 call_id: "call-b".to_string(),
             },
         );
         gw.cache_event(
             &"call-b".to_string(),
-            &rustpbx::rwi::RwiEvent::CallBridged {
+            &rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallBridged  { 
                 leg_a: "call-b".to_string(),
                 leg_b: "call-c".to_string(),
             },
         );
-    }
+    }, None);
+
 
     // Resume call-a specifically
     let (_, json) = req("call.resume", serde_json::json!({"call_id": "call-a"}));
@@ -364,7 +377,8 @@ async fn test_call_resume_filters_by_call_id() {
     // Verify all events are for call-a
     for event in events {
         assert_eq!(event["call_id"], "call-a");
-    }
+    }, None);
+
 
     // Resume call-b
     let (_, json) = req("call.resume", serde_json::json!({"call_id": "call-b"}));
@@ -377,11 +391,13 @@ async fn test_call_resume_filters_by_call_id() {
     let has_bridged = events.iter().any(|e| {
         let event_json = serde_json::to_string(&e["event"]).unwrap_or_default();
         event_json.contains("bridged") || e["event"]["leg_a"].is_string()
-    });
+    });, None);
+
     assert!(has_bridged, "Should have a bridged event: {:?}", events);
 
     ws.close(None).await.unwrap();
-}
+}, None);
+
 
 /// Test: Resume with non-existent call returns empty events
 #[tokio::test]
@@ -417,15 +433,16 @@ async fn test_event_sequence_monotonicity() {
 
     // Push events sequentially
     {
-        let gw = gateway.read().await;
+        let gw = gateway.read();
         for i in 0..10 {
-            let event = rustpbx::rwi::RwiEvent::Dtmf {
+            let event = rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::Dtmf  { 
                 call_id: "dtmf-call".to_string(),
                 digit: i.to_string(),
                 leg_id: None,
-            };
+            }, None);
             gw.cache_event(&"dtmf-call".to_string(), &event);
-        }
+        }, None);
+
     }
 
     // Resume and check sequence numbers

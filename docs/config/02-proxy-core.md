@@ -66,6 +66,10 @@ frequency_limiter = "100/60s"
 session_timer = true
 session_expires = 1800  # 30 minutes
 
+# RTP timeout — if no audio packets are received on either direction for
+# this many seconds, the call is automatically terminated (default: 30)
+rtp_timeout = 30
+
 # SIP Transaction Timers (RFC 3261) - optional overrides
 t1_timer = 500      # T1 timer in milliseconds (default: 500)
 t1x64_timer = 32000 # T1x64 timer in milliseconds (default: 32000)
@@ -131,8 +135,16 @@ queue_dir = "./queues"
 
 ```toml
 [proxy]
-# Registrar expires time (in seconds)
-registrar_expires = 3600
+# Registrar default expires time in seconds (default: 30).
+# This is the fallback value when the REGISTER request does not include
+# an Expires header or Contact expires parameter.
+# Both settings can be changed via the Web Console under Settings > Proxy.
+registrar_expires = 30
+
+# Maximum allowed expires value in seconds (default: 50).
+# Client-requested expires exceeding this limit will be capped.
+# Set to a higher value if clients need longer registration lifetimes.
+max_registrar_expires = 50
 
 # Passthrough failure status codes to caller
 # When true, caller receives the same SIP error code (e.g., 486, 603) from callee
@@ -163,3 +175,42 @@ To disable explicitly:
 [proxy]
 dialog_auth_cache = { enabled = false }
 ```
+
+## Channel Capacity
+
+Controls the size of internal async channels used for session and media command/event passing. Increasing these values may help under high concurrency at the cost of memory, while decreasing them can reduce backpressure latency.
+
+```toml
+[proxy]
+# Session command channel capacity (default: 256)
+session_cmd_channel_capacity = 256
+# Session state change channel capacity (default: 256)
+session_state_channel_capacity = 256
+# Media engine command channel capacity (default: 512)
+media_cmd_channel_capacity = 512
+# Media engine event channel capacity (default: 1024)
+media_event_channel_capacity = 1024
+```
+
+- **`session_cmd_channel_capacity`**: Max pending commands per SIP session (e.g., hangup, transfer, play). Default: `256`.
+- **`session_state_channel_capacity`**: Max pending state-change notifications per session. Default: `256`.
+- **`media_cmd_channel_capacity`**: Max pending commands per media engine instance (e.g., play, stop, record). Default: `512`.
+- **`media_event_channel_capacity`**: Max pending media events per engine instance (e.g., DTMF, playback complete). Default: `1024`.
+
+## Identity & Privacy
+
+These settings control how the PBX identifies itself in SIP signaling and SDP media attributes.
+
+```toml
+[proxy]
+# Contact header username when no dialplan caller_contact is set.
+# If not specified, a random 16-char hex string is generated at startup.
+contact_username = "my-pbx-01"
+
+# CNAME value used in SDP a=ssrc:<n> cname:<value> attributes.
+# If not specified, a random 16-char hex string is generated at startup.
+# This replaces the default "rustrtc-cname-<ssrc>" in generated SDP.
+rtc_cname = "my-pbx-01"
+```
+
+When neither is specified, both default to the same randomly generated hex string, making the PBX instance identifiable without revealing implementation details.

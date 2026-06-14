@@ -2,9 +2,18 @@ use super::SipSession;
 use crate::call::domain::{CallCommand, LegId, LegState};
 use crate::callrecord::CallRecordHangupReason;
 use anyhow::{Result, anyhow};
+use futures::{SinkExt, StreamExt};
 use rsipstack::dialog::dialog::DialogState;
+use rsipstack::sip::StatusCode;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
+
+// Re-export for peer access
+use crate::call::runtime::conference_media_bridge::AudioReceiver;
+use crate::proxy::proxy_call::sip_session::PeerConnectionAudioReceiver;
+use std::collections::HashMap;
+use std::time::Duration;
 
 /// Parsed representation of a transfer target URI.
 ///
@@ -15,12 +24,21 @@ pub(crate) enum TransferTarget {
     Queue {
         name: String,
         return_ivr: Option<String>,
+        target_overrides: Vec<String>,
     },
     Ivr {
         name: String,
     },
     Voicemail {
         extension: String,
+    },
+    /// WebSocket + PCM real-time VoIP bridge.
+    VoipBridge {
+        endpoint: String,
+        headers: HashMap<String, String>,
+        sample_rate: u32,
+        codec: String,
+        timeout_ms: Option<u64>,
     },
     Sip(String),
 }
@@ -31,17 +49,41 @@ pub(crate) enum TransferTarget {
 pub(crate) fn parse_transfer_target(target: &str) -> TransferTarget {
     if let Some(rest) = target.strip_prefix("queue:") {
         let remainder = rest.trim();
-        let (queue_name, return_ivr) = if let Some(pos) = remainder.find("?return_ivr=") {
-            let q = remainder[..pos].trim();
-            let ivr = remainder[pos + "?return_ivr=".len()..].to_string();
-            (q, Some(ivr))
-        } else {
-            (remainder, None)
+        let (queue_name, query_str) = match remainder.find('?') {
+            Some(pos) => (remainder[..pos].trim(), Some(&remainder[pos + 1..])),
+            None => (remainder, None),
         };
-        if !queue_name.is_empty() {
+        if queue_name.is_empty() {
+            // empty name → fall through to Sip
+        } else {
+            let mut return_ivr = None;
+            let mut target_overrides = Vec::new();
+            if let Some(query) = query_str {
+                for pair in query.split('&') {
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    let mut parts = pair.splitn(2, '=');
+                    let key = parts.next().unwrap_or("");
+                    let value = parts.next().unwrap_or("");
+                    let decoded = {
+                        let s = value.replace('+', " ");
+                        match urlencoding::decode(&s) {
+                            Ok(c) => c.into_owned(),
+                            Err(_) => s,
+                        }
+                    };
+                    match key {
+                        "return_ivr" => return_ivr = Some(decoded),
+                        "target" => target_overrides.push(decoded),
+                        _ => {}
+                    }
+                }
+            }
             return TransferTarget::Queue {
                 name: queue_name.to_string(),
                 return_ivr,
+                target_overrides,
             };
         }
     }
@@ -61,6 +103,76 @@ pub(crate) fn parse_transfer_target(target: &str) -> TransferTarget {
             };
         }
     }
+    if let Some(rest) = target.strip_prefix("voip_bridge:") {
+        let raw = rest.trim();
+        if !raw.is_empty() {
+            let mut sample_rate = 8000u32;
+            let mut codec = "pcm".to_string();
+            let mut timeout_ms = None;
+            let mut headers = HashMap::new();
+            let mut passthrough_params = Vec::new();
+
+            // Parse URI to extract query params
+            if let Ok(uri) = raw.parse::<http::Uri>() {
+                if let Some(query) = uri.query() {
+                    for pair in query.split('&') {
+                        if pair.is_empty() {
+                            continue;
+                        }
+                        let mut parts = pair.splitn(2, '=');
+                        let key = parts.next().unwrap_or("");
+                        let value = parts.next().unwrap_or("");
+                        // Decode: replace "+" with " " (query-string convention) then
+                        // percent-decode.
+                        let decoded_val = {
+                            let s = value.replace('+', " ");
+                            match urlencoding::decode(&s) {
+                                Ok(c) => c.into_owned(),
+                                Err(_) => s,
+                            }
+                        };
+                        match key {
+                            k if k.starts_with("_hdr_") => {
+                                let hdr_name = &k["_hdr_".len()..];
+                                headers.insert(hdr_name.to_string(), decoded_val);
+                            }
+                            "samplerate" => {
+                                sample_rate = value.parse().unwrap_or(8000);
+                            }
+                            "codec" => {
+                                codec = value.to_string();
+                            }
+                            "timeout_ms" => {
+                                timeout_ms = value.parse().ok();
+                            }
+                            _ => passthrough_params.push(pair.to_string()),
+                        }
+                    }
+                }
+                // Rebuild clean URL: scheme + authority + path + passthrough params
+                let mut ep = String::new();
+                if let Some(scheme) = uri.scheme_str() {
+                    ep.push_str(scheme);
+                    ep.push_str("://");
+                }
+                if let Some(auth) = uri.authority() {
+                    ep.push_str(auth.as_str());
+                }
+                ep.push_str(uri.path());
+                if !passthrough_params.is_empty() {
+                    ep.push('?');
+                    ep.push_str(&passthrough_params.join("&"));
+                }
+                return TransferTarget::VoipBridge {
+                    endpoint: ep,
+                    headers,
+                    sample_rate,
+                    codec,
+                    timeout_ms,
+                };
+            }
+        }
+    }
     let sip = if target.starts_with("sip:") || target.starts_with("tel:") {
         target.to_string()
     } else {
@@ -75,6 +187,7 @@ impl SipSession {
         leg_id: LegId,
         target: String,
         attended: bool,
+        callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<()> {
         info!(%leg_id, %target, %attended, "Handling transfer");
 
@@ -93,7 +206,8 @@ impl SipSession {
 
         if attended {
             if !target.is_empty() {
-                self.handle_replace_transfer(leg_id, target).await?;
+                self.handle_replace_transfer(leg_id, target, callee_state_rx)
+                    .await?;
             } else {
                 self.update_leg_state(&leg_id, LegState::Hold);
                 info!(
@@ -101,7 +215,8 @@ impl SipSession {
                 );
             }
         } else {
-            self.handle_blind_transfer(leg_id, target).await?;
+            self.handle_blind_transfer(leg_id, target, callee_state_rx)
+                .await?;
         }
 
         Ok(())
@@ -111,11 +226,23 @@ impl SipSession {
         &mut self,
         leg_id: LegId,
         target: String,
+        callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<()> {
         match parse_transfer_target(&target) {
-            TransferTarget::Queue { name, return_ivr } => {
-                info!(%leg_id, queue = %name, ?return_ivr, "Handling queue transfer");
-                self.handle_queue_transfer(leg_id, &name, return_ivr).await
+            TransferTarget::Queue {
+                name,
+                return_ivr,
+                target_overrides,
+            } => {
+                info!(%leg_id, queue = %name, ?return_ivr, overrides = %target_overrides.len(), "Handling queue transfer");
+                self.handle_queue_transfer(
+                    leg_id,
+                    &name,
+                    return_ivr,
+                    target_overrides,
+                    callee_state_rx,
+                )
+                .await
             }
             TransferTarget::Ivr { name } => {
                 info!(%leg_id, ivr = %name, "Handling IVR transfer by starting IvrApp");
@@ -124,6 +251,24 @@ impl SipSession {
             TransferTarget::Voicemail { extension } => {
                 info!(%leg_id, %extension, "Handling voicemail transfer by starting VoicemailApp");
                 self.start_voicemail_app(&extension).await
+            }
+            TransferTarget::VoipBridge {
+                endpoint,
+                headers,
+                sample_rate,
+                codec,
+                timeout_ms,
+            } => {
+                info!(%leg_id, endpoint = %endpoint, sample_rate, codec = %codec, "Handling VoipBridge transfer");
+                self.connect_voip_bridge(
+                    leg_id,
+                    endpoint.clone(),
+                    headers.clone(),
+                    sample_rate,
+                    codec.clone(),
+                    timeout_ms,
+                )
+                .await
             }
             TransferTarget::Sip(refer_to_str) => {
                 let refer_to_uri = rsipstack::sip::Uri::try_from(refer_to_str.as_str())
@@ -135,18 +280,14 @@ impl SipSession {
                         aor: refer_to_uri,
                         ..Default::default()
                     };
-                    // Create a proper dialog-state channel so early media (183) from the
-                    // B-leg propagates correctly during the transfer INVITE.
-                    let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<DialogState>();
-                    let prev_callee_tx = self.callee_event_tx.replace(callee_tx);
                     let result = self
-                        .try_single_target(&location, &mut callee_rx, None)
+                        .try_single_target(&location, callee_state_rx, None)
                         .await;
-                    self.callee_event_tx = prev_callee_tx;
-                    return result.map_err(|(code, reason)| {
+                    return result.map_err(|(code, text, reason)| {
                         anyhow!(
-                            "B-leg transfer failed: {:?} - {}",
+                            "B-leg transfer failed: {} {} - {}",
                             code,
+                            text,
                             reason.unwrap_or_default()
                         )
                     });
@@ -159,7 +300,7 @@ impl SipSession {
                     .caller_contact
                     .clone()
                     .map(|c| c.to_string())
-                    .unwrap_or_else(|| "sip:rustpbx@localhost".to_string());
+                    .unwrap_or_else(|| format!("sip:{}@localhost", self.server.contact_username));
                 let headers = vec![rsipstack::sip::Header::Other(
                     "Referred-By".to_string(),
                     format!("<{}>", referred_by),
@@ -253,7 +394,10 @@ impl SipSession {
                     }
                 }
 
-                info!("Blind transfer initiated — call will be transferred to {}", refer_to_str);
+                info!(
+                    "Blind transfer initiated — call will be transferred to {}",
+                    refer_to_str
+                );
                 Ok(())
             }
         }
@@ -264,8 +408,10 @@ impl SipSession {
         leg_id: LegId,
         queue_name: &str,
         return_ivr: Option<String>,
+        target_overrides: Vec<String>,
+        callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<()> {
-        info!(%leg_id, queue = %queue_name, ?return_ivr, "Starting queue transfer");
+        info!(%leg_id, queue = %queue_name, ?return_ivr, overrides = %target_overrides.len(), "Starting queue transfer");
 
         let queue_config = self
             .server
@@ -283,6 +429,42 @@ impl SipSession {
         let mut queue_plan = queue_config
             .to_queue_plan()
             .map_err(|e| anyhow!("Invalid queue config: {}", e))?;
+
+        if !target_overrides.is_empty() {
+            use crate::call::{DialStrategy, Location};
+            let mut locations = Vec::new();
+            for target in &target_overrides {
+                let trimmed = target.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let location = if trimmed.starts_with("skillgroup:") {
+                    let id = trimmed.strip_prefix("skillgroup:").unwrap_or(trimmed).trim();
+                    Location {
+                        aor: rsipstack::sip::Uri::try_from(format!("skill-group:{}", id))
+                            .map_err(|e| anyhow!("invalid target '{}': {}", trimmed, e))?,
+                        contact_raw: Some(trimmed.to_string()),
+                        ..Default::default()
+                    }
+                } else {
+                    let uri = rsipstack::sip::Uri::try_from(trimmed)
+                        .map_err(|e| anyhow!("invalid target '{}': {}", trimmed, e))?;
+                    Location {
+                        aor: uri.clone(),
+                        contact_raw: Some(uri.to_string()),
+                        ..Default::default()
+                    }
+                };
+                locations.push(location);
+            }
+            if !locations.is_empty() {
+                info!(
+                    overrides = %locations.len(),
+                    "Queue transfer: overriding targets from query params"
+                );
+                queue_plan.dial_strategy = Some(DialStrategy::Sequential(locations));
+            }
+        }
 
         let return_ivr_fallback_audio: Option<String> = if return_ivr.is_some() {
             queue_plan.failure_audio.clone().or_else(|| {
@@ -311,40 +493,38 @@ impl SipSession {
             queue_plan.failure_audio = return_ivr_fallback_audio;
         }
 
-        // Create a proper dialog-state channel so early media (183) from agents
-        // propagates correctly during queue-driven transfers at runtime.
-        let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<DialogState>();
-        let prev_callee_tx = self.callee_event_tx.replace(callee_tx);
-        let queue_result = self.execute_queue(&queue_plan, &mut callee_rx).await;
-        self.callee_event_tx = prev_callee_tx;
+        let queue_result = self.execute_queue(&queue_plan, callee_state_rx).await;
 
         match queue_result {
             Ok(()) => {
                 info!(queue = %queue_name, "Queue transfer completed successfully");
                 Ok(())
             }
-            Err((code, reason)) => {
+            Err((code, text, reason)) => {
                 warn!(
                     queue = %queue_name,
-                    ?code,
+                    code = %code,
+                    text = %text,
                     ?reason,
                     "Queue transfer failed"
                 );
                 if self.server_dialog.state().is_confirmed() {
-                    self.meta.last_error = Some((code.clone(), reason.clone()));
-                    self.meta.hangup_reason
+                    self.meta.last_error = Some((StatusCode::Other(code, text.clone()), reason.clone()));
+                    self.meta
+                        .hangup_reason
                         .get_or_insert(CallRecordHangupReason::Failed);
                     self.pending_hangup.insert(self.server_dialog.id());
                     self.cancel_token.cancel();
                     info!(
                         queue = %queue_name,
-                        ?code,
+                        code = %code,
+                        text = %text,
                         ?reason,
                         "Queue transfer failed after caller was answered; hanging up caller dialog"
                     );
                     return Ok(());
                 }
-                Err(anyhow!("Queue transfer failed: {:?} - {:?}", code, reason))
+                Err(anyhow!("Queue transfer failed: {} {} {:?}", code, text, reason))
             }
         }
     }
@@ -352,7 +532,7 @@ impl SipSession {
     pub(crate) async fn start_ivr_app(&self, ivr_name: &str) -> Result<()> {
         use crate::call::runtime::AppRuntimeError;
 
-        let ivr_file = format!("config/ivr/{}.toml", ivr_name);
+        let ivr_file = self.server.data_context.resolve_ivr_file(ivr_name);
         info!(ivr = %ivr_name, file = %ivr_file, "Starting IVR application");
 
         let params = Some(serde_json::json!({"file": ivr_file}));
@@ -434,10 +614,248 @@ impl SipSession {
                 self.app_runtime
                     .start_app("voicemail", params, true)
                     .await
-                    .map_err(|e| anyhow!("Failed to restart voicemail for '{}': {:?}", extension, e))
+                    .map_err(|e| {
+                        anyhow!("Failed to restart voicemail for '{}': {:?}", extension, e)
+                    })
             }
-            Err(e) => Err(anyhow!("Failed to start voicemail for '{}': {:?}", extension, e)),
+            Err(e) => Err(anyhow!(
+                "Failed to start voicemail for '{}': {:?}",
+                extension,
+                e
+            )),
         }
+    }
+
+    /// Establish a WebSocket + PCM real‑time bridge to an external VoIP endpoint.
+    ///
+    /// Full‑duplex audio bridge between the SIP call leg and a WebSocket carrying
+    /// raw PCM16 (i16 little‑endian, no framing header).
+    ///
+    /// ┌──────────────────────────────────────────────────────────────────┐
+    /// │  SipSession                                                     │
+    /// │  ┌──── forward_loop ─────────────────────────────────────────┐  │
+    /// │  │ WS raw PCM16 → buffer → resample → encode → audio_sender  │  │
+    /// │  └────────────────────────────────────────────────────────────┘  │
+    /// │  ┌──── reverse_loop ─────────────────────────────────────────┐  │
+    /// │  │ audio_receiver → resample → raw PCM16 → WS send           │  │
+    /// │  └────────────────────────────────────────────────────────────┘  │
+    /// └──────────────────────────────────────────────────────────────────┘
+    pub(crate) async fn connect_voip_bridge(
+        &mut self,
+        leg_id: LegId,
+        endpoint: String,
+        _headers: HashMap<String, String>,
+        sample_rate: u32,
+        codec: String,
+        timeout_ms: Option<u64>,
+    ) -> Result<()> {
+        info!(%leg_id, endpoint = %endpoint, sample_rate, codec = %codec, "Connecting VoipBridge");
+
+        // ── 1. Establish WebSocket connection ──────────────────────────
+        let ws_connect = tokio_tungstenite::connect_async(&endpoint);
+        let (ws_stream, _) = if let Some(ms) = timeout_ms {
+            tokio::time::timeout(Duration::from_millis(ms), ws_connect)
+                .await
+                .map_err(|_| anyhow!("VoipBridge connection timed out after {}ms", ms))?
+                .map_err(|e| anyhow!("Failed to connect VoipBridge WebSocket: {}", e))?
+        } else {
+            ws_connect
+                .await
+                .map_err(|e| anyhow!("Failed to connect VoipBridge WebSocket: {}", e))?
+        };
+        info!("VoipBridge WebSocket connected to {}", endpoint);
+        let (mut ws_write, mut ws_read) = ws_stream.split();
+
+        // ── 2. Get the leg's media peer, track sender & PC ───────────
+        let peer = self
+            .legs
+            .get_peer(&leg_id)
+            .cloned()
+            .unwrap_or_else(|| self.caller_peer().clone());
+
+        let tracks = peer.get_tracks().await;
+        let mut audio_sender = None;
+        let mut pc = None;
+        for t in &tracks {
+            let guard = t.lock().await;
+            if audio_sender.is_none() {
+                audio_sender = guard.get_sender();
+            }
+            if pc.is_none() {
+                pc = guard.get_peer_connection().await;
+            }
+        }
+        let audio_sender = audio_sender.ok_or_else(|| anyhow!("No track sender for VoipBridge"))?;
+        let pc = pc.ok_or_else(|| anyhow!("No PeerConnection for VoipBridge"))?;
+
+        // ── 3. Create audio receiver (call → raw PCM) ────────────────
+        let decoder = self
+            .create_audio_decoder()
+            .ok_or_else(|| anyhow!("Failed to create audio decoder"))?;
+        let mut audio_receiver = PeerConnectionAudioReceiver::new(pc, decoder);
+
+        // ── 4. Determine codec type for the forward encoder ───────────
+        let codec_type = match codec.as_str() {
+            "pcm" | "pcmu" => audio_codec::CodecType::PCMU,
+            "pcma" | "g711" => audio_codec::CodecType::PCMA,
+            "opus" => audio_codec::CodecType::Opus,
+            "g722" => audio_codec::CodecType::G722,
+            _ => {
+                let negotiated = self.leg_negotiated_codec(&leg_id);
+                info!(?negotiated, "Using negotiated codec");
+                negotiated
+            }
+        };
+        let ws_sample_rate = if sample_rate == 0 { 8000 } else { sample_rate };
+
+        // ── 5. Cancellation token (parent = session cancel) ──────────
+        let cancel_token = self.cancel_token.child_token();
+
+        // ── 6. Forward loop: WS raw PCM16 → inject into call ─────────
+        let forward_cancel = cancel_token.child_token();
+        let forward_handle = {
+            let leg_id = leg_id.clone();
+            crate::utils::spawn(async move {
+                use audio_codec::create_encoder;
+                use rustrtc::media::{AudioFrame as RtcAudioFrame, MediaSample};
+
+                let mut encoder = create_encoder(codec_type);
+                let enc_sample_rate = encoder.sample_rate();
+                let clock_rate = codec_type.clock_rate() as u32;
+                let payload_type = codec_type.payload_type();
+                let samples_per_frame = (enc_sample_rate * 20 / 1000) as usize;
+                let rtp_ticks_per_frame = clock_rate * 20 / 1000;
+
+                let mut rtp_ts: u32 = rand::random();
+                let mut seq: u16 = rand::random();
+                let mut buf: Vec<i16> = Vec::new();
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = forward_cancel.cancelled() => {
+                            info!(%leg_id, "VoipBridge forward loop cancelled");
+                            break;
+                        }
+                        msg = ws_read.next() => {
+                            match msg {
+                                Some(Ok(Message::Binary(data))) => {
+                                    if data.len() < 2 { continue; }
+                                    let samples: Vec<i16> = data.chunks_exact(2)
+                                        .map(|c| i16::from_ne_bytes([c[0], c[1]]))
+                                        .collect();
+                                    buf.extend(samples);
+
+                                    while buf.len() >= samples_per_frame {
+                                        let chunk: Vec<i16> = buf.drain(..samples_per_frame).collect();
+                                        let chunk = if ws_sample_rate != enc_sample_rate {
+                                            crate::call::runtime::conference_media_bridge::resample_linear(
+                                                &chunk, ws_sample_rate, enc_sample_rate,
+                                            )
+                                        } else {
+                                            chunk
+                                        };
+                                        let encoded = encoder.encode(&chunk);
+                                        let frame = RtcAudioFrame {
+                                            rtp_timestamp: rtp_ts,
+                                            clock_rate,
+                                            data: encoded.into(),
+                                            sequence_number: Some(seq),
+                                            payload_type: Some(payload_type),
+                                            marker: false,
+                                            header_extension: None,
+                                            raw_packet: None,
+                                            source_addr: None,
+                                        };
+                                        if audio_sender.send(MediaSample::Audio(frame)).await.is_err() {
+                                            warn!(%leg_id, "VoipBridge forward: audio sender closed");
+                                            return;
+                                        }
+                                        rtp_ts = rtp_ts.wrapping_add(rtp_ticks_per_frame);
+                                        seq = seq.wrapping_add(1);
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None => {
+                                    info!(%leg_id, "VoipBridge WS closed remotely");
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    warn!(%leg_id, "VoipBridge WS read error: {}", e);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // ── 7. Reverse loop: call audio → raw PCM16 → WS ─────────────
+        let reverse_cancel = cancel_token.child_token();
+        let reverse_handle = {
+            let leg_id = leg_id.clone();
+            crate::utils::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = reverse_cancel.cancelled() => {
+                            info!(%leg_id, "VoipBridge reverse loop cancelled");
+                            break;
+                        }
+                        pcm = audio_receiver.recv() => {
+                            match pcm {
+                                Some(frame) => {
+                                    let samples = if frame.sample_rate != ws_sample_rate {
+                                        crate::call::runtime::conference_media_bridge::resample_linear(
+                                            &frame.samples, frame.sample_rate, ws_sample_rate,
+                                        )
+                                    } else {
+                                        frame.samples
+                                    };
+                                    let mut bytes = Vec::with_capacity(samples.len() * 2);
+                                    for s in &samples {
+                                        bytes.extend_from_slice(&s.to_ne_bytes());
+                                    }
+                                    if ws_write.send(Message::Binary(bytes.into())).await.is_err() {
+                                        warn!(%leg_id, "VoipBridge WS write failed");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    info!(%leg_id, "VoipBridge audio receiver closed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // ── 8. Register tasks for session cleanup ────────────────────
+        self.legs
+            .tasks
+            .entry(leg_id.clone())
+            .or_default()
+            .push(forward_handle);
+        self.legs
+            .tasks
+            .entry(leg_id.clone())
+            .or_default()
+            .push(reverse_handle);
+
+        // ── 9. Store bridge reference on session ─────────────────────
+        self.conference_bridge = crate::call::runtime::SessionConferenceBridge {
+            bridge_handle: Some(crate::call::runtime::ConferenceBridgeHandle {
+                _tasks: vec![],
+                cancel_token,
+            }),
+            conf_id: Some(format!("voip-bridge-{}", self.id.0)),
+        };
+
+        info!(%leg_id, endpoint = %endpoint, "VoipBridge established");
+        Ok(())
     }
 
     pub(super) fn build_replaces_header(&self) -> Option<String> {
@@ -461,6 +879,7 @@ impl SipSession {
         &mut self,
         leg_id: LegId,
         target: String,
+        callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<()> {
         let replaces = self
             .build_replaces_header()
@@ -473,7 +892,8 @@ impl SipSession {
             format!("{}?Replaces={}", target, encoded_replaces)
         };
 
-        self.handle_blind_transfer(leg_id, refer_target).await
+        self.handle_blind_transfer(leg_id, refer_target, callee_state_rx)
+            .await
     }
 
     pub(super) async fn emit_refer_event(
@@ -785,6 +1205,7 @@ mod tests {
             TransferTarget::Queue {
                 name: "support".to_string(),
                 return_ivr: Some("main".to_string()),
+                target_overrides: vec![],
             }
         );
     }
@@ -797,6 +1218,7 @@ mod tests {
             TransferTarget::Queue {
                 name: "support".to_string(),
                 return_ivr: None,
+                target_overrides: vec![],
             }
         );
     }
@@ -809,6 +1231,82 @@ mod tests {
             TransferTarget::Queue {
                 name: "sales".to_string(),
                 return_ivr: None,
+                target_overrides: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_transfer_target_queue_with_target_skillgroup() {
+        let t = parse_transfer_target("queue:support?target=skillgroup:sales");
+        assert_eq!(
+            t,
+            TransferTarget::Queue {
+                name: "support".to_string(),
+                return_ivr: None,
+                target_overrides: vec!["skillgroup:sales".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_transfer_target_queue_with_target_sip_uri() {
+        let t = parse_transfer_target("queue:support?target=sip:agent@pbx.com");
+        assert_eq!(
+            t,
+            TransferTarget::Queue {
+                name: "support".to_string(),
+                return_ivr: None,
+                target_overrides: vec!["sip:agent@pbx.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_transfer_target_queue_with_multiple_targets() {
+        let t = parse_transfer_target("queue:support?target=skillgroup:sales&target=skillgroup:support");
+        assert_eq!(
+            t,
+            TransferTarget::Queue {
+                name: "support".to_string(),
+                return_ivr: None,
+                target_overrides: vec![
+                    "skillgroup:sales".to_string(),
+                    "skillgroup:support".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_transfer_target_queue_with_target_and_return_ivr() {
+        let t = parse_transfer_target(
+            "queue:support?target=skillgroup:sales&return_ivr=main_menu",
+        );
+        assert_eq!(
+            t,
+            TransferTarget::Queue {
+                name: "support".to_string(),
+                return_ivr: Some("main_menu".to_string()),
+                target_overrides: vec!["skillgroup:sales".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_transfer_target_queue_with_multiple_targets_and_return_ivr() {
+        let t = parse_transfer_target(
+            "queue:support?target=sip:a@pbx&target=sip:b@pbx&return_ivr=ivr_main",
+        );
+        assert_eq!(
+            t,
+            TransferTarget::Queue {
+                name: "support".to_string(),
+                return_ivr: Some("ivr_main".to_string()),
+                target_overrides: vec![
+                    "sip:a@pbx".to_string(),
+                    "sip:b@pbx".to_string(),
+                ],
             }
         );
     }
@@ -816,7 +1314,12 @@ mod tests {
     #[test]
     fn test_parse_transfer_target_ivr() {
         let t = parse_transfer_target("ivr:main");
-        assert_eq!(t, TransferTarget::Ivr { name: "main".to_string() });
+        assert_eq!(
+            t,
+            TransferTarget::Ivr {
+                name: "main".to_string()
+            }
+        );
     }
 
     #[test]
@@ -965,7 +1468,10 @@ mod tests {
         let (_tx, mut rx) = mpsc::unbounded_channel::<u32>();
         drop(_tx);
         // recv() on a channel with no senders returns None immediately.
-        assert!(rx.recv().await.is_none(), "dropped sender should yield None");
+        assert!(
+            rx.recv().await.is_none(),
+            "dropped sender should yield None"
+        );
     }
 
     #[tokio::test]
@@ -975,5 +1481,240 @@ mod tests {
         tx.send(42).unwrap();
         drop(tx);
         assert_eq!(rx.recv().await, Some(42));
+    }
+
+    // ── VoipBridge parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_voip_bridge() {
+        let target = "voip_bridge:wss://voip.example.com/rooms";
+        let parsed = super::parse_transfer_target(target);
+        match parsed {
+            TransferTarget::VoipBridge {
+                endpoint,
+                sample_rate,
+                codec,
+                ..
+            } => {
+                assert_eq!(endpoint, "wss://voip.example.com/rooms");
+                assert_eq!(sample_rate, 8000);
+                assert_eq!(codec, "pcm");
+            }
+            _ => panic!("expected VoipBridge, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn test_parse_voip_bridge_with_query_params() {
+        let target = "voip_bridge:wss://room.example.com/ws?token=abc&samplerate=16000&codec=opus&_hdr_Authorization=Bearer+xxx";
+        let parsed = super::parse_transfer_target(target);
+        match parsed {
+            TransferTarget::VoipBridge {
+                endpoint,
+                headers,
+                sample_rate,
+                codec,
+                ..
+            } => {
+                assert_eq!(endpoint, "wss://room.example.com/ws?token=abc");
+                assert_eq!(sample_rate, 16000);
+                assert_eq!(codec, "opus");
+                assert_eq!(
+                    headers.get("Authorization"),
+                    Some(&"Bearer xxx".to_string())
+                );
+            }
+            _ => panic!("expected VoipBridge, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn test_parse_voip_bridge_with_pct_encoded_headers() {
+        let target = "voip_bridge:wss://room.example.com/ws?_hdr_X-Custom=hello%20world%26more";
+        let parsed = super::parse_transfer_target(target);
+        match parsed {
+            TransferTarget::VoipBridge {
+                headers, endpoint, ..
+            } => {
+                assert_eq!(endpoint, "wss://room.example.com/ws");
+                assert_eq!(
+                    headers.get("X-Custom"),
+                    Some(&"hello world&more".to_string())
+                );
+            }
+            _ => panic!("expected VoipBridge, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn test_parse_voip_bridge_with_timeout() {
+        let target = "voip_bridge:wss://room.example.com/ws?timeout_ms=5000";
+        let parsed = super::parse_transfer_target(target);
+        match parsed {
+            TransferTarget::VoipBridge {
+                endpoint,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(endpoint, "wss://room.example.com/ws");
+                assert_eq!(timeout_ms, Some(5000));
+            }
+            _ => panic!("expected VoipBridge, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn test_voip_bridge_precedence_over_sip() {
+        let target = "voip_bridge:wss://room.example.com/ws";
+        let parsed = super::parse_transfer_target(target);
+        assert!(
+            matches!(parsed, TransferTarget::VoipBridge { .. }),
+            "expected VoipBridge, got {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn test_voip_bridge_empty_endpoint_falls_through() {
+        let target = "voip_bridge:";
+        let parsed = super::parse_transfer_target(target);
+        assert!(
+            matches!(parsed, TransferTarget::Sip(_)),
+            "empty voip_bridge should fall through to Sip, got {:?}",
+            parsed
+        );
+    }
+
+    // ── E2E integration: WS echo server + raw PCM round-trip ───────────
+
+    /// Spawn a WebSocket echo server on a random local port.
+    /// Returns the bound address so the test can connect.
+    async fn spawn_ws_echo_server() -> std::net::SocketAddr {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        crate::utils::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let (ws_write, ws_read) = ws_stream.split();
+                // Echo every message back
+                crate::utils::spawn(async move {
+                    ws_read
+                        .map(|msg| {
+                            msg.map(|m| {
+                                // Echo binary as-is, ignore non-binary
+                                if m.is_binary() {
+                                    m
+                                } else {
+                                    tokio_tungstenite::tungstenite::Message::Binary(vec![].into())
+                                }
+                            })
+                        })
+                        .forward(ws_write)
+                        .await
+                        .ok();
+                });
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_voip_bridge_echo_integration() {
+        let addr = spawn_ws_echo_server().await;
+        let ws_url = format!("ws://127.0.0.1:{}", addr.port());
+
+        // 1. Verify the target URI parses correctly
+        let target = format!("voip_bridge:{ws_url}?_hdr_X-Test=hello&samplerate=8000&codec=pcm");
+        let parsed = super::parse_transfer_target(&target);
+        let (endpoint, headers, sample_rate, codec) = match parsed {
+            TransferTarget::VoipBridge {
+                endpoint,
+                headers,
+                sample_rate,
+                codec,
+                ..
+            } => (endpoint, headers, sample_rate, codec),
+            other => panic!("expected VoipBridge, got {other:?}"),
+        };
+        // http::Uri::path() always returns at least "/", so the parsed
+        // endpoint will have a trailing slash.
+        assert_eq!(endpoint, format!("{ws_url}/"));
+        assert_eq!(headers.get("X-Test"), Some(&"hello".to_string()));
+        assert_eq!(sample_rate, 8000);
+        assert_eq!(codec, "pcm");
+
+        // 2. Connect to the echo server and exchange PCM data
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect("connect to echo server");
+        let (mut ws_write, mut ws_read) = ws_stream.split();
+
+        // Send a PCM16 frame (160 samples at 8kHz = 10ms)
+        let tx_samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+        let mut tx_bytes = Vec::with_capacity(tx_samples.len() * 2);
+        for s in &tx_samples {
+            tx_bytes.extend_from_slice(&s.to_ne_bytes());
+        }
+
+        ws_write
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                tx_bytes.clone().into(),
+            ))
+            .await
+            .expect("send PCM data");
+
+        // Receive echoed data
+        let echoed = tokio::time::timeout(Duration::from_secs(5), ws_read.next())
+            .await
+            .expect("timeout waiting for echo")
+            .expect("ws stream ended")
+            .expect("ws error");
+
+        let rx_bytes = match echoed {
+            tokio_tungstenite::tungstenite::Message::Binary(data) => data,
+            other => panic!("expected Binary, got {other:?}"),
+        };
+
+        // Verify echoed data matches
+        assert_eq!(
+            rx_bytes.len(),
+            tx_bytes.len(),
+            "echo should have same byte count"
+        );
+        let rx_samples: Vec<i16> = rx_bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(rx_samples, tx_samples, "echoed PCM should match original");
+
+        // 3. Close cleanly
+        ws_write
+            .close()
+            .await
+            .expect("close WS connection gracefully");
+    }
+
+    #[tokio::test]
+    async fn test_voip_bridge_resample_linear_8k_to_16k() {
+        // Generate 160 samples of 8kHz PCM (= 20ms)
+        let input: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+        let output =
+            crate::call::runtime::conference_media_bridge::resample_linear(&input, 8000, 16000);
+        // 160 samples at 8kHz → 320 samples at 16kHz (same duration)
+        assert_eq!(output.len(), 320, "8k→16k should double sample count");
+        // First and last samples should match
+        assert_eq!(output[0], input[0]);
+        assert_eq!(output[output.len() - 1], input[input.len() - 1]);
+    }
+
+    #[tokio::test]
+    async fn test_voip_bridge_resample_linear_16k_to_8k() {
+        let input: Vec<i16> = (0..320).map(|i| (i * 50) as i16).collect();
+        let output =
+            crate::call::runtime::conference_media_bridge::resample_linear(&input, 16000, 8000);
+        assert_eq!(output.len(), 160, "16k→8k should halve sample count");
     }
 }

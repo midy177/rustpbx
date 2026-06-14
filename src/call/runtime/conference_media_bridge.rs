@@ -116,7 +116,7 @@ impl ConferenceMediaBridge {
 
         let leg_id_clone = leg_id.clone();
         let conf_id_string = conf_id.to_string();
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             Self::forward_loop(
                 output_rx,
                 audio_sender,
@@ -187,7 +187,7 @@ impl ConferenceMediaBridge {
         let forward_cancel = cancel_token.child_token();
         let leg_id_forward = leg_id.clone();
         let conf_id_forward = conf_id.to_string();
-        let forward_handle = tokio::spawn(async move {
+        let forward_handle = crate::utils::spawn(async move {
             Self::forward_loop(
                 output_rx,
                 audio_sender,
@@ -203,7 +203,7 @@ impl ConferenceMediaBridge {
         let reverse_cancel = cancel_token.child_token();
         let leg_id_reverse = leg_id.clone();
         let conf_id_reverse = conf_id.to_string();
-        let reverse_handle = tokio::spawn(async move {
+        let reverse_handle = crate::utils::spawn(async move {
             Self::reverse_loop(
                 audio_receiver,
                 input_tx,
@@ -414,7 +414,7 @@ impl ConferenceMediaBridge {
 }
 
 /// Resample audio using linear interpolation.
-fn resample_linear(samples: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
+pub(crate) fn resample_linear(samples: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
     if src_rate == dst_rate {
         return samples.to_vec();
     }
@@ -444,7 +444,7 @@ fn resample_linear(samples: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
 
 /// Handle to control a conference media bridge.
 pub struct ConferenceBridgeHandle {
-    _tasks: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) _tasks: Vec<tokio::task::JoinHandle<()>>,
     pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
@@ -594,7 +594,7 @@ mod tests {
         let cancel_clone = cancel.clone();
 
         // Spawn forward loop
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender_clone,
@@ -651,7 +651,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender_clone,
@@ -691,7 +691,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender_clone,
@@ -749,7 +749,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::reverse_loop(
                 Box::new(receiver),
                 input_tx,
@@ -832,7 +832,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender,
@@ -860,7 +860,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::reverse_loop(
                 Box::new(receiver),
                 input_tx,
@@ -901,7 +901,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::reverse_loop(
                 Box::new(receiver),
                 input_tx,
@@ -937,7 +937,7 @@ mod tests {
         let cancel_clone = cancel.clone();
 
         // Spawn forward loop with G.722 codec
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender_for_loop,
@@ -992,7 +992,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::utils::spawn(async move {
             ConferenceMediaBridge::forward_loop(
                 rx,
                 sender_for_loop,
@@ -1025,10 +1025,7 @@ mod tests {
 
         match &sent[0] {
             MediaSample::Audio(frame) => {
-                assert!(
-                    !frame.data.is_empty(),
-                    "G.722 payload should not be empty"
-                );
+                assert!(!frame.data.is_empty(), "G.722 payload should not be empty");
             }
             _ => panic!("Expected Audio sample"),
         }

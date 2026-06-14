@@ -10,6 +10,7 @@ use crate::addons::wholesale::models::{
 use crate::{
     console::handlers::forms::{self, ListQuery, SipTrunkForm},
     console::{ConsoleState, middleware::AuthRequired},
+    models::routing::{Entity as RoutingEntity, Model as RoutingModel},
     models::sip_trunk::{
         ActiveModel as SipTrunkActiveModel, Column as SipTrunkColumn, Entity as SipTrunkEntity,
         SipTransport, SipTrunkDirection, SipTrunkStatus,
@@ -21,7 +22,7 @@ use axum::{
     extract::{Form, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, patch, put},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Order;
@@ -63,6 +64,20 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
                 .patch(update_sip_trunk)
                 .delete(delete_sip_trunk),
         )
+        .route("/sip-trunk/{id}/dependencies", get(trunk_dependencies))
+}
+
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route(
+            "/sip-trunk",
+            put(create_sip_trunk).post(query_sip_trunks),
+        )
+        .route(
+            "/sip-trunk/{id}",
+            patch(update_sip_trunk).delete(delete_sip_trunk),
+        )
+        .route("/sip-trunk/{id}/dependencies", get(trunk_dependencies))
 }
 
 async fn page_sip_trunks(
@@ -123,7 +138,7 @@ async fn page_sip_trunk_create(
             "filters": filters,
             "tenants": tenants,
             "mode": "create",
-            "create_url": state.url_for("/sip-trunk"),
+            "create_url": state.api_url_for("/sip-trunk"),
             "current_user": current_user,
             "ami_endpoint": ami_endpoint,
         }),
@@ -202,7 +217,7 @@ async fn page_sip_trunk_detail(
                     "filters": filters,
                     "tenants": tenants,
                     "mode": "edit",
-                    "update_url": state.url_for(&format!("/sip-trunk/{id}")),
+                    "update_url": state.api_url_for(&format!("/sip-trunk/{id}")),
                     "current_user": current_user,
                     "ami_endpoint": ami_endpoint,
                 }),
@@ -344,6 +359,99 @@ async fn update_sip_trunk(
                 .into_response()
         }
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrunkRouteRef {
+    id: i64,
+    name: String,
+    role: String,
+}
+
+async fn trunk_dependencies(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(_): AuthRequired,
+) -> Response {
+    let db = state.db();
+
+    let trunk = match SipTrunkEntity::find_by_id(id).one(db).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "SIP trunk not found"})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            warn!("failed to load trunk {} for dependency check: {}", id, err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("Failed to check dependencies: {}", err)})),
+            )
+                .into_response();
+        }
+    };
+
+    let trunk_name = trunk.name.clone();
+
+    let all_routes: Vec<RoutingModel> = match RoutingEntity::find().all(db).await {
+        Ok(routes) => routes,
+        Err(err) => {
+            warn!("failed to load routes for trunk dependency check: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("Failed to check dependencies: {}", err)})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut refs: Vec<TrunkRouteRef> = Vec::new();
+
+    for route in &all_routes {
+        if route.source_trunk_id == Some(id) {
+            refs.push(TrunkRouteRef {
+                id: route.id,
+                name: route.name.clone(),
+                role: "source".into(),
+            });
+        }
+        if route.default_trunk_id == Some(id) {
+            refs.push(TrunkRouteRef {
+                id: route.id,
+                name: route.name.clone(),
+                role: "default".into(),
+            });
+        }
+        if let Some(target_json) = &route.target_trunks {
+            if let Some(arr) = target_json.as_array() {
+                for entry in arr {
+                    if entry.get("name").and_then(|v| v.as_str()) == Some(&trunk_name) {
+                        refs.push(TrunkRouteRef {
+                            id: route.id,
+                            name: route.name.clone(),
+                            role: "target".into(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    refs.sort_by(|a, b| a.id.cmp(&b.id));
+    refs.retain(|r| seen.insert((r.id, r.role.clone())));
+
+    Json(json!({
+        "trunk_id": id,
+        "trunk_name": trunk_name,
+        "routes": refs,
+    }))
+    .into_response()
 }
 
 async fn delete_sip_trunk(
@@ -946,9 +1054,7 @@ mod tests {
             .await
             .expect("connect sqlite memory");
         Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(
-            Arc::new(crate::callrecord::DefaultCallRecordFormatter::default()),
-            db,
+        ConsoleState::initialize(db,
             ConsoleConfig::default(),
         )
         .await

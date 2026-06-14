@@ -1,14 +1,11 @@
 use anyhow::{Result, anyhow};
 use audio_codec::{CodecType, Decoder, Resampler, create_decoder, create_encoder};
-use rustrtc::rtp::RtpPacket;
 use std::{
     collections::{BTreeMap, HashMap},
     io::{Cursor, Seek, SeekFrom, Write},
 };
 
-use crate::media::{
-    StreamWriter, negotiate::MediaNegotiator, recorder::DtmfGenerator, wav_writer::WavWriter,
-};
+use crate::media::{negotiate::MediaNegotiator, recorder::DtmfGenerator};
 use crate::sipflow::{SipFlowItem, SipFlowMsgType, extract_rtp_addr, extract_sdp};
 
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +16,14 @@ pub(crate) struct PayloadDescriptor {
 
 pub(crate) type PayloadTypeMap = HashMap<u8, PayloadDescriptor>;
 pub(crate) type LegPayloadTypeMap = HashMap<i32, PayloadTypeMap>;
+
+struct RtpPacketView<'a> {
+    leg: i32,
+    payload_type: u8,
+    sequence_number: u16,
+    rtp_timestamp: u32,
+    payload: &'a [u8],
+}
 
 fn default_payload_descriptor(pt: u8) -> PayloadDescriptor {
     match pt {
@@ -47,6 +52,52 @@ fn default_payload_descriptor(pt: u8) -> PayloadDescriptor {
             clock_rate: 8000,
         },
     }
+}
+
+fn parse_borrowed_rtp_packet(leg: i32, raw: &[u8]) -> Option<RtpPacketView<'_>> {
+    if raw.len() < 12 || raw[0] >> 6 != 2 {
+        return None;
+    }
+
+    let has_padding = raw[0] & 0x20 != 0;
+    let has_extension = raw[0] & 0x10 != 0;
+    let csrc_count = (raw[0] & 0x0f) as usize;
+    let mut payload_offset = 12usize.checked_add(csrc_count.checked_mul(4)?)?;
+
+    if raw.len() < payload_offset {
+        return None;
+    }
+
+    if has_extension {
+        let extension_header_end = payload_offset.checked_add(4)?;
+        if raw.len() < extension_header_end {
+            return None;
+        }
+        let extension_words =
+            u16::from_be_bytes([raw[payload_offset + 2], raw[payload_offset + 3]]) as usize;
+        payload_offset = extension_header_end.checked_add(extension_words.checked_mul(4)?)?;
+        if raw.len() < payload_offset {
+            return None;
+        }
+    }
+
+    let payload_end = if has_padding {
+        let padding_len = *raw.last()? as usize;
+        if padding_len == 0 || raw.len() < payload_offset.checked_add(padding_len)? {
+            return None;
+        }
+        raw.len() - padding_len
+    } else {
+        raw.len()
+    };
+
+    Some(RtpPacketView {
+        leg,
+        payload_type: raw[1] & 0x7f,
+        sequence_number: u16::from_be_bytes([raw[2], raw[3]]),
+        rtp_timestamp: u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        payload: &raw[payload_offset..payload_end],
+    })
 }
 
 pub(crate) fn build_payload_type_map(flow_items: &[SipFlowItem]) -> PayloadTypeMap {
@@ -233,21 +284,6 @@ fn mix_pcm_chunks(audio_chunk: &[u8], dtmf_chunk: &[u8]) -> Vec<u8> {
     mixed
 }
 
-fn compose_leg_chunk(
-    audio_chunk: Option<&Vec<u8>>,
-    dtmf_chunk: Option<&Vec<u8>>,
-    silence_frame: &[u8],
-    target_codec: Option<CodecType>,
-) -> Vec<u8> {
-    match (audio_chunk, dtmf_chunk) {
-        (Some(audio), Some(dtmf)) if target_codec.is_none() => mix_pcm_chunks(audio, dtmf),
-        (Some(_audio), Some(dtmf)) => dtmf.clone(),
-        (Some(audio), None) => audio.clone(),
-        (None, Some(dtmf)) => dtmf.clone(),
-        (None, None) => silence_frame.to_vec(),
-    }
-}
-
 pub fn write_wav_header<W: Write + Seek>(
     writer: &mut W,
     codec: Option<CodecType>,
@@ -320,62 +356,73 @@ pub fn generate_wav_from_packets_ex(
     generate_wav_from_packets_with_map_ex(packets, &HashMap::new(), force_pcm)
 }
 
+pub fn generate_wav_to_writer_ex<W: Write + Seek>(
+    packets: &[(i32, u64, Vec<u8>)],
+    force_pcm: bool,
+    writer: &mut W,
+) -> Result<u64> {
+    generate_wav_to_writer(packets, &HashMap::new(), &HashMap::new(), force_pcm, writer)
+}
+
 pub(crate) fn generate_wav_from_packets_with_map_ex(
     packets: &[(i32, u64, Vec<u8>)],
     payload_map: &PayloadTypeMap,
     force_pcm: bool,
 ) -> Result<Vec<u8>> {
-    generate_wav_from_packets_with_leg_map_ex(packets, payload_map, &HashMap::new(), force_pcm)
+    let mut cursor = Cursor::new(Vec::new());
+    generate_wav_to_writer(
+        packets,
+        payload_map,
+        &HashMap::new(),
+        force_pcm,
+        &mut cursor,
+    )?;
+    Ok(cursor.into_inner())
 }
 
-pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
+pub(crate) fn generate_wav_to_writer<W: Write + Seek>(
     packets: &[(i32, u64, Vec<u8>)],
     payload_map: &PayloadTypeMap,
     leg_payload_map: &LegPayloadTypeMap,
     force_pcm: bool,
-) -> Result<Vec<u8>> {
+    writer: &mut W,
+) -> Result<u64> {
     if packets.is_empty() {
         return Err(anyhow!("No RTP packets found"));
     }
 
-    // 1. Analyze codecs to determine output format
-    let mut legs_codecs: HashMap<i32, Vec<CodecType>> = HashMap::new();
-    let mut leg_audio_clock_rates: HashMap<i32, u32> = HashMap::new();
-    let mut min_ts = u64::MAX;
-    let mut max_ts = 0;
-
-    for (leg, ts, p) in packets {
-        if p.len() < 12 {
-            continue;
+    let mut parsed_packets = Vec::new();
+    for (leg, _, raw_packet) in packets {
+        if let Some(packet) = parse_borrowed_rtp_packet(*leg, raw_packet) {
+            parsed_packets.push(packet);
         }
-        if *ts < min_ts {
-            min_ts = *ts;
-        }
-        if *ts > max_ts {
-            max_ts = *ts;
-        }
-
-        // Detect if it's a valid RTP v2 packet
-        let pt = RtpPacket::parse(p)
-            .map(|packet| packet.header.payload_type)
-            .unwrap_or(0);
-        let payload = RtpPacket::parse(p)
-            .map(|packet| packet.payload.to_vec())
-            .unwrap_or_default();
-
-        if looks_like_dtmf_payload(&payload) {
-            continue;
-        }
-
-        let codec = payload_descriptor(pt, *leg, payload_map, leg_payload_map);
-        let codec_type = codec.codec;
-        leg_audio_clock_rates
-            .entry(*leg)
-            .or_insert(codec.clock_rate);
-        legs_codecs.entry(*leg).or_default().push(codec_type);
     }
 
-    // Determine target codec
+    if parsed_packets.is_empty() {
+        return Err(anyhow!("No valid RTP packets found"));
+    }
+
+    parsed_packets.sort_by_key(|rtp| (rtp.leg, rtp.rtp_timestamp, rtp.sequence_number));
+
+    let mut legs_codecs: HashMap<i32, Vec<CodecType>> = HashMap::new();
+    let mut leg_audio_clock_rates: HashMap<i32, u32> = HashMap::new();
+
+    for rtp in &parsed_packets {
+        let pt = rtp.payload_type;
+        let payload = rtp.payload;
+
+        if looks_like_dtmf_payload(payload) {
+            continue;
+        }
+
+        let codec = payload_descriptor(pt, rtp.leg, payload_map, leg_payload_map);
+        let codec_type = codec.codec;
+        leg_audio_clock_rates
+            .entry(rtp.leg)
+            .or_insert(codec.clock_rate);
+        legs_codecs.entry(rtp.leg).or_default().push(codec_type);
+    }
+
     let has_other = legs_codecs.values().any(|s| {
         s.iter()
             .any(|c| *c != CodecType::PCMU && *c != CodecType::PCMA)
@@ -383,7 +430,6 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
     let has_pcmu = legs_codecs.values().any(|s| s.contains(&CodecType::PCMU));
     let has_pcma = legs_codecs.values().any(|s| s.contains(&CodecType::PCMA));
 
-    // If force_pcm is true, always output PCM format (for ASR compatibility)
     let (target_codec, target_sample_rate) = if force_pcm {
         (None, 16000)
     } else if !has_other && has_pcmu && !has_pcma {
@@ -408,51 +454,40 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
     };
     let silence_frame = silence_chunk(target_codec, step_samples);
 
-    // 2. Process streams
     let mut buffer_a: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut buffer_b: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut dtmf_buffer_a: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut dtmf_buffer_b: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
 
-    // Decoding State
     let mut decoders: HashMap<(i32, u8), Box<dyn Decoder>> = HashMap::new();
     let mut resamplers: HashMap<(i32, u8), Resampler> = HashMap::new();
     let mut base_timestamps: HashMap<i32, u64> = HashMap::new();
 
-    for (leg, ts, p) in packets {
-        if p.len() < 12 {
-            continue;
-        }
+    for rtp in &parsed_packets {
+        let rtp_timestamp = rtp.rtp_timestamp as u64;
+        let pt = rtp.payload_type;
+        let payload = rtp.payload;
 
-        let rtp = match rustrtc::rtp::RtpPacket::parse(p) {
-            Ok(packet) => packet,
-            Err(_) => {
-                continue;
-            }
-        };
-
-        let pt = rtp.header.payload_type;
-        let payload = &rtp.payload;
-
-        let mut descriptor = payload_descriptor(pt, *leg, payload_map, leg_payload_map);
+        let mut descriptor = payload_descriptor(pt, rtp.leg, payload_map, leg_payload_map);
         if descriptor.codec != CodecType::TelephoneEvent && looks_like_dtmf_payload(payload) {
             descriptor = PayloadDescriptor {
                 codec: CodecType::TelephoneEvent,
-                clock_rate: leg_audio_clock_rates.get(leg).copied().unwrap_or(8000),
+                clock_rate: leg_audio_clock_rates.get(&rtp.leg).copied().unwrap_or(8000),
             };
         }
         let codec = descriptor.codec;
         let clock_rate = descriptor.clock_rate as u64;
 
-        let base = *base_timestamps.entry(*leg).or_insert(*ts);
-        let rtp_diff = ts.wrapping_sub(base);
-        let target_timestamp = (rtp_diff * target_sample_rate as u64 / clock_rate) as u32;
+        let base = *base_timestamps.entry(rtp.leg).or_insert(rtp_timestamp);
+        let rtp_diff = rtp_timestamp.saturating_sub(base);
+        let target_timestamp =
+            (rtp_diff.saturating_mul(target_sample_rate as u64) / clock_rate) as u32;
 
         if codec == CodecType::TelephoneEvent {
             if let Some((digit, duration_ms)) = parse_dtmf_payload(payload, descriptor.clock_rate) {
                 let dtmf_audio =
                     encode_dtmf_tone(digit, duration_ms, target_codec, target_sample_rate);
-                if *leg == 1 {
+                if rtp.leg == 1 {
                     insert_chunked(
                         &mut dtmf_buffer_b,
                         target_timestamp,
@@ -475,19 +510,17 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
             continue;
         }
 
-        // Decoding logic...
         let decoder_needed = target_codec.is_none();
 
-        // ... (existing decoding code)
         let processed_data: Vec<u8> = if decoder_needed {
             let decoder = decoders
-                .entry((*leg, pt))
+                .entry((rtp.leg, pt))
                 .or_insert_with(|| create_decoder(codec));
             let samples = decoder.decode(payload);
 
             let current_rate = decoder.sample_rate();
             let final_samples = if current_rate != target_sample_rate {
-                let resampler = resamplers.entry((*leg, pt)).or_insert_with(|| {
+                let resampler = resamplers.entry((rtp.leg, pt)).or_insert_with(|| {
                     Resampler::new(current_rate as usize, target_sample_rate as usize)
                 });
                 resampler.resample(&samples)
@@ -495,23 +528,24 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
                 samples
             };
 
-            // Target is L16 (None)
             audio_codec::samples_to_bytes(&final_samples)
         } else {
             payload.to_vec()
         };
 
-        if *leg == 1 {
+        if rtp.leg == 1 {
             buffer_b.insert(target_timestamp, processed_data);
         } else {
             buffer_a.insert(target_timestamp, processed_data);
         }
     }
 
-    // 3. Write WAV
-    let mut cursor = Cursor::new(Vec::new());
-    let mut writer = WavWriter::new_with_writer(&mut cursor, target_sample_rate, 2, target_codec);
-    writer.write_header()?;
+    drop(parsed_packets);
+    drop(decoders);
+    drop(resamplers);
+    drop(base_timestamps);
+    drop(leg_audio_clock_rates);
+    drop(legs_codecs);
 
     let max_time_a = buffer_a.keys().max().cloned().unwrap_or(0);
     let max_time_b = buffer_b.keys().max().cloned().unwrap_or(0);
@@ -522,6 +556,8 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
         .max(max_dtmf_time_a)
         .max(max_dtmf_time_b);
     let max_duration = max_time + target_sample_rate / 50;
+    let max_duration_cap = target_sample_rate.saturating_mul(3600);
+    let max_duration = max_duration.min(max_duration_cap);
 
     tracing::info!(
         "Buffer stats: A_len={} B_len={} A_dtmf_len={} B_dtmf_len={} max_time={} max_duration={}",
@@ -533,26 +569,29 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
         max_duration
     );
 
-    let mut current_ts = 0;
-    let mut silence_count = 0;
-    let mut chunk_count = 0;
+    write_wav_header(writer, target_codec, target_sample_rate, 2, 0)?;
+
+    let mut current_ts = 0u32;
+    let mut silence_count = 0u64;
+    let mut chunk_count = 0u64;
+    let mut data_size = 0u64;
+    let mut interleaved = Vec::with_capacity(bytes_per_chunk * 2);
 
     while current_ts < max_duration {
-        let audio_a = find_chunk(&buffer_a, current_ts, step_samples);
-        let dtmf_a = find_chunk(&dtmf_buffer_a, current_ts, step_samples);
-        let chunk_a = compose_leg_chunk(audio_a, dtmf_a, &silence_frame, target_codec);
+        let audio_a = find_and_remove_chunk(&mut buffer_a, current_ts, step_samples);
+        let dtmf_a = find_and_remove_chunk(&mut dtmf_buffer_a, current_ts, step_samples);
+        let chunk_a = compose_leg_chunk_owned(audio_a, dtmf_a, &silence_frame, target_codec);
         if chunk_a == silence_frame {
             silence_count += 1;
         } else {
             chunk_count += 1;
         }
 
-        let audio_b = find_chunk(&buffer_b, current_ts, step_samples);
-        let dtmf_b = find_chunk(&dtmf_buffer_b, current_ts, step_samples);
-        let chunk_b = compose_leg_chunk(audio_b, dtmf_b, &silence_frame, target_codec);
+        let audio_b = find_and_remove_chunk(&mut buffer_b, current_ts, step_samples);
+        let dtmf_b = find_and_remove_chunk(&mut dtmf_buffer_b, current_ts, step_samples);
+        let chunk_b = compose_leg_chunk_owned(audio_b, dtmf_b, &silence_frame, target_codec);
 
-        let mut interleaved = Vec::with_capacity(chunk_a.len() + chunk_b.len());
-
+        interleaved.clear();
         if target_codec.is_none() {
             let count = chunk_a.len().min(chunk_b.len()) / 2;
             for i in 0..count {
@@ -567,9 +606,11 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
             }
         }
 
-        writer.write_packet(&interleaved, 0)?;
+        writer.write_all(&interleaved)?;
+        data_size += interleaved.len() as u64;
         current_ts += step_samples;
     }
+
     tracing::info!(
         "Wav Gen: chunks={} silences={} total_steps={}",
         chunk_count,
@@ -577,20 +618,42 @@ pub(crate) fn generate_wav_from_packets_with_leg_map_ex(
         current_ts / step_samples
     );
 
-    writer.finalize()?;
-    Ok(cursor.into_inner())
+    let data_size_u32 = data_size.try_into().unwrap_or(u32::MAX);
+    write_wav_header(writer, target_codec, target_sample_rate, 2, data_size_u32)?;
+
+    Ok(data_size)
 }
 
-fn find_chunk(buffer: &BTreeMap<u32, Vec<u8>>, ts: u32, step: u32) -> Option<&Vec<u8>> {
-    let tolerance = step / 2; // tighter tolerance for RTP sequence
+fn find_and_remove_chunk(
+    buffer: &mut BTreeMap<u32, Vec<u8>>,
+    ts: u32,
+    step: u32,
+) -> Option<Vec<u8>> {
+    let tolerance = step / 2;
     let start = ts.saturating_sub(tolerance);
     let end = ts + tolerance;
 
-    // Find absolute closest match in the window
-    buffer
+    let best_key = buffer
         .range(start..end)
         .min_by_key(|(k, _)| (**k as i64 - ts as i64).abs())
-        .map(|(_, v)| v)
+        .map(|(k, _)| *k)?;
+
+    buffer.remove(&best_key)
+}
+
+fn compose_leg_chunk_owned(
+    audio_chunk: Option<Vec<u8>>,
+    dtmf_chunk: Option<Vec<u8>>,
+    silence_frame: &[u8],
+    target_codec: Option<CodecType>,
+) -> Vec<u8> {
+    match (audio_chunk, dtmf_chunk) {
+        (Some(audio), Some(dtmf)) if target_codec.is_none() => mix_pcm_chunks(&audio, &dtmf),
+        (Some(_audio), Some(dtmf)) => dtmf,
+        (Some(audio), None) => audio,
+        (None, Some(dtmf)) => dtmf,
+        (None, None) => silence_frame.to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -598,10 +661,11 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn build_rtp_packet(payload_type: u8, payload: &[u8]) -> Vec<u8> {
+    fn build_rtp_packet(payload_type: u8, timestamp: u32, payload: &[u8]) -> Vec<u8> {
         let mut packet = vec![0u8; 12];
         packet[0] = 0x80;
         packet[1] = payload_type & 0x7f;
+        packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
         packet.extend_from_slice(payload);
         packet
     }
@@ -625,6 +689,7 @@ mod tests {
         let item = SipFlowItem {
             timestamp: 0,
             seq: 0,
+            leg: None,
             msg_type: SipFlowMsgType::Sip,
             src_addr: String::new(),
             dst_addr: String::new(),
@@ -646,6 +711,7 @@ mod tests {
         let leg_a = SipFlowItem {
             timestamp: 0,
             seq: 0,
+            leg: None,
             msg_type: SipFlowMsgType::Sip,
             src_addr: String::new(),
             dst_addr: String::new(),
@@ -656,6 +722,7 @@ mod tests {
         let leg_b = SipFlowItem {
             timestamp: 1,
             seq: 0,
+            leg: None,
             msg_type: SipFlowMsgType::Sip,
             src_addr: String::new(),
             dst_addr: String::new(),
@@ -694,7 +761,7 @@ mod tests {
         let packets = vec![(
             0,
             48_000,
-            build_rtp_packet(101, &[5, 0x80, 0x03, 0xC0]), // digit 5, 20 ms at 48 kHz
+            build_rtp_packet(101, 48_000, &[5, 0x80, 0x03, 0xC0]), // digit 5, 20 ms at 48 kHz
         )];
 
         let wav = generate_wav_from_packets_with_map_ex(&packets, &payload_map, true)
@@ -733,11 +800,11 @@ mod tests {
             (
                 0,
                 0,
-                build_rtp_packet(101, &[5, 0x80, 0x02, 0x80]), // 80 ms digit 5 at 8 kHz
+                build_rtp_packet(101, 0, &[5, 0x80, 0x02, 0x80]), // 80 ms digit 5 at 8 kHz
             ),
-            (0, 160, build_rtp_packet(0, &silence_payload)),
-            (0, 320, build_rtp_packet(0, &silence_payload)),
-            (0, 480, build_rtp_packet(0, &silence_payload)),
+            (0, 160, build_rtp_packet(0, 160, &silence_payload)),
+            (0, 320, build_rtp_packet(0, 320, &silence_payload)),
+            (0, 480, build_rtp_packet(0, 480, &silence_payload)),
         ];
 
         let wav = generate_wav_from_packets_with_map_ex(&packets, &payload_map, true)
@@ -766,11 +833,11 @@ mod tests {
 
         let silence_payload = create_encoder(CodecType::PCMU).encode(&vec![0i16; 160]);
         let packets = vec![
-            (1, 0, build_rtp_packet(0, &silence_payload)),
+            (1, 0, build_rtp_packet(0, 0, &silence_payload)),
             (
                 1,
                 160,
-                build_rtp_packet(97, &[5, 0x80, 0x06, 0x40]), // 200 ms digit 5 at 8 kHz
+                build_rtp_packet(97, 160, &[5, 0x80, 0x06, 0x40]), // 200 ms digit 5 at 8 kHz
             ),
         ];
 
@@ -786,6 +853,71 @@ mod tests {
             audible_windows >= 8,
             "RFC4733 payload without SDP mapping should still regenerate an audible tone, got {} windows",
             audible_windows
+        );
+    }
+
+    /// Reproduction: RTP packets from different SSRCs on the same leg have
+    /// very different timestamp offsets.  After sorting, the range can be
+    /// close to `u32::MAX`, making `max_duration` enormous and the WAV loop
+    /// allocate multi-GB — causing OOM on a single cancelled call with just
+    /// a few stray RTP packets.
+    #[test]
+    fn repro_different_ssrcs_cause_enormous_max_duration() {
+        // Simulate two RTP packets on leg 0 from different SSRCs:
+        //   SSRC-A: timestamp starts at 100 (normal call media)
+        //   SSRC-B: timestamp starts at 4_000_000_000 (stray packet, different clock)
+        //
+        // After sorting by timestamp: [100, 4_000_000_000]
+        // base = 100, rtp_diff = 3_999_999_900
+        let base: u64 = 100;
+        let later: u64 = 4_000_000_000;
+        let rtp_diff = later.saturating_sub(base);
+
+        let target_sample_rate = 16000u64;
+        let clock_rate = 8000u64;
+        let target_timestamp = rtp_diff.saturating_mul(target_sample_rate) / clock_rate;
+        let target_timestamp_u32 = target_timestamp as u32;
+
+        let step_samples = 320u32;
+        let max_duration = target_timestamp_u32 + step_samples;
+        let iterations = max_duration / step_samples;
+        let estimated_bytes = iterations as u64 * 640;
+
+        eprintln!(
+            "target_timestamp={target_timestamp_u32}, max_duration={max_duration}, \
+             iterations={iterations}, estimated_wav_bytes≈{estimated_bytes} ({:.1} GB)",
+            estimated_bytes as f64 / 1_073_741_824.0
+        );
+
+        assert!(
+            iterations > 1_000_000,
+            "expected >1M iterations (multi-GB allocation), got {iterations}"
+        );
+    }
+
+    /// After the fix (saturating arithmetic + max_duration cap), WAV generation
+    /// completes normally even with packets from different SSRCs.
+    #[test]
+    fn test_wav_generation_handles_mismatched_timestamps() {
+        let payload = vec![0xffu8; 160]; // 20ms PCMU
+
+        // Two packets on the same leg with very different timestamps
+        // (simulating different SSRCs).
+        let packets = vec![
+            (0i32, 0u64, build_rtp_packet(0, 100, &payload)),
+            (0i32, 1u64, build_rtp_packet(0, 4_000_000_000, &payload)),
+        ];
+
+        let wav = generate_wav_from_packets_ex(&packets, true)
+            .expect("wav generation should succeed despite mismatched timestamps");
+
+        // Before fix: this would attempt ~7 GB allocation → OOM kill.
+        // After fix: capped at 1 hour of audio ≈ 230 MB worst case.
+        assert!(
+            wav.len() < 300_000_000,
+            "wav should be bounded (< 300 MB with 1h cap), got {} bytes ({:.1} MB)",
+            wav.len(),
+            wav.len() as f64 / 1_048_576.0
         );
     }
 }

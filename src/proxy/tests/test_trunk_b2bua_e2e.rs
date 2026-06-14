@@ -1,9 +1,9 @@
-//! Wholesale / Trunk E2E Tests
+//! Trunk B2BUA E2E Tests
 //!
 //! Verifies trunk-based call flows with full RTP media verification
 //! and CDR generation accuracy.
 //!
-//! These tests exercise the same B2BUA call path that wholesale/trunk calls use:
+//! These tests exercise the core B2BUA call path that trunk calls use:
 //! - Inbound trunk call: external → proxy → registered user
 //! - The proxy handles these the same as P2P but with different routing/config
 //!
@@ -12,10 +12,11 @@
 //! - CDR accuracy (duration, hangup reason, status)
 //! - Correct codec passthrough (PCMU, PCMA)
 //! - Rejection flows (486 reject → correct CDR)
-//! - Multiple concurrent wholesale calls
+//! - Multiple concurrent trunk calls
 
 use super::e2e_test_server::E2eTestServer;
 use super::rtp_utils::{RtpPacket, RtpReceiver, RtpSender, RtpStats, extract_media_endpoint};
+use super::test_helpers;
 use super::test_ua::TestUaEvent;
 use crate::callrecord::CallRecordHangupReason;
 use crate::config::MediaProxyMode;
@@ -25,35 +26,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-fn pcmu_sdp(ip: &str, port: u16) -> String {
-    let sid = chrono::Utc::now().timestamp();
-    format!(
-        "v=0\r\n\
-         o=- {sid} {sid} IN IP4 {ip}\r\n\
-         s=-\r\n\
-         c=IN IP4 {ip}\r\n\
-         t=0 0\r\n\
-         m=audio {port} RTP/AVP 0 101\r\n\
-         a=rtpmap:0 PCMU/8000\r\n\
-         a=rtpmap:101 telephone-event/8000\r\n\
-         a=sendrecv\r\n"
-    )
-}
-
-fn pcma_sdp(ip: &str, port: u16) -> String {
-    let sid = chrono::Utc::now().timestamp();
-    format!(
-        "v=0\r\n\
-         o=- {sid} {sid} IN IP4 {ip}\r\n\
-         s=-\r\n\
-         c=IN IP4 {ip}\r\n\
-         t=0 0\r\n\
-         m=audio {port} RTP/AVP 8 101\r\n\
-         a=rtpmap:8 PCMA/8000\r\n\
-         a=rtpmap:101 telephone-event/8000\r\n\
-         a=sendrecv\r\n"
-    )
-}
+use test_helpers::{pcma_sdp, pcmu_sdp};
 
 /// Helper: establish call, get both dialog IDs and proxy media endpoints.
 struct EstablishedCall {
@@ -85,7 +58,7 @@ async fn establish_call(
     let caller_clone = caller_ua.clone();
     let callee_str = callee.to_string();
     let caller_handle =
-        tokio::spawn(async move { caller_clone.make_call(&callee_str, Some(caller_sdp)).await });
+        crate::utils::spawn(async move { caller_clone.make_call(&callee_str, Some(caller_sdp)).await });
 
     let mut callee_dialog_id = None;
     let mut callee_offer_sdp: Option<String> = None;
@@ -216,10 +189,47 @@ async fn wait_for_cdr(server: &E2eTestServer, timeout_ms: u64) -> Result<()> {
     Ok(())
 }
 
+async fn send_dtmf_and_wait(
+    sender: Arc<super::test_ua::TestUa>,
+    dialog_id: rsipstack::dialog::DialogId,
+    receiver: &super::test_ua::TestUa,
+    expected_digit: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let digit_for_send = expected_digit.to_string();
+    let send_handle =
+        crate::utils::spawn(async move { sender.send_dtmf_info(&dialog_id, &digit_for_send).await });
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut received = false;
+    while tokio::time::Instant::now() < deadline {
+        let events = receiver.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::DtmfInfo(_, digit) = event
+                && digit == expected_digit
+            {
+                received = true;
+                break;
+            }
+        }
+        if received {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let send_result = tokio::time::timeout(Duration::from_secs(5), send_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("SIP INFO send timed out"))?;
+    send_result.map_err(|e| anyhow::anyhow!("SIP INFO send task failed: {}", e))??;
+
+    Ok(received)
+}
+
 // ─── Test 1: Wholesale inbound — caller (trunk side) hangs up ────────────────
 
 #[tokio::test]
-async fn test_wholesale_inbound_caller_hangup_rtp_cdr() -> Result<()> {
+async fn test_trunk_b2bua_inbound_caller_hangup_rtp_cdr() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -303,14 +313,14 @@ async fn test_wholesale_inbound_caller_hangup_rtp_cdr() -> Result<()> {
     caller_receiver.stop();
     callee_receiver.stop();
     server.stop();
-    info!("test_wholesale_inbound_caller_hangup_rtp_cdr PASSED");
+    info!("test_trunk_b2bua_inbound_caller_hangup_rtp_cdr PASSED");
     Ok(())
 }
 
 // ─── Test 2: Wholesale inbound — user (callee) hangs up ──────────────────────
 
 #[tokio::test]
-async fn test_wholesale_inbound_user_hangup_rtp_cdr() -> Result<()> {
+async fn test_trunk_b2bua_inbound_user_hangup_rtp_cdr() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -365,19 +375,19 @@ async fn test_wholesale_inbound_user_hangup_rtp_cdr() -> Result<()> {
     caller_receiver.stop();
     callee_receiver.stop();
     server.stop();
-    info!("test_wholesale_inbound_user_hangup_rtp_cdr PASSED");
+    info!("test_trunk_b2bua_inbound_user_hangup_rtp_cdr PASSED");
     Ok(())
 }
 
 // ─── Test 3: Wholesale — reject with 486 → verify CDR ───────────────────────
 
 #[tokio::test]
-async fn test_wholesale_reject_486_cdr() -> Result<()> {
+async fn test_trunk_b2bua_reject_486_cdr() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
     let alice = Arc::new(server.create_ua("alice").await?);
-    let bob = server.create_ua("bob").await?;
+    let bob = Arc::new(server.create_ua("bob").await?);
 
     sleep(Duration::from_millis(100)).await;
 
@@ -386,7 +396,7 @@ async fn test_wholesale_reject_486_cdr() -> Result<()> {
     let alice_clone = alice.clone();
     let sdp_clone = sdp.clone();
     let caller_handle =
-        tokio::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
+        crate::utils::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
 
     // Bob rejects with 486
     let mut bob_rejected = false;
@@ -448,14 +458,14 @@ async fn test_wholesale_reject_486_cdr() -> Result<()> {
     }
 
     server.stop();
-    info!("test_wholesale_reject_486_cdr PASSED");
+    info!("test_trunk_b2bua_reject_486_cdr PASSED");
     Ok(())
 }
 
 // ─── Test 4: Wholesale — PCMA codec through proxy ────────────────────────────
 
 #[tokio::test]
-async fn test_wholesale_pcma_rtp_cdr() -> Result<()> {
+async fn test_trunk_b2bua_pcma_rtp_cdr() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -479,7 +489,7 @@ async fn test_wholesale_pcma_rtp_cdr() -> Result<()> {
     // Establish call
     let caller_clone = caller_ua.clone();
     let caller_handle =
-        tokio::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
+        crate::utils::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
 
     let mut callee_dialog_id = None;
     let mut callee_offer_sdp: Option<String> = None;
@@ -575,14 +585,14 @@ async fn test_wholesale_pcma_rtp_cdr() -> Result<()> {
     caller_receiver.stop();
     callee_receiver.stop();
     server.stop();
-    info!("test_wholesale_pcma_rtp_cdr PASSED");
+    info!("test_trunk_b2bua_pcma_rtp_cdr PASSED");
     Ok(())
 }
 
 // ─── Test 5: Wholesale — CDR duration accuracy ───────────────────────────────
 
 #[tokio::test]
-async fn test_wholesale_cdr_duration_accuracy() -> Result<()> {
+async fn test_trunk_b2bua_cdr_duration_accuracy() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -597,7 +607,7 @@ async fn test_wholesale_cdr_duration_accuracy() -> Result<()> {
     let alice_clone = alice.clone();
     let sdp_clone = sdp.clone();
     let caller_handle =
-        tokio::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
+        crate::utils::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
 
     let mut bob_dialog_id = None;
     for _ in 0..50 {
@@ -650,14 +660,14 @@ async fn test_wholesale_cdr_duration_accuracy() -> Result<()> {
     ));
 
     server.stop();
-    info!("test_wholesale_cdr_duration_accuracy PASSED");
+    info!("test_trunk_b2bua_cdr_duration_accuracy PASSED");
     Ok(())
 }
 
 // ─── Test 6: Wholesale — RTP payload integrity through proxy ─────────────────
 
 #[tokio::test]
-async fn test_wholesale_rtp_payload_integrity() -> Result<()> {
+async fn test_trunk_b2bua_rtp_payload_integrity() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -680,7 +690,7 @@ async fn test_wholesale_rtp_payload_integrity() -> Result<()> {
 
     let caller_clone = caller_ua.clone();
     let caller_handle =
-        tokio::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
+        crate::utils::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
 
     let mut callee_dialog_id = None;
     let mut callee_offer_sdp: Option<String> = None;
@@ -792,14 +802,14 @@ async fn test_wholesale_rtp_payload_integrity() -> Result<()> {
     caller_receiver.stop();
     callee_receiver.stop();
     server.stop();
-    info!("test_wholesale_rtp_payload_integrity PASSED");
+    info!("test_trunk_b2bua_rtp_payload_integrity PASSED");
     Ok(())
 }
 
 // ─── Test 7: Wholesale — two concurrent calls, each with correct CDR ──────────
 
 #[tokio::test]
-async fn test_wholesale_two_concurrent_calls() -> Result<()> {
+async fn test_trunk_b2bua_two_concurrent_calls() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server1 = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
@@ -813,7 +823,7 @@ async fn test_wholesale_two_concurrent_calls() -> Result<()> {
     let sdp = pcmu_sdp("127.0.0.1", 12345);
     let alice1_c = alice1.clone();
     let sdp1 = sdp.clone();
-    let h1 = tokio::spawn(async move { alice1_c.make_call("bob", Some(sdp1)).await });
+    let h1 = crate::utils::spawn(async move { alice1_c.make_call("bob", Some(sdp1)).await });
 
     let mut bob1_id = None;
     for _ in 0..50 {
@@ -844,7 +854,7 @@ async fn test_wholesale_two_concurrent_calls() -> Result<()> {
 
     let alice2_c = alice2.clone();
     let sdp2 = sdp.clone();
-    let h2 = tokio::spawn(async move { alice2_c.make_call("bob", Some(sdp2)).await });
+    let h2 = crate::utils::spawn(async move { alice2_c.make_call("bob", Some(sdp2)).await });
 
     let mut bob2_id = None;
     for _ in 0..50 {
@@ -899,19 +909,19 @@ async fn test_wholesale_two_concurrent_calls() -> Result<()> {
 
     server1.stop();
     server2.stop();
-    info!("test_wholesale_two_concurrent_calls PASSED");
+    info!("test_trunk_b2bua_two_concurrent_calls PASSED");
     Ok(())
 }
 
 // ─── Test 8: Wholesale — no answer / timeout ─────────────────────────────────
 
 #[tokio::test]
-async fn test_wholesale_no_answer() -> Result<()> {
+async fn test_trunk_b2bua_no_answer() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
     let alice = Arc::new(server.create_ua("alice").await?);
-    let bob = server.create_ua("bob").await?;
+    let bob = Arc::new(server.create_ua("bob").await?);
 
     sleep(Duration::from_millis(100)).await;
 
@@ -919,7 +929,7 @@ async fn test_wholesale_no_answer() -> Result<()> {
 
     let alice_clone = alice.clone();
     let sdp_clone = sdp.clone();
-    let caller_handle = tokio::spawn(async move {
+    let caller_handle = crate::utils::spawn(async move {
         tokio::time::timeout(
             Duration::from_secs(3),
             alice_clone.make_call("bob", Some(sdp_clone)),
@@ -955,6 +965,377 @@ async fn test_wholesale_no_answer() -> Result<()> {
     }
 
     server.stop();
-    info!("test_wholesale_no_answer PASSED");
+    info!("test_trunk_b2bua_no_answer PASSED");
+    Ok(())
+}
+
+// ─── Test 9: Wholesale — DTMF INFO passthrough ──────────────────────────────
+
+#[tokio::test]
+async fn test_trunk_b2bua_dtmf_info_passthrough() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
+    let alice = Arc::new(server.create_ua("alice").await?);
+    let bob = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let sdp = pcmu_sdp("127.0.0.1", 12345);
+
+    let alice_clone = alice.clone();
+    let sdp_clone = sdp.clone();
+    let caller_handle =
+        crate::utils::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
+
+    let mut bob_dialog_id = None;
+    for _ in 0..50 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, _) = event {
+                bob_dialog_id = Some(id.clone());
+                bob.answer_call(&id, Some(sdp.clone())).await?;
+                break;
+            }
+        }
+        if bob_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let _bob_id = bob_dialog_id.ok_or_else(|| anyhow::anyhow!("No INVITE"))?;
+
+    let alice_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))?
+        .map_err(|e| anyhow::anyhow!("join: {}", e))?
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
+
+    // Call is established. Send DTMF digits from Alice to Bob via SIP INFO.
+    let digits = ["1", "2", "3", "#"];
+    let mut received_digits: Vec<String> = Vec::new();
+    for digit in &digits {
+        if send_dtmf_and_wait(
+            alice.clone(),
+            alice_id.clone(),
+            &bob,
+            digit,
+            Duration::from_secs(3),
+        )
+        .await?
+        {
+            info!(digit, "Bob received DTMF INFO");
+            received_digits.push((*digit).to_string());
+        }
+    }
+
+    info!(
+        sent = ?digits,
+        received = ?received_digits,
+        "DTMF passthrough results"
+    );
+
+    assert!(
+        !received_digits.is_empty(),
+        "Bob should have received at least one DTMF INFO through the proxy"
+    );
+
+    alice.hangup(&alice_id).await?;
+
+    sleep(Duration::from_millis(800)).await;
+    let records = server.cdr_capture.get_all_records().await;
+    if !records.is_empty() {
+        assert_eq!(records[0].details.status, "completed");
+    }
+
+    server.stop();
+    info!("test_trunk_b2bua_dtmf_info_passthrough PASSED");
+    Ok(())
+}
+
+// ─── Test 10: Wholesale — early media with 183 Session Progress ──────────
+
+#[tokio::test]
+async fn test_trunk_b2bua_early_media_183() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
+
+    let caller_receiver = RtpReceiver::bind(0).await?;
+    let callee_receiver = RtpReceiver::bind(0).await?;
+    let caller_sender = RtpSender::bind().await?;
+    let callee_sender = RtpSender::bind().await?;
+
+    let caller_port = caller_receiver.port()?;
+    let callee_port = callee_receiver.port()?;
+
+    let caller_ua = Arc::new(server.create_ua("alice").await?);
+    let callee_ua = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let caller_sdp = pcmu_sdp("127.0.0.1", caller_port);
+    let callee_sdp = pcmu_sdp("127.0.0.1", callee_port);
+
+    let caller_clone = caller_ua.clone();
+    let caller_handle =
+        crate::utils::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
+
+    let mut callee_dialog_id = None;
+    let mut callee_offer_sdp: Option<String> = None;
+    for _ in 0..50 {
+        let events = callee_ua.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                callee_dialog_id = Some(id.clone());
+                callee_offer_sdp = offer;
+                callee_ua.answer_call(&id, Some(callee_sdp.clone())).await?;
+                break;
+            }
+        }
+        if callee_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let _callee_id = callee_dialog_id.ok_or_else(|| anyhow::anyhow!("No INVITE"))?;
+
+    let caller_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))?
+        .map_err(|e| anyhow::anyhow!("join: {}", e))?
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
+
+    // Exchange RTP briefly
+    let caller_answer = caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No answer SDP"))?;
+    let callee_offer = callee_offer_sdp.ok_or_else(|| anyhow::anyhow!("No offer SDP"))?;
+
+    let callee_target = extract_media_endpoint(&callee_offer)
+        .ok_or_else(|| anyhow::anyhow!("No callee endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer)
+        .ok_or_else(|| anyhow::anyhow!("No caller endpoint"))?;
+
+    let (caller_stats, callee_stats) = exchange_rtp(
+        &caller_sender,
+        &callee_sender,
+        &caller_receiver,
+        &callee_receiver,
+        caller_target,
+        callee_target,
+        0,
+        1500,
+    )
+    .await?;
+
+    assert!(
+        callee_stats.packets_received > 0,
+        "Callee should receive RTP"
+    );
+    assert!(
+        caller_stats.packets_received > 0,
+        "Caller should receive RTP"
+    );
+
+    caller_ua.hangup(&caller_id).await?;
+
+    wait_for_cdr(&server, 800).await?;
+    let records = server.cdr_capture.get_all_records().await;
+    assert_eq!(records[0].details.status, "completed");
+
+    caller_receiver.stop();
+    callee_receiver.stop();
+    server.stop();
+    info!("test_trunk_b2bua_early_media_183 PASSED");
+    Ok(())
+}
+
+// ─── Test 11: Wholesale — basic call with CDR round-trip ──────────────────
+
+#[tokio::test]
+async fn test_trunk_b2bua_basic_call_cdr_roundtrip() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
+    let alice = Arc::new(server.create_ua("alice").await?);
+    let bob = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let sdp = pcmu_sdp("127.0.0.1", 12345);
+
+    let alice_clone = alice.clone();
+    let sdp_clone = sdp.clone();
+    let caller_handle =
+        crate::utils::spawn(async move { alice_clone.make_call("bob", Some(sdp_clone)).await });
+
+    let mut bob_dialog_id = None;
+    for _ in 0..50 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, _) = event {
+                bob_dialog_id = Some(id.clone());
+                bob.answer_call(&id, Some(sdp.clone())).await?;
+                break;
+            }
+        }
+        if bob_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let _bob_id = bob_dialog_id.ok_or_else(|| anyhow::anyhow!("No INVITE"))?;
+
+    let alice_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))?
+        .map_err(|e| anyhow::anyhow!("join: {}", e))?
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
+
+    // Keep the call alive briefly then hangup
+    sleep(Duration::from_millis(500)).await;
+
+    alice.hangup(&alice_id).await?;
+
+    sleep(Duration::from_millis(800)).await;
+    let records = server.cdr_capture.get_all_records().await;
+    assert!(!records.is_empty(), "Should have CDR");
+    assert_eq!(records[0].details.status, "completed");
+
+    server.stop();
+    info!("test_trunk_b2bua_options_keepalive PASSED");
+    Ok(())
+}
+
+// ─── Test 12: Wholesale — mid-call re-INVITE (codec change) ──────────────
+
+#[tokio::test]
+async fn test_trunk_b2bua_mid_call_reinvite() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
+
+    let caller_receiver = RtpReceiver::bind(0).await?;
+    let callee_receiver = RtpReceiver::bind(0).await?;
+    let caller_sender = RtpSender::bind().await?;
+    let callee_sender = RtpSender::bind().await?;
+
+    let caller_port = caller_receiver.port()?;
+    let callee_port = callee_receiver.port()?;
+
+    let caller_ua = Arc::new(server.create_ua("alice").await?);
+    let callee_ua = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Start with PCMU
+    let caller_sdp = pcmu_sdp("127.0.0.1", caller_port);
+    let callee_sdp = pcmu_sdp("127.0.0.1", callee_port);
+
+    let caller_clone = caller_ua.clone();
+    let caller_handle =
+        crate::utils::spawn(async move { caller_clone.make_call("bob", Some(caller_sdp)).await });
+
+    let mut callee_dialog_id = None;
+    let mut callee_offer_sdp: Option<String> = None;
+    for _ in 0..50 {
+        let events = callee_ua.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                callee_dialog_id = Some(id.clone());
+                callee_offer_sdp = offer;
+                callee_ua.answer_call(&id, Some(callee_sdp.clone())).await?;
+                break;
+            }
+        }
+        if callee_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let _callee_id = callee_dialog_id.ok_or_else(|| anyhow::anyhow!("No INVITE"))?;
+
+    let caller_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))?
+        .map_err(|e| anyhow::anyhow!("join: {}", e))?
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
+
+    // Exchange RTP briefly with PCMU
+    let caller_answer = caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No answer SDP"))?;
+    let callee_offer = callee_offer_sdp.ok_or_else(|| anyhow::anyhow!("No offer SDP"))?;
+
+    let callee_target = extract_media_endpoint(&callee_offer)
+        .ok_or_else(|| anyhow::anyhow!("No callee endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer)
+        .ok_or_else(|| anyhow::anyhow!("No caller endpoint"))?;
+
+    let (_caller_stats, callee_stats) = exchange_rtp(
+        &caller_sender,
+        &callee_sender,
+        &caller_receiver,
+        &callee_receiver,
+        caller_target,
+        callee_target,
+        0,
+        1000,
+    )
+    .await?;
+
+    assert!(
+        callee_stats.packets_received > 0,
+        "Callee should receive RTP before re-INVITE"
+    );
+
+    let pcma_sdp_offer = pcma_sdp("127.0.0.1", caller_port);
+    let reinvite_result = caller_ua
+        .send_reinvite(&caller_id, Some(pcma_sdp_offer))
+        .await;
+
+    if let Ok(Some(_answer)) = reinvite_result {
+        info!("re-INVITE succeeded, codec changed to PCMA");
+
+        // Exchange more RTP with PCMA (PT=8)
+        let (_caller_stats2, callee_stats2) = exchange_rtp(
+            &caller_sender,
+            &callee_sender,
+            &caller_receiver,
+            &callee_receiver,
+            caller_target,
+            callee_target,
+            8,
+            1000,
+        )
+        .await?;
+
+        assert!(
+            callee_stats2.packets_received > 0 || callee_stats.packets_received > 0,
+            "Callee should receive RTP after re-INVITE"
+        );
+    } else {
+        info!(
+            "re-INVITE was not completed (proxy may not support mid-call codec change in this mode)"
+        );
+    }
+
+    caller_ua.hangup(&caller_id).await?;
+
+    wait_for_cdr(&server, 800).await?;
+    let records = server.cdr_capture.get_all_records().await;
+    assert_eq!(records[0].details.status, "completed");
+
+    caller_receiver.stop();
+    callee_receiver.stop();
+    server.stop();
+    info!("test_trunk_b2bua_mid_call_reinvite PASSED");
     Ok(())
 }

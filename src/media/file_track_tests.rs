@@ -13,14 +13,14 @@ async fn create_test_wav_file(path: &str) -> Result<()> {
 }
 
 async fn create_test_wav_file_with_samples(path: &str, num_samples: usize) -> Result<()> {
-    let spec = hound::WavSpec {
+    let spec = crate::media::wav_reader::WavSpec {
         channels: 1,
         sample_rate: 8000,
         bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        sample_format: crate::media::wav_reader::SampleFormat::Int,
     };
     let mut writer =
-        hound::WavWriter::create(path, spec).map_err(|e| anyhow::anyhow!("WavWriter: {e}"))?;
+        crate::media::wav_reader::WavWriter::create(path, spec).map_err(|e| anyhow::anyhow!("WavWriter: {e}"))?;
     for i in 0..num_samples {
         let sample = ((i as f32 / 8.0).sin() * 1000.0) as i16;
         writer
@@ -49,15 +49,6 @@ async fn test_file_track_creation() {
         track.codec_preference,
         vec![CodecType::PCMU, CodecType::PCMA]
     );
-}
-
-#[tokio::test]
-async fn test_file_track_with_ssrc_compatibility() {
-    let track = FileTrack::new("test".to_string())
-        .with_path("/tmp/test.wav".to_string())
-        .with_ssrc(12345); // Should not panic, just ignore
-
-    assert_eq!(track.id(), "test");
 }
 
 #[tokio::test]
@@ -204,11 +195,7 @@ async fn test_file_track_playback_completion_accurate() {
 
     // The file has 20 ms of audio.  Allow 2 s for completion (the RTP loop
     // fires every 20 ms, so it should finish in ≤ 40 ms in practice).
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(2),
-        end_rx.recv(),
-    )
-    .await;
+    let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), end_rx.recv()).await;
 
     assert!(
         matches!(result, Ok(Some(PlaybackEndReason::Completed))),
@@ -240,11 +227,8 @@ async fn test_file_track_playback_completion() {
 
     // Allow 500 ms — the RTP loop fires within 20 ms and the empty source
     // immediately returns 0, triggering completion.
-    let completion = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        end_rx.recv(),
-    )
-    .await;
+    let completion =
+        tokio::time::timeout(tokio::time::Duration::from_millis(500), end_rx.recv()).await;
 
     assert!(
         matches!(completion, Ok(Some(PlaybackEndReason::Completed))),
@@ -285,11 +269,7 @@ async fn test_file_track_cancel_stops_rtp() {
     track.stop().await;
 
     // on_end must fire promptly after cancellation.
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        end_rx.recv(),
-    )
-    .await;
+    let result = tokio::time::timeout(tokio::time::Duration::from_millis(500), end_rx.recv()).await;
 
     assert!(
         matches!(result, Ok(Some(PlaybackEndReason::Interrupted))),
@@ -677,11 +657,7 @@ async fn test_start_playback_on_none_backward_compatible() {
     // start_playback().
     track.start_playback_on(None).await.unwrap();
 
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(2),
-        end_rx.recv(),
-    )
-    .await;
+    let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), end_rx.recv()).await;
 
     assert!(
         matches!(result, Ok(Some(PlaybackEndReason::Completed))),

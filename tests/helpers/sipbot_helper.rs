@@ -15,12 +15,24 @@
 // ```
 
 use sipbot::{
-    config::{AccountConfig, AnswerConfig, Config as SipBotConfig, RingConfig},
+    audio_quality::AudioQualityConfig,
+    config::{AccountConfig, AnswerConfig, Config as SipBotConfig, HangupConfig, RingConfig},
     sip::SipBot,
     stats::CallStats,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+struct BuildCallee {
+    sip_port: u16,
+    username: String,
+    ring_secs: u64,
+    refer_reject: Option<u16>,
+    record_path: Option<String>,
+    reject_code: Option<u16>,
+    answer: Option<Option<AnswerConfig>>,
+    hangup_after_secs: Option<u64>,
+}
 
 /// A SIP UA backed by `sipbot`.
 pub struct TestUa {
@@ -30,6 +42,9 @@ pub struct TestUa {
     /// Shared call statistics for RTP validation
     #[allow(dead_code)]
     pub stats: Arc<CallStats>,
+    /// WAV file path where sipbot records RX/TX audio (stereo 16kHz, L=RX, R=TX)
+    #[allow(dead_code)]
+    pub record_path: Option<String>,
 }
 
 impl TestUa {
@@ -81,7 +96,7 @@ impl TestUa {
         let stats_clone = stats.clone();
         let ct = cancel_token.clone();
 
-        tokio::spawn(async move {
+        rustpbx::utils::spawn(async move {
             let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
             tokio::select! {
                 _ = ct.cancelled() => {}
@@ -100,11 +115,109 @@ impl TestUa {
             cancel_token,
             domain: format!("{}:{}", domain, sip_port),
             stats,
+            record_path: None,
         }
+    }
+
+    /// Create a callee that immediately rejects with the given SIP code (e.g. 486 Busy, 480 Temporarily Unavailable).
+    pub async fn callee_reject(sip_port: u16, username: &str, reject_code: u16) -> Self {
+        Self::build_callee(BuildCallee {
+            sip_port, username: username.to_string(), ring_secs: 0, refer_reject: None, record_path: None,
+            reject_code: Some(reject_code), answer: None, hangup_after_secs: None,
+        }).await
+    }
+
+    pub async fn callee_no_answer(sip_port: u16, username: &str, ring_secs: u64) -> Self {
+        Self::build_callee(BuildCallee {
+            sip_port, username: username.to_string(), ring_secs, refer_reject: None, record_path: None,
+            reject_code: None, answer: Some(None), hangup_after_secs: None,
+        }).await
+    }
+
+    pub async fn callee_answer_then_hangup(sip_port: u16, ring_secs: u64, username: &str, after_secs: u64) -> Self {
+        Self::build_callee(BuildCallee {
+            sip_port, username: username.to_string(), ring_secs, refer_reject: None, record_path: None,
+            reject_code: None, answer: Some(Some(AnswerConfig::Echo)), hangup_after_secs: Some(after_secs),
+        }).await
+    }
+
+    async fn build_callee(opts: BuildCallee) -> Self {
+        let cancel_token = CancellationToken::new();
+        let domain = format!("127.0.0.1:{}", opts.sip_port);
+
+        let answer_val = match opts.answer {
+            Some(a) => a,
+            None => Some(AnswerConfig::Echo),
+        };
+
+        let account = AccountConfig {
+            username: opts.username,
+            domain: domain.clone(),
+            password: None,
+            register: Some(false),
+            ring: if opts.ring_secs > 0 {
+                Some(RingConfig { duration_secs: opts.ring_secs, ringback: None, local: None })
+            } else {
+                None
+            },
+            answer: answer_val,
+            refer_reject: opts.refer_reject,
+            record: opts.record_path,
+            reject_prob: opts.reject_code.map(|_| 100),
+            hangup: opts.reject_code.map(|code| HangupConfig { code, after_secs: None }).or_else(|| opts.hangup_after_secs.map(|after| HangupConfig { code: 200, after_secs: Some(after) })),
+            audio_quality: Some(AudioQualityConfig { enabled: true, ..Default::default() }),
+            ..Default::default()
+        };
+
+        let global_config = SipBotConfig {
+            addr: Some(format!("127.0.0.1:{}", opts.sip_port)),
+            external_ip: None,
+            recorders: None,
+            accounts: vec![account.clone()],
+        };
+
+        let stats = Arc::new(CallStats::new());
+        let stats_clone = stats.clone();
+        let ct = cancel_token.clone();
+
+        rustpbx::utils::spawn(async move {
+            let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
+            tokio::select! {
+                _ = ct.cancelled() => {}
+                res = bot.run_wait() => {
+                    if let Err(e) = res { tracing::error!("sipbot run_wait error: {e:?}"); }
+                }
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        Self { cancel_token, domain, stats, record_path: None }
     }
 
     /// Create and start an outbound caller UA that will place calls to `target_uri`.
     pub async fn caller_with_target(sip_port: u16, username: &str, target_uri: String) -> Self {
+        Self::caller_with_options(sip_port, username, target_uri, None).await
+    }
+
+    /// Create and start an outbound caller UA that sends DTMF after answer.
+    /// `dtmf_flows` format: "1s:2,1.5s:#" (delay:digit pairs)
+    pub async fn caller_with_dtmf(
+        sip_port: u16,
+        username: &str,
+        target_uri: String,
+        dtmf_flows: &str,
+    ) -> Self {
+        Self::caller_with_options(sip_port, username, target_uri, Some(dtmf_flows.to_string()))
+            .await
+    }
+
+    async fn caller_with_options(
+        sip_port: u16,
+        username: &str,
+        target_uri: String,
+        dtmf_flows: Option<String>,
+    ) -> Self {
         let cancel_token = CancellationToken::new();
         let domain = format!("127.0.0.1:{}", sip_port);
 
@@ -114,6 +227,11 @@ impl TestUa {
             password: None,
             register: Some(false),
             target: Some(target_uri),
+            dtmf_flows,
+            audio_quality: Some(AudioQualityConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -128,7 +246,7 @@ impl TestUa {
         let stats_clone = stats.clone();
         let ct = cancel_token.clone();
 
-        tokio::spawn(async move {
+        rustpbx::utils::spawn(async move {
             let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
             tokio::select! {
                 _ = ct.cancelled() => {}
@@ -146,10 +264,10 @@ impl TestUa {
             cancel_token,
             domain,
             stats,
+            record_path: None,
         }
     }
 
-    /// Create and start a callee UA with REFER rejection (for 3PCC fallback testing).
     #[allow(dead_code)]
     pub async fn callee_with_refer_reject(
         sip_port: u16,
@@ -166,6 +284,28 @@ impl TestUa {
         username: &str,
         refer_reject: Option<u16>,
     ) -> Self {
+        Self::callee_with_options_and_record(sip_port, ring_secs, username, refer_reject, None)
+            .await
+    }
+
+    /// Create and start a callee UA with optional WAV recording.
+    pub async fn callee_with_record(
+        sip_port: u16,
+        ring_secs: u64,
+        username: &str,
+        record_path: String,
+    ) -> Self {
+        Self::callee_with_options_and_record(sip_port, ring_secs, username, None, Some(record_path))
+            .await
+    }
+
+    async fn callee_with_options_and_record(
+        sip_port: u16,
+        ring_secs: u64,
+        username: &str,
+        refer_reject: Option<u16>,
+        record_path: Option<String>,
+    ) -> Self {
         let cancel_token = CancellationToken::new();
         let domain = format!("127.0.0.1:{}", sip_port);
 
@@ -173,7 +313,7 @@ impl TestUa {
             username: username.to_string(),
             domain: domain.clone(),
             password: None,
-            register: Some(false), // no registration needed in test
+            register: Some(false),
             ring: Some(RingConfig {
                 duration_secs: ring_secs,
                 ringback: None,
@@ -181,6 +321,11 @@ impl TestUa {
             }),
             answer: Some(AnswerConfig::Echo),
             refer_reject,
+            record: record_path.clone(),
+            audio_quality: Some(AudioQualityConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -195,7 +340,7 @@ impl TestUa {
         let stats_clone = stats.clone();
         let ct = cancel_token.clone();
 
-        tokio::spawn(async move {
+        rustpbx::utils::spawn(async move {
             let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
             tokio::select! {
                 _ = ct.cancelled() => {}
@@ -207,13 +352,13 @@ impl TestUa {
             }
         });
 
-        // Give the UA a moment to bind its UDP socket before we start calling it.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         Self {
             cancel_token,
             domain,
             stats,
+            record_path,
         }
     }
 
@@ -251,6 +396,77 @@ impl TestUa {
     pub fn has_rtp_tx(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.stats.tx_packets.load(Ordering::Relaxed) > 0
+    }
+
+    /// Get the number of received DTMF events
+    #[allow(dead_code)]
+    pub fn rx_dtmf_count(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.stats.rx_dtmf_events.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of transmitted DTMF events
+    #[allow(dead_code)]
+    pub fn tx_dtmf_count(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.stats.tx_dtmf_events.load(Ordering::Relaxed)
+    }
+
+    /// Get audio quality summary for assertions
+    #[allow(dead_code)]
+    pub fn audio_quality_summary(&self) -> AudioQualitySummary {
+        use std::sync::atomic::Ordering;
+        AudioQualitySummary {
+            total_frames: self
+                .stats
+                .audio_quality_total_frames
+                .load(Ordering::Relaxed),
+            silence_frames: self
+                .stats
+                .audio_quality_silence_frames
+                .load(Ordering::Relaxed),
+            clipping_frames: self
+                .stats
+                .audio_quality_clipping_frames
+                .load(Ordering::Relaxed),
+            shrill_count: self
+                .stats
+                .audio_quality_shrill_count
+                .load(Ordering::Relaxed),
+            muffled_count: self
+                .stats
+                .audio_quality_muffled_count
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AudioQualitySummary {
+    pub total_frames: u64,
+    pub silence_frames: u64,
+    pub clipping_frames: u64,
+    pub shrill_count: u64,
+    pub muffled_count: u64,
+}
+
+impl AudioQualitySummary {
+    pub fn silence_ratio(&self) -> f64 {
+        if self.total_frames == 0 {
+            return 1.0;
+        }
+        self.silence_frames as f64 / self.total_frames as f64
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.total_frames > 0 && self.silence_ratio() < 0.95
+    }
+
+    pub fn clipping_ratio(&self) -> f64 {
+        if self.total_frames == 0 {
+            return 0.0;
+        }
+        self.clipping_frames as f64 / self.total_frames as f64
     }
 }
 

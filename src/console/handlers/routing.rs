@@ -1,7 +1,3 @@
-use crate::addons::queue::models::{
-    Column as QueueColumn, Entity as QueueEntity, Model as QueueModel,
-};
-use crate::addons::queue::services::utils as queue_utils;
 use crate::console::handlers::{bad_request, forms};
 use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::models::{
@@ -17,7 +13,7 @@ use axum::{
     extract::{Json, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
@@ -55,6 +51,21 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route("/routing/{id}/data", get(route_detail_data))
 }
 
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route(
+            "/routing",
+            post(query_routing).put(create_routing),
+        )
+        .route(
+            "/routing/{id}",
+            patch(update_routing).delete(delete_routing),
+        )
+        .route("/routing/{id}/clone", post(clone_routing))
+        .route("/routing/{id}/toggle", post(toggle_routing))
+        .route("/routing/{id}/data", get(route_detail_data))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RouteDocument {
@@ -78,7 +89,7 @@ pub(crate) struct RouteDocument {
     rewrite: JsonMap<String, Value>,
     #[serde(default)]
     action: RouteActionDocument,
-    #[serde(default)]
+    #[serde(rename = "source_trunk", default)]
     source_trunk: Option<String>,
     #[serde(default)]
     notes: Vec<String>,
@@ -142,7 +153,7 @@ pub(crate) struct QueryRoutingFilters {
     #[serde(default)]
     q: Option<String>,
     #[serde(default)]
-    direction: Option<String>,
+    source_context: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -367,8 +378,7 @@ impl RouteDocument {
     }
 
     fn apply_trunk_context(&mut self, model: &RoutingModel, trunks: &HashMap<i64, SipTrunkModel>) {
-        if self.source_trunk.is_none()
-            && let Some(source_id) = model.source_trunk_id
+        if let Some(source_id) = model.source_trunk_id
             && let Some(trunk) = trunks.get(&source_id)
         {
             self.source_trunk = Some(trunk.name.clone());
@@ -559,11 +569,23 @@ async fn load_trunks(db: &DatabaseConnection) -> Result<Vec<SipTrunkModel>, DbEr
         .await
 }
 
-async fn load_queues(db: &DatabaseConnection) -> Result<Vec<QueueModel>, DbErr> {
-    QueueEntity::find()
-        .order_by_asc(QueueColumn::Name)
-        .all(db)
-        .await
+fn load_catalogs(state: &ConsoleState) -> crate::console::catalog::ForwardingCatalog {
+    match crate::console::catalog::load_proxy_config(state.app_state().as_ref()) {
+        Some(proxy_config) => {
+            let catalog =
+                crate::console::catalog::build_forwarding_catalog(&proxy_config);
+            tracing::info!(
+                queue_count = catalog.queues.len(),
+                ivr_count = catalog.ivr_projects.len(),
+                "load_catalogs: scanned file catalogs for routing form"
+            );
+            catalog
+        }
+        None => {
+            tracing::warn!("load_catalogs: app_state not available, returning empty catalogs");
+            crate::console::catalog::ForwardingCatalog::empty()
+        }
+    }
 }
 
 fn build_trunk_options(trunks: &[SipTrunkModel]) -> Vec<Value> {
@@ -585,39 +607,24 @@ fn build_trunk_options(trunks: &[SipTrunkModel]) -> Vec<Value> {
         .collect()
 }
 
-fn build_queue_options(queues: &[QueueModel]) -> Vec<Value> {
-    queues
-        .iter()
-        .filter_map(|queue| match queue_utils::convert_queue_model(queue.clone()) {
-            Ok(entry) => Some(json!({
-                "id": queue.id,
-                "queue_id": format!("db-{}", queue.id),
-                "name": entry.name,
-                "description": entry.description,
-                "is_active": queue.is_active,
-                "updated_at": queue.updated_at.to_rfc3339(),
-                "file_name": entry.file_name(),
-            })),
-            Err(err) => {
-                warn!(queue = %queue.name, error = %err, "failed to convert queue for routing options");
-                None
-            }
-        })
-        .collect()
-}
-
 fn build_route_console_payload(
     state: &ConsoleState,
     doc: &RouteDocument,
     model: &RoutingModel,
 ) -> Value {
     let status = if doc.disabled { "paused" } else { "active" };
+    let source_context = if doc.source_trunk.is_some() || model.source_trunk_id.is_some() {
+        "from_trunk"
+    } else {
+        "any"
+    };
     json!({
         "id": model.id,
         "name": doc.name,
         "description": doc.description.clone().unwrap_or_default(),
         "owner": doc.owner.clone().unwrap_or_default(),
-            "direction": doc.direction,
+        "source_context": source_context,
+        "direction": doc.direction,
         "priority": doc.priority,
         "disabled": doc.disabled,
         "match": doc.matchers.clone(),
@@ -703,8 +710,7 @@ fn render_route_form(
     mode: &str,
     doc: &RouteDocument,
     trunks: &[SipTrunkModel],
-    queues: &[QueueModel],
-    ivr_options: Value,
+    forwarding_catalog: &crate::console::catalog::ForwardingCatalog,
     error_message: Option<String>,
     form_action: String,
     headers: &HeaderMap,
@@ -712,7 +718,6 @@ fn render_route_form(
 ) -> Response {
     let route_value = serde_json::to_value(doc).unwrap_or(Value::Null);
     let trunk_options = Value::Array(build_trunk_options(trunks));
-    let queue_options = Value::Array(build_queue_options(queues));
     let selection_algorithms = selection_algorithms_value();
     let direction_options = direction_options_value();
     let status_options = status_options_value();
@@ -746,8 +751,7 @@ fn render_route_form(
             "submit_label": submit_label,
             "route_data": route_value,
             "trunk_options": trunk_options,
-            "queue_options": queue_options,
-            "ivr_options": ivr_options,
+            "forwarding_catalog": forwarding_catalog,
             "selection_algorithms": selection_algorithms,
             "direction_options": direction_options,
             "status_options": status_options,
@@ -825,6 +829,8 @@ pub async fn page_routing(
         .ami_path
         .clone()
         .unwrap_or_else(|| "/ami/v1".to_string());
+    let catalog = load_catalogs(state.as_ref());
+
     state.render_with_headers(
         "console/routing.html",
         json!({
@@ -835,6 +841,7 @@ pub async fn page_routing(
                 "direction_options": direction_options_value(),
                 "status_options": status_options_value(),
             },
+            "forwarding_catalog": catalog,
             "create_url": state.url_for("/routing/new"),
             "current_user": current_user,
             "has_file_routes": has_file_routes,
@@ -866,14 +873,15 @@ pub(crate) async fn query_routing(
             }
         }
 
-        if let Some(ref raw_direction) = filters.direction {
-            let direction = match raw_direction.trim().to_ascii_lowercase().as_str() {
-                "inbound" => Some(RoutingDirection::Inbound),
-                "outbound" => Some(RoutingDirection::Outbound),
-                _ => None,
-            };
-            if let Some(direction) = direction {
-                selector = selector.filter(RoutingColumn::Direction.eq(direction));
+        if let Some(ref raw_source) = filters.source_context {
+            match raw_source.trim().to_ascii_lowercase().as_str() {
+                "from_trunk" => {
+                    selector = selector.filter(RoutingColumn::SourceTrunkId.is_not_null());
+                }
+                "internal" | "any" => {
+                    selector = selector.filter(RoutingColumn::SourceTrunkId.is_null());
+                }
+                _ => {}
             }
         }
 
@@ -959,12 +967,17 @@ pub(crate) async fn query_routing(
                 if let ConfigOrigin::File(ref path) = route.origin {
                     let action_payload =
                         serde_json::to_value(&route.action).unwrap_or_else(|_| json!({}));
+                    let source_context = if !route.source_trunks.is_empty() {
+                        "from_trunk"
+                    } else {
+                        "any"
+                    };
                     Some(json!({
                         "id": null,
                         "name": route.name,
                         "description": route.description,
                         "priority": route.priority,
-                        "direction": route.direction,
+                        "source_context": source_context,
                         "disabled": route.disabled.unwrap_or(false),
                         "source": "file",
                         "source_file": path,
@@ -1024,19 +1037,8 @@ pub async fn page_routing_create(
                 .into_response();
         }
     };
-    let queues = match load_queues(db).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!("failed to load queues for route create page: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load routing form: {}", err),
-            )
-                .into_response();
-        }
-    };
 
-    let ivr_options = Value::Array(vec![]);
+    let catalog = load_catalogs(state.as_ref());
     let current_user = state.build_current_user_ctx(&user).await;
 
     let doc = RouteDocument::default();
@@ -1045,10 +1047,9 @@ pub async fn page_routing_create(
         "create",
         &doc,
         &trunks,
-        &queues,
-        ivr_options,
+        &catalog,
         None,
-        state.url_for("/routing"),
+        state.api_url_for("/routing"),
         &headers,
         &current_user,
     )
@@ -1092,19 +1093,7 @@ pub async fn page_routing_edit(
         .map(|trunk| (trunk.id, trunk))
         .collect();
 
-    let queues = match load_queues(db).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!("failed to load queues for route edit page: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load routing form: {}", err),
-            )
-                .into_response();
-        }
-    };
-
-    let ivr_options = Value::Array(vec![]);
+    let catalog = load_catalogs(state.as_ref());
     let current_user = state.build_current_user_ctx(&user).await;
 
     let mut doc = RouteDocument::from_model(&model);
@@ -1115,10 +1104,9 @@ pub async fn page_routing_edit(
         "edit",
         &doc,
         &trunks,
-        &queues,
-        ivr_options,
+        &catalog,
         None,
-        state.url_for(&format!("/routing/{}", id)),
+        state.api_url_for(&format!("/routing/{}", id)),
         &headers,
         &current_user,
     )
@@ -1161,19 +1149,7 @@ pub async fn route_detail_data(
         }
     };
 
-    let queues = match load_queues(db).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!("failed to load queues for route detail {}: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
-            )
-                .into_response();
-        }
-    };
-
-    let ivr_options = Value::Array(vec![]);
+    let catalog = load_catalogs(state.as_ref());
 
     let trunk_map: HashMap<i64, SipTrunkModel> =
         trunks.iter().cloned().map(|t| (t.id, t)).collect();
@@ -1183,8 +1159,7 @@ pub async fn route_detail_data(
     Json(json!({
         "route": doc,
         "trunk_options": build_trunk_options(&trunks),
-        "queue_options": build_queue_options(&queues),
-        "ivr_options": ivr_options,
+        "forwarding_catalog": catalog,
         "selection_algorithms": selection_algorithms(),
         "direction_options": direction_options_value(),
         "status_options": status_options_value(),
@@ -1258,14 +1233,7 @@ pub async fn clone_routing(
     };
     let trunk_lookup = build_trunk_name_lookup(&trunks);
 
-    if let Err(err) = load_queues(db).await {
-        warn!("failed to load queues for route clone {}: {}", id, err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
-        )
-            .into_response();
-    }
+    let _catalog = load_catalogs(state.as_ref());
 
     doc.source_trunk = sanitize_optional_string(doc.source_trunk.take());
     if let Some(ref name) = doc.source_trunk
@@ -1716,9 +1684,7 @@ mod tests {
             .await
             .expect("connect sqlite memory");
         Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(
-            Arc::new(crate::callrecord::DefaultCallRecordFormatter::default()),
-            db,
+        ConsoleState::initialize(db,
             ConsoleConfig::default(),
         )
         .await
@@ -1776,35 +1742,98 @@ mod tests {
     }
 
     #[test]
-    fn build_queue_options_includes_queue_id() {
-        use crate::addons::queue::models::Model as QueueModel;
-        let now = Utc::now();
-        let queue = QueueModel {
-            id: 42,
-            name: "Customer calls back".to_string(),
-            description: Some("Main support queue".to_string()),
-            metadata: None,
-            // spec must be a valid RouteQueueConfig JSON (accept_immediately is required)
-            spec: serde_json::json!({ "accept_immediately": false }),
-            is_active: true,
-            created_at: now,
-            updated_at: now,
-            last_exported_at: None,
+    fn forwarding_catalog_queue_has_reference() {
+        use crate::console::catalog::{ForwardingCatalog, ForwardingQueue};
+        let catalog = ForwardingCatalog {
+            queues: vec![ForwardingQueue {
+                reference: "db-42".to_string(),
+                name: "Customer calls back".to_string(),
+                description: Some("Main support queue".to_string()),
+            }],
+            ivr_projects: vec![],
+        };
+        assert_eq!(catalog.queues.len(), 1);
+        assert_eq!(catalog.queues[0].reference, "db-42");
+        assert_eq!(catalog.queues[0].name, "Customer calls back");
+    }
+
+    #[test]
+    fn route_document_serialization_preserves_source_trunk_and_trunks() {
+        let doc = RouteDocument {
+            id: Some(1),
+            name: "test-route".into(),
+            description: Some("desc".into()),
+            owner: Some("admin".into()),
+            direction: RoutingDirection::Outbound,
+            priority: 10,
+            disabled: false,
+            matchers: JsonMap::new(),
+            rewrite: JsonMap::new(),
+            action: RouteActionDocument {
+                select: RoutingSelectionStrategy::RoundRobin,
+                hash_key: None,
+                trunks: vec![
+                    RouteTrunkDocument { name: "trunk-b".into(), weight: 100 },
+                    RouteTrunkDocument { name: "trunk-c".into(), weight: 50 },
+                ],
+                target_type: RouteTargetKind::SipTrunk,
+                queue_file: None,
+                voicemail_extension: None,
+                ivr_file: None,
+            },
+            source_trunk: Some("trunk-a".into()),
+            notes: vec![],
         };
 
-        let options = build_queue_options(&[queue]);
-        assert_eq!(
-            options.len(),
-            1,
-            "should build one option from a valid queue model"
-        );
-        let opt = &options[0];
-        assert_eq!(opt["id"], 42);
-        assert_eq!(
-            opt["queue_id"].as_str().unwrap(),
-            "db-42",
-            "queue_id must be the stable db-<id> reference (issue #176)"
-        );
-        assert_eq!(opt["name"].as_str().unwrap(), "Customer calls back");
+        let value = serde_json::to_value(&doc).unwrap();
+        let obj = value.as_object().expect("value should be object");
+
+        let source_trunk_val = obj.get("source_trunk").expect("source_trunk key should exist");
+        assert_eq!(source_trunk_val, &Value::String("trunk-a".into()));
+
+        let action = obj.get("action").expect("action key should exist").as_object().expect("action should be object");
+        let trunks = action.get("trunks").expect("action.trunks key should exist").as_array().expect("trunks should be array");
+        assert_eq!(trunks.len(), 2);
+        assert_eq!(trunks[0].get("name").unwrap().as_str().unwrap(), "trunk-b");
+        assert_eq!(trunks[0].get("weight").unwrap().as_i64().unwrap(), 100);
+        assert_eq!(trunks[1].get("name").unwrap().as_str().unwrap(), "trunk-c");
+        assert_eq!(trunks[1].get("weight").unwrap().as_i64().unwrap(), 50);
+        assert_eq!(action.get("target_type").unwrap().as_str().unwrap(), "sip_trunk");
+    }
+
+    #[test]
+    fn route_document_roundtrip_through_metadata() {
+        let doc = RouteDocument {
+            id: Some(1),
+            name: "test-route".into(),
+            description: Some("desc".into()),
+            owner: Some("admin".into()),
+            direction: RoutingDirection::Outbound,
+            priority: 10,
+            disabled: false,
+            matchers: JsonMap::new(),
+            rewrite: JsonMap::new(),
+            action: RouteActionDocument {
+                select: RoutingSelectionStrategy::RoundRobin,
+                hash_key: None,
+                trunks: vec![
+                    RouteTrunkDocument { name: "trunk-b".into(), weight: 100 },
+                ],
+                target_type: RouteTargetKind::SipTrunk,
+                queue_file: None,
+                voicemail_extension: None,
+                ivr_file: None,
+            },
+            source_trunk: Some("trunk-a".into()),
+            notes: vec![],
+        };
+
+        let metadata = doc.metadata_value();
+        let doc2: RouteDocument = serde_json::from_value(metadata).unwrap();
+        assert_eq!(doc2.source_trunk, Some("trunk-a".into()));
+        assert_eq!(doc2.action.trunks.len(), 1);
+        assert_eq!(doc2.action.trunks[0].name, "trunk-b");
+        assert_eq!(doc2.action.trunks[0].weight, 100);
+        assert_eq!(doc2.action.target_type, RouteTargetKind::SipTrunk);
     }
 }

@@ -257,6 +257,21 @@ pub enum RwiCommandPayload {
     ConferenceDestroy {
         conf_id: String,
     },
+    ConferenceEnd {
+        conf_id: String,
+        host_call_id: String,
+    },
+    ConferenceKick {
+        conf_id: String,
+        call_id: String,
+    },
+    ConferenceMuteAll {
+        conf_id: String,
+    },
+    ConferenceInfo {
+        conf_id: String,
+    },
+    ConferenceList,
     ConferenceMerge {
         conf_id: String,
         call_id: String,
@@ -499,7 +514,7 @@ pub struct QueueEnqueueRequest {
     pub max_wait_secs: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ConferenceCreateRequest {
     #[serde(default, alias = "conference_id")]
     pub conf_id: String,
@@ -509,6 +524,8 @@ pub struct ConferenceCreateRequest {
     #[serde(default)]
     pub record: bool,
     pub mcu_uri: Option<String>,
+    pub host_call_id: Option<String>,
+    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -801,6 +818,12 @@ pub enum RwiRequestPayload {
     ConferenceUnmute(ConferenceUnmuteRequest),
     #[serde(rename = "conference.destroy")]
     ConferenceDestroy(ConferenceDestroyRequest),
+    #[serde(rename = "conference.end")]
+    ConferenceEnd {
+        #[serde(alias = "conference_id")]
+        conf_id: Option<String>,
+        host_call_id: Option<String>,
+    },
     #[serde(rename = "conference.merge")]
     ConferenceMerge(ConferenceMergeRequest),
     #[serde(rename = "conference.seat_replace")]
@@ -1143,6 +1166,12 @@ impl From<RwiRequest> for RwiCommandPayload {
             RwiRequestPayload::ConferenceDestroy(r) => RwiCommandPayload::ConferenceDestroy {
                 conf_id: r.conf_id.unwrap_or_default(),
             },
+            RwiRequestPayload::ConferenceEnd { conf_id, host_call_id } => {
+                RwiCommandPayload::ConferenceEnd {
+                    conf_id: conf_id.unwrap_or_default(),
+                    host_call_id: host_call_id.unwrap_or_default(),
+                }
+            }
             RwiRequestPayload::ConferenceMerge(r) => RwiCommandPayload::ConferenceMerge {
                 conf_id: r.conf_id.unwrap_or_default(),
                 call_id: r.call_id.unwrap_or_default(),

@@ -47,7 +47,16 @@ pub fn ami_router(app_state: AppState) -> Router<AppState> {
     let r = r
         .route("/cluster/ping", post(cluster_ping_handler))
         .route("/cluster/reload_config", get(cluster_reload_config_handler))
-        .route("/cluster/reload_sync", post(cluster_reload_sync_handler));
+        .route("/cluster/reload_sync", post(cluster_reload_sync_handler))
+        .route(
+            "/cluster/dispatch_command",
+            post(cluster_dispatch_command_handler),
+        )
+        .route(
+            "/cluster/show_session/{session_id}",
+            get(cluster_show_session_handler),
+        )
+        .route("/cluster/list_calls", get(cluster_list_calls_handler));
 
     let r = r.layer(middleware::from_fn_with_state(
         app_state.clone(),
@@ -904,17 +913,21 @@ async fn cluster_ping_handler(State(state): State<AppState>) -> Response {
     for peer in &peers {
         let url = format!("http://{}:{}{}/health", peer.addr, peer.ami_port, ami_path);
         let start = Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        match client.get(&url).send().await {
+        let opts = crate::http_util::HttpFetchOptions::new()
+            .with_timeout(std::time::Duration::from_secs(5));
+        match crate::http_util::execute_request(
+            reqwest::Client::new().get(&url),
+            &opts.headers,
+            opts.timeout,
+        )
+        .await
+        {
             Ok(resp) => {
                 let latency = start.elapsed().as_millis() as u64;
                 let mut entry = serde_json::json!({
                     "peer": format!("{}:{}", peer.addr, peer.sip_port),
                     "ami_addr": format!("{}:{}", peer.addr, peer.ami_port),
-                    "reachable": resp.status().is_success(),
+                    "reachable": true,
                     "latency_ms": latency,
                 });
 
@@ -974,7 +987,7 @@ async fn cluster_reload_config_handler(
     let payload = query;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
 
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         let send_event = |event_type: &'static str, data: serde_json::Value| {
             let tx = tx.clone();
             async move {
@@ -1041,6 +1054,9 @@ async fn cluster_reload_config_handler(
             .clone()
             .unwrap_or_else(|| "/ami/v1".to_string());
 
+        let mut peer_results_summary: Vec<serde_json::Value> = Vec::new();
+        let mut any_error = false;
+
         for peer in &peers {
             let peer_label = format!("{}:{}", peer.addr, peer.ami_port);
             send_event(
@@ -1053,27 +1069,37 @@ async fn cluster_reload_config_handler(
                 "http://{}:{}{}/cluster/reload_sync",
                 peer.addr, peer.ami_port, ami_path
             );
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default();
+            let opts = crate::http_util::HttpFetchOptions::new()
+                .with_timeout(std::time::Duration::from_secs(120));
 
-            match client.post(&url).json(&payload).send().await {
-                Ok(resp) => match resp.json::<serde_json::Value>().await {
-                    Ok(peer_results) => {
-                        send_event("progress", serde_json::json!({"type": "node_complete", "node": &peer_label, "result": peer_results})).await;
+            let start = std::time::Instant::now();
+            let req = reqwest::Client::new().post(&url).json(&payload);
+            match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+                Ok(resp) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(peer_results) => {
+                            send_event("progress", serde_json::json!({"type": "node_complete", "node": &peer_label, "elapsed_ms": elapsed_ms, "result": peer_results})).await;
+                            peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "ok", "elapsed_ms": elapsed_ms}));
+                        }
+                        Err(e) => {
+                            send_event("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "elapsed_ms": elapsed_ms, "error": format!("Invalid response: {}", e)})).await;
+                            any_error = true;
+                            peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "error", "elapsed_ms": elapsed_ms, "error": format!("Invalid response: {}", e)}));
+                        }
                     }
-                    Err(e) => {
-                        send_event("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Invalid response: {}", e)})).await;
-                    }
-                },
+                }
                 Err(e) => {
-                    send_event("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Connection failed: {}", e)})).await;
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    send_event("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "elapsed_ms": elapsed_ms, "error": format!("Connection failed: {}", e)})).await;
+                    any_error = true;
+                    peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "error", "elapsed_ms": elapsed_ms, "error": format!("Connection failed: {}", e)}));
                 }
             }
         }
 
-        send_event("complete", serde_json::json!({"type": "complete"})).await;
+        let overall_status = if any_error { "error" } else { "ok" };
+        send_event("complete", serde_json::json!({"type": "complete", "overall_status": overall_status, "peers": peer_results_summary})).await;
     });
 
     let stream = stream::unfold(rx, |mut rx| async move {
@@ -1187,6 +1213,130 @@ async fn reload_routes_on_node(state: &AppState, _node: &str) -> serde_json::Val
             serde_json::json!({ "addon": "routes", "status": "error", "message": e.to_string() })
         }
     }
+}
+
+#[cfg(feature = "commerce")]
+async fn cluster_dispatch_command_handler(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let session_id = match req.get("session_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": "Missing session_id" })),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: crate::console::handlers::call_control::CallCommandPayload =
+        match serde_json::from_value(
+            req.get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": format!("Invalid payload: {}", e) })),
+                )
+                    .into_response();
+            }
+        };
+
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    if registry.get_handle(&session_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Call not found" })),
+        )
+            .into_response();
+    }
+
+    use crate::call::runtime::dispatch_console_command;
+
+    match dispatch_console_command(&registry, &session_id, payload) {
+        Ok(result) => {
+            if result.success {
+                let mut resp = serde_json::json!({ "message": "Command dispatched" });
+                if let Some(data) = result.data {
+                    resp.as_object_mut()
+                        .unwrap()
+                        .insert("data".into(), data);
+                }
+                Json(resp).into_response()
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": result.message })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "message": format!("Failed to deliver command: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "commerce")]
+async fn cluster_show_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+
+    let Some(handle) = registry.get_handle(&session_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Call not found" })),
+        )
+            .into_response();
+    };
+
+    Json(serde_json::json!({
+        "data": {
+            "meta": registry.get(&session_id),
+            "state": handle.snapshot(),
+        }
+    }))
+    .into_response()
+}
+
+#[cfg(feature = "commerce")]
+#[derive(Deserialize)]
+struct ClusterListCallsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[cfg(feature = "commerce")]
+async fn cluster_list_calls_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ClusterListCallsQuery>,
+) -> Response {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let entries = registry.list_recent(limit);
+
+    let payload: Vec<_> = entries
+        .into_iter()
+        .map(|entry| {
+            let sid = entry.session_id.clone();
+            let snapshot: Option<_> = registry.get_handle(&sid).and_then(|h| h.snapshot());
+            serde_json::json!({
+                "meta": entry,
+                "state": snapshot,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "data": payload })).into_response()
 }
 
 #[cfg(test)]

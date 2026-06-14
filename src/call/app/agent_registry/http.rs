@@ -25,6 +25,7 @@ pub struct HttpRegistry {
     /// Round-robin counter
     rr_counter: RwLock<u64>,
     /// Event callbacks for state changes
+    #[allow(dead_code)]
     event_handlers: RwLock<Vec<super::AgentEventHandler>>,
 
     /// Cache TTL
@@ -49,20 +50,14 @@ impl HttpRegistry {
         self
     }
 
-    /// Build HTTP headers with API key if present
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
+    /// Build headers as a `HashMap<String, String>` for `http_util`.
+    fn headers_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        map.insert("Content-Type".to_string(), "application/json".to_string());
         if let Some(ref key) = self.api_key {
-            headers.insert(
-                "X-API-Key",
-                reqwest::header::HeaderValue::from_str(key).unwrap(),
-            );
+            map.insert("X-API-Key".to_string(), key.clone());
         }
-        headers
+        map
     }
 
     /// Check if cache entry is still valid
@@ -74,22 +69,20 @@ impl HttpRegistry {
     async fn fetch_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
         let url = format!("{}/agents/{}", self.base_url, agent_id);
 
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.build_headers())
-            .send()
-            .await?;
+        let opts = crate::http_util::HttpFetchOptions::new()
+            .with_headers(self.headers_map());
+        let req = self.client.get(&url);
+        let resp =
+            match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+                Ok(r) => r,
+                Err(e) if e.to_string().contains("404") => return Ok(None),
+                Err(e) => return Err(e),
+            };
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {}", response.status());
-        }
-
-        let data: serde_json::Value = response.json().await?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {}", e))?;
 
         // Parse agent record from JSON
         let record = Self::parse_agent_from_json(&data)?;
@@ -109,17 +102,8 @@ impl HttpRegistry {
     ) -> anyhow::Result<()> {
         let url = format!("{}/agents/{}", self.base_url, agent_id);
 
-        let response = self
-            .client
-            .patch(&url)
-            .headers(self.build_headers())
-            .json(&updates)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {}", response.status());
-        }
+        let req = self.client.patch(&url).json(&updates);
+        crate::http_util::execute_request(req, &self.headers_map(), None).await?;
 
         Ok(())
     }
@@ -186,17 +170,8 @@ impl AgentRegistry for HttpRegistry {
             "presence": "available",
         });
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.build_headers())
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {}", response.status());
-        }
+        let req = self.client.post(&url).json(&payload);
+        crate::http_util::execute_request(req, &self.headers_map(), None).await?;
 
         info!(agent_id = %agent_id, "Agent registered via HTTP API");
         Ok(())
@@ -205,16 +180,8 @@ impl AgentRegistry for HttpRegistry {
     async fn unregister(&self, agent_id: &str) -> anyhow::Result<()> {
         let url = format!("{}/agents/{}", self.base_url, agent_id);
 
-        let response = self
-            .client
-            .delete(&url)
-            .headers(self.build_headers())
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {}", response.status());
-        }
+        let req = self.client.delete(&url);
+        crate::http_util::execute_request(req, &self.headers_map(), None).await?;
 
         // Remove from cache
         let mut cache = self.cache.write().await;
@@ -247,27 +214,19 @@ impl AgentRegistry for HttpRegistry {
     async fn list_agents(&self) -> Vec<AgentRecord> {
         let url = format!("{}/agents", self.base_url);
 
-        match self
-            .client
-            .get(&url)
-            .headers(self.build_headers())
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Vec<serde_json::Value>>().await {
-                    Ok(data) => data
-                        .iter()
-                        .filter_map(|v| Self::parse_agent_from_json(v).ok())
-                        .collect(),
-                    Err(e) => {
-                        error!(error = %e, "Failed to parse agents list");
-                        Vec::new()
-                    }
+        let req = self.client.get(&url);
+        match crate::http_util::execute_request(req, &self.headers_map(), None).await {
+            Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
+                Ok(data) => data
+                    .iter()
+                    .filter_map(|v| Self::parse_agent_from_json(v).ok())
+                    .collect(),
+                Err(e) => {
+                    error!(error = %e, "Failed to parse agents list");
+                    Vec::new()
                 }
-            }
-            _ => {
-                // Fallback to cache
+            },
+            Err(_) => {
                 let cache = self.cache.read().await;
                 cache
                     .values()
@@ -312,7 +271,7 @@ impl AgentRegistry for HttpRegistry {
         let mut cache = self.cache.write().await;
         if let Some((record, _)) = cache.get_mut(agent_id) {
             record.current_calls += 1;
-            record.presence = PresenceState::Busy;
+            record.presence = PresenceState::Busy { call_id: None };
             record.last_state_change = Instant::now();
         }
 
@@ -337,7 +296,7 @@ impl AgentRegistry for HttpRegistry {
             record.last_call_end = Some(Instant::now());
 
             if record.current_calls == 0 {
-                record.presence = PresenceState::Wrapup;
+                record.presence = PresenceState::Wrapup { call_id: None };
             }
         }
 
@@ -360,13 +319,6 @@ impl AgentRegistry for HttpRegistry {
         let candidates = self.find_available_agents(required_skills).await;
         let mut rr_counter = self.rr_counter.write().await;
         super::select_best_agent(candidates, strategy, &mut rr_counter)
-    }
-
-    async fn on_state_change(&self, handler: Box<dyn Fn(&AgentRecord) + Send + Sync>) {
-        let mut handlers = self.event_handlers.write().await;
-        let handler: Box<dyn Fn(&AgentRecord) + Send + Sync + 'static> =
-            unsafe { std::mem::transmute(handler) };
-        handlers.push(handler);
     }
 
     async fn resolve_target(&self, _target_uri: &str) -> Vec<String> {

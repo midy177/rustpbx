@@ -280,6 +280,9 @@ pub struct QueueApp {
     enqueued_at: Option<Instant>,
     /// Queue statistics.
     stats: Arc<RwLock<HashMap<String, QueueStats>>>,
+    /// (agent_uri, call_id) for agents being dialed concurrently (parallel mode).
+    /// When the first agent answers, the rest are cancelled via LegRemove.
+    pending_agents: Vec<(String, String)>,
 }
 
 impl QueueApp {
@@ -298,6 +301,7 @@ impl QueueApp {
             call_id: String::new(),
             enqueued_at: None,
             stats: Arc::new(RwLock::new(HashMap::new())),
+            pending_agents: Vec::new(),
         }
     }
 
@@ -466,18 +470,50 @@ impl QueueApp {
     }
 
     /// Announce queue position.
-    async fn announce_position(&self, _ctrl: &mut CallController) -> anyhow::Result<()> {
-        // TODO: Implement position announcement using TTS
-        // For now, just log
-        debug!("Queue: position announcement (not implemented)");
+    ///
+    /// Plays `voice_prompts.position_prompt` if configured; otherwise emits a
+    /// warning so operators know the announcement was requested but unconfigured.
+    async fn announce_position(&self, ctrl: &mut CallController) -> anyhow::Result<()> {
+        let prompts = self
+            .plan
+            .voice_prompts
+            .as_ref()
+            .or(self.config.voice_prompts.as_ref());
+
+        if let Some(path) = prompts.and_then(|p| p.position_prompt.as_ref()) {
+            debug!(file = %path, "Queue: playing position announcement");
+            ctrl.play_audio(path.clone(), false).await?;
+        } else {
+            warn!(
+                queue = %self.config.name,
+                "Queue: announce_position is enabled but voice_prompts.position_prompt \
+                 is not configured — skipping announcement"
+            );
+        }
         Ok(())
     }
 
     /// Announce estimated wait time.
-    async fn announce_wait_time(&self, _ctrl: &mut CallController) -> anyhow::Result<()> {
-        // TODO: Implement wait time announcement using TTS
-        // For now, just log
-        debug!("Queue: wait time announcement (not implemented)");
+    ///
+    /// Plays `voice_prompts.wait_time_prompt` if configured; otherwise emits a
+    /// warning so operators know the announcement was requested but unconfigured.
+    async fn announce_wait_time(&self, ctrl: &mut CallController) -> anyhow::Result<()> {
+        let prompts = self
+            .plan
+            .voice_prompts
+            .as_ref()
+            .or(self.config.voice_prompts.as_ref());
+
+        if let Some(path) = prompts.and_then(|p| p.wait_time_prompt.as_ref()) {
+            debug!(file = %path, "Queue: playing wait-time announcement");
+            ctrl.play_audio(path.clone(), false).await?;
+        } else {
+            warn!(
+                queue = %self.config.name,
+                "Queue: announce_wait_time is enabled but voice_prompts.wait_time_prompt \
+                 is not configured — skipping announcement"
+            );
+        }
         Ok(())
     }
 
@@ -487,9 +523,16 @@ impl QueueApp {
         ctrl: &mut CallController,
         reason: AgentUnavailableReason,
     ) -> anyhow::Result<AppAction> {
-        if !self.is_parallel() {
-            self.current_agent_idx += 1;
+        if self.is_parallel() {
+            self.pending_agents.clear();
+            return match reason {
+                AgentUnavailableReason::Busy => self.play_busy_and_then_fallback(ctrl).await,
+                AgentUnavailableReason::NoAnswer => {
+                    self.play_no_answer_and_then_fallback(ctrl).await
+                }
+            };
         }
+        self.current_agent_idx += 1;
         self.dial_attempts += 1;
 
         let agents = self.get_agents();
@@ -665,7 +708,12 @@ impl CallApp for QueueApp {
 
                 // Update agent presence to ringing
                 let _ = registry
-                    .update_presence(&agent.agent_id, PresenceState::Ringing)
+                    .update_presence(
+                        &agent.agent_id,
+                        PresenceState::Ringing {
+                            call_id: Some(self.call_id.clone()),
+                        },
+                    )
                     .await;
 
                 // Originate call to agent
@@ -708,6 +756,52 @@ impl CallApp for QueueApp {
                     }
                 }
                 return self.play_busy_and_then_fallback(ctrl).await;
+            }
+        }
+
+        // Parallel mode: originate calls to ALL static agents concurrently.
+        // When the first agent answers via agent_connected event, the rest
+        // are cancelled via remove_legs.
+        if self.is_parallel() {
+            let agents = self.get_agents();
+            if !agents.is_empty() {
+                info!(
+                    "Queue: originating {} parallel calls to static agents",
+                    agents.len()
+                );
+                let mut pending = Vec::with_capacity(agents.len());
+                for (idx, agent) in agents.iter().enumerate() {
+                    let uri = agent
+                        .contact_raw
+                        .clone()
+                        .unwrap_or_else(|| agent.aor.to_string());
+                    match ctrl.originate_call(&uri, Some(self.call_id.clone())).await {
+                        Ok(call_id) => {
+                            info!(
+                                index = idx,
+                                call_id = %call_id,
+                                "Queue: parallel originate to agent"
+                            );
+                            pending.push((uri, call_id));
+                        }
+                        Err(e) => {
+                            warn!(
+                                index = idx,
+                                error = %e,
+                                "Queue: failed to originate parallel call"
+                            );
+                        }
+                    }
+                }
+                self.pending_agents = pending;
+
+                self.state = QueueState::DialingAgents { attempt: 1 };
+                self.dial_attempts = 1;
+
+                let ring_timeout = self.config.ring_timeout.unwrap_or(Duration::from_secs(20));
+                ctrl.set_timeout("agent_ring_timeout", ring_timeout);
+
+                return Ok(AppAction::Continue);
             }
         }
 
@@ -772,6 +866,25 @@ impl CallApp for QueueApp {
                         info!(agent = %agent_uri, "Queue: agent connected");
                         self._stop_hold_music().await;
 
+                        // In parallel mode, cancel all remaining pending agent legs
+                        // EXCEPT the one that just answered.
+                        if !self.pending_agents.is_empty() {
+                            let mut other_legs: Vec<String> = Vec::new();
+                            let all = std::mem::take(&mut self.pending_agents);
+                            for (u, cid) in all {
+                                if u != agent_uri {
+                                    other_legs.push(cid);
+                                }
+                            }
+                            if !other_legs.is_empty() {
+                                info!(
+                                    "Queue: cancelling {} non-answering parallel legs",
+                                    other_legs.len()
+                                );
+                                ctrl.remove_legs(&other_legs);
+                            }
+                        }
+
                         let wait_secs =
                             self.enqueued_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
 
@@ -825,7 +938,12 @@ impl CallApp for QueueApp {
 
                         if let Some(ref registry) = self.agent_registry {
                             let _ = registry
-                                .update_presence(agent_id, PresenceState::Ringing)
+                                .update_presence(
+                                    agent_id,
+                                    PresenceState::Ringing {
+                                        call_id: Some(self.call_id.clone()),
+                                    },
+                                )
                                 .await;
                         }
                     }
@@ -837,7 +955,12 @@ impl CallApp for QueueApp {
                         && let Some(ref registry) = self.agent_registry
                     {
                         let _ = registry
-                            .update_presence(agent_id, PresenceState::Busy)
+                            .update_presence(
+                                agent_id,
+                                PresenceState::Busy {
+                                    call_id: Some(self.call_id.clone()),
+                                },
+                            )
                             .await;
                     }
                     self.handle_agent_unavailable(ctrl, AgentUnavailableReason::Busy)
@@ -875,17 +998,14 @@ impl CallApp for QueueApp {
             "agent_ring_timeout" => {
                 info!("Queue: agent ring timeout, handling no-answer");
 
-                // Notify that agent didn't answer
                 if let Some(ref registry) = self.agent_registry {
-                    // Find the agent that was ringing and set back to available
                     let agents = registry.list_agents().await;
                     for agent in agents {
-                        if matches!(agent.presence, PresenceState::Ringing) {
+                        if matches!(agent.presence, PresenceState::Ringing { .. }) {
                             let _ = registry
                                 .update_presence(&agent.agent_id, PresenceState::Available)
                                 .await;
 
-                            // Notify external systems
                             ctrl.notify_event(
                                 "queue.agent_no_answer",
                                 serde_json::json!({

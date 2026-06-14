@@ -1,7 +1,7 @@
 use crate::app::AppStateInner;
 use crate::config::{
-    CallRecordConfig, Config, HttpRouterConfig, LocatorWebhookConfig, ProxyConfig,
-    UserBackendConfig,
+    CallRecordConfig, CallRecordStorageConfig, Config, HttpRouterConfig, LocatorWebhookConfig,
+    ProxyConfig, UserBackendConfig,
 };
 use crate::console::handlers::forms;
 use crate::console::{ConsoleState, middleware::AuthRequired};
@@ -120,13 +120,22 @@ struct AssignRolesPayload {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ProxySettingsPayload {
     pub realms: Option<Vec<String>>,
+    pub registrar_expires: Option<u32>,
+    pub max_registrar_expires: Option<u32>,
     pub locator_webhook: Option<LocatorWebhookConfig>,
+    pub rwi_webhook: Option<LocatorWebhookConfig>,
     pub user_backends: Option<Vec<UserBackendConfig>>,
     pub http_router: Option<HttpRouterConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TestLocatorWebhookPayload {
+    pub url: String,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TestRwiWebhookPayload {
     pub url: String,
     pub headers: Option<std::collections::HashMap<String, String>>,
 }
@@ -180,6 +189,10 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route("/settings/logs/follow", get(follow_logs))
         .route("/settings/logs/stream", get(stream_logs))
         .route("/settings/config/platform", patch(update_platform_settings))
+        .route(
+            "/settings/config/platform/auto-external-ip/test",
+            post(test_auto_external_ip),
+        )
         .route("/settings/config/proxy", patch(update_proxy_settings))
         .route("/settings/config/storage", patch(update_storage_settings))
         .route(
@@ -189,6 +202,84 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route(
             "/settings/config/proxy/locator-webhook/test",
             post(test_locator_webhook),
+        )
+        .route(
+            "/settings/config/proxy/rwi-webhook/test",
+            post(test_rwi_webhook),
+        )
+        .route(
+            "/settings/config/proxy/http-router/test",
+            post(test_http_router),
+        )
+        .route(
+            "/settings/config/proxy/user-backend/test",
+            post(test_user_backend),
+        )
+        .route("/settings/config/security", patch(update_security_settings))
+        .route("/settings/config/rwi", patch(update_rwi_settings));
+
+    #[cfg(feature = "commerce")]
+    let router = router
+        .route("/settings/config/cluster", patch(update_cluster_settings))
+        .route(
+            "/settings/config/cluster/reload",
+            get(cluster_reload_sse_handler),
+        )
+        .route(
+            "/settings/config/cluster/reload-addons",
+            get(list_reload_addons_handler),
+        );
+
+    router
+        .route(
+            "/settings/departments",
+            post(query_departments).put(create_department),
+        )
+        .route(
+            "/settings/departments/{id}",
+            get(get_department)
+                .patch(update_department)
+                .delete(delete_department),
+        )
+        .route("/settings/users", post(query_users).put(create_user))
+        .route(
+            "/settings/users/{id}",
+            get(get_user).patch(update_user).delete(delete_user),
+        )
+        .route(
+            "/settings/users/{id}/roles",
+            get(get_user_roles).post(assign_user_roles),
+        )
+        .route("/settings/roles", get(list_roles).post(create_role))
+        .route(
+            "/settings/roles/{id}",
+            get(get_role).patch(update_role).delete(delete_role_handler),
+        )
+}
+
+pub fn api_urls() -> Router<Arc<ConsoleState>> {
+    let router = Router::new()
+        .route("/settings/logs/recent", get(fetch_recent_logs))
+        .route("/settings/logs/follow", get(follow_logs))
+        .route("/settings/logs/stream", get(stream_logs))
+        .route("/settings/config/platform", patch(update_platform_settings))
+        .route(
+            "/settings/config/platform/auto-external-ip/test",
+            post(test_auto_external_ip),
+        )
+        .route("/settings/config/proxy", patch(update_proxy_settings))
+        .route("/settings/config/storage", patch(update_storage_settings))
+        .route(
+            "/settings/config/storage/test",
+            post(test_storage_connection),
+        )
+        .route(
+            "/settings/config/proxy/locator-webhook/test",
+            post(test_locator_webhook),
+        )
+        .route(
+            "/settings/config/proxy/rwi-webhook/test",
+            post(test_rwi_webhook),
         )
         .route(
             "/settings/config/proxy/http-router/test",
@@ -325,6 +416,9 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
         key_items.push(json!({ "label": "HTTP address", "value": config.http_addr.clone() }));
         if let Some(ext) = config.external_ip.as_ref() {
             key_items.push(json!({ "label": "External IP", "value": ext }));
+        } else if let Some(url) = config.auto_external_ip.as_ref() {
+            let display = if url.is_empty() { "http://ifconfig.me" } else { url };
+            key_items.push(json!({ "label": "External IP", "value": format!("auto ({})", display) }));
         }
         if let (Some(start), Some(end)) = (config.rtp_start_port, config.rtp_end_port) {
             key_items.push(json!({ "label": "RTP ports", "value": format!("{}-{}", start, end) }));
@@ -372,6 +466,7 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
             "modules": config.proxy.modules.clone().unwrap_or_default(),
             "max_concurrency": config.proxy.max_concurrency,
             "registrar_expires": config.proxy.registrar_expires,
+            "max_registrar_expires": config.proxy.max_registrar_expires,
             "callid_suffix": config.proxy.callid_suffix.clone(),
             "useragent": config.proxy.useragent.clone(),
             "ua_whitelist": config.proxy.ua_white_list.clone().unwrap_or_default(),
@@ -383,6 +478,7 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
             "rtp": config.rtp_config(),
             "user_backends": config.proxy.user_backends.clone(),
             "locator_webhook": config.proxy.locator_webhook.clone(),
+            "rwi_webhook": config.rwi_webhook.clone(),
             "http_router": config.proxy.http_router.clone(),
             "realms": config.proxy.realms.clone().unwrap_or_default(),
             "dos_enabled": config.proxy.dos_enabled,
@@ -393,6 +489,10 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
             "uri_max_length": config.proxy.uri_max_length,
             "uri_reject_malformed": config.proxy.uri_reject_malformed,
             "emergency": config.proxy.emergency.clone(),
+            "session_cmd_channel_capacity": config.proxy.session_cmd_channel_capacity,
+            "session_state_channel_capacity": config.proxy.session_state_channel_capacity,
+            "media_cmd_channel_capacity": config.proxy.media_cmd_channel_capacity,
+            "media_event_channel_capacity": config.proxy.media_event_channel_capacity,
             "stats": proxy_stats_value.clone(),
         });
 
@@ -604,8 +704,8 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
 
     let recorder_path = config.recorder_path();
 
-    let (mode, callrecord_profile) = match config.callrecord.as_ref() {
-        Some(CallRecordConfig::Local { root }) => {
+    let (mode, callrecord_profile) = match config.callrecord.as_ref().map(|cfg| &cfg.storage) {
+        Some(CallRecordStorageConfig::Local { root }) => {
             let mut profile = Profile::new(
                 "callrecord-local",
                 "Call recordings",
@@ -615,7 +715,7 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
             profile.insert("root", json!(root));
             ("local".to_string(), profile)
         }
-        Some(CallRecordConfig::S3 {
+        Some(CallRecordStorageConfig::S3 {
             vendor,
             bucket,
             region,
@@ -651,7 +751,7 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
             }
             ("s3".to_string(), profile)
         }
-        Some(CallRecordConfig::Http {
+        Some(CallRecordStorageConfig::Http {
             url,
             headers,
             with_media,
@@ -675,7 +775,7 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
             }
             ("http".to_string(), profile)
         }
-        Some(CallRecordConfig::Database {
+        Some(CallRecordStorageConfig::Database {
             database_url,
             table_name,
         }) => {
@@ -1391,12 +1491,12 @@ fn mask_basic(value: &str) -> String {
 }
 
 fn summarize_callrecord(config: Option<&CallRecordConfig>) -> Option<JsonValue> {
-    match config? {
-        CallRecordConfig::Local { root } => Some(json!({
+    match &config?.storage {
+        CallRecordStorageConfig::Local { root } => Some(json!({
             "label": "Call record storage",
             "value": format!("Local ({})", root),
         })),
-        CallRecordConfig::S3 {
+        CallRecordStorageConfig::S3 {
             bucket,
             region,
             endpoint,
@@ -1406,17 +1506,17 @@ fn summarize_callrecord(config: Option<&CallRecordConfig>) -> Option<JsonValue> 
             "value": format!("S3 bucket {} ({})", bucket, region),
             "hint": endpoint,
         })),
-        CallRecordConfig::Http { url, .. } => Some(json!({
+        CallRecordStorageConfig::Http { url, .. } => Some(json!({
             "label": "Call record storage",
             "value": format!("HTTP {}", url),
         })),
-        CallRecordConfig::Database {
+        CallRecordStorageConfig::Database {
             database_url,
             table_name,
         } => Some(json!({
             "label": "Call record storage",
             "value": format!("Database ({})", table_name),
-            "hint": database_url.as_deref().unwrap_or("default"),
+            "hint": database_url.as_deref().unwrap_or("not configured"),
         })),
     }
 }
@@ -1451,9 +1551,16 @@ pub(crate) struct PlatformSettingsPayload {
     #[serde(default)]
     external_ip: Option<Option<String>>,
     #[serde(default)]
+    auto_external_ip: Option<Option<String>>,
+    #[serde(default)]
     rtp_start_port: Option<Option<u16>>,
     #[serde(default)]
     rtp_end_port: Option<Option<u16>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TestAutoExternalIpPayload {
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1532,6 +1639,8 @@ pub(crate) struct RecordingPolicyPayload {
     path: Option<Option<String>>,
     #[serde(default)]
     format: Option<Option<String>>,
+    #[serde(default)]
+    force_file: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1549,6 +1658,11 @@ pub(crate) struct SecuritySettingsPayload {
     uri_reject_malformed: Option<bool>,
     // Emergency routing
     emergency: Option<Option<EmergencySettingsPayload>>,
+    // Channel capacities
+    session_cmd_channel_capacity: Option<usize>,
+    session_state_channel_capacity: Option<usize>,
+    media_cmd_channel_capacity: Option<usize>,
+    media_event_channel_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1582,7 +1696,7 @@ pub(crate) async fn update_platform_settings(
         if let Some(level) = normalize_opt_string(level_opt) {
             doc["log_level"] = value(level);
         } else {
-            doc.remove("log_level");
+            doc.insert("log_level", Item::None);
         }
         modified = true;
     }
@@ -1591,7 +1705,7 @@ pub(crate) async fn update_platform_settings(
         if let Some(path) = normalize_opt_string(file_opt) {
             doc["log_file"] = value(path);
         } else {
-            doc.remove("log_file");
+            doc.insert("log_file", Item::None);
         }
         modified = true;
     }
@@ -1599,8 +1713,19 @@ pub(crate) async fn update_platform_settings(
     if let Some(ext_opt) = payload.external_ip {
         if let Some(ip) = normalize_opt_string(ext_opt) {
             doc["external_ip"] = value(ip);
+            doc.insert("auto_external_ip", Item::None);
         } else {
-            doc.remove("external_ip");
+            doc.insert("external_ip", Item::None);
+        }
+        modified = true;
+    }
+
+    if let Some(auto_opt) = payload.auto_external_ip {
+        if let Some(url) = normalize_opt_string(auto_opt) {
+            doc["auto_external_ip"] = value(url);
+            doc.insert("external_ip", Item::None);
+        } else {
+            doc.insert("auto_external_ip", Item::None);
         }
         modified = true;
     }
@@ -1664,6 +1789,7 @@ pub(crate) async fn update_platform_settings(
         },
         "rtp": {
             "external_ip": config.external_ip,
+            "auto_external_ip": config.auto_external_ip,
             "start_port": config.rtp_start_port,
             "end_port": config.rtp_end_port,
         }
@@ -1690,6 +1816,8 @@ pub(crate) async fn update_proxy_settings(
     };
 
     let mut modified = false;
+    let mut rwi_webhook_value = None;
+    let mut remove_rwi_webhook = false;
     let table = ensure_table_mut(&mut doc, "proxy");
 
     if let Some(realms) = payload.realms {
@@ -1697,27 +1825,70 @@ pub(crate) async fn update_proxy_settings(
         modified = true;
     }
 
-    if let Some(webhook) = payload.locator_webhook {
-        let toml_s = match toml::to_string(&webhook) {
-            Ok(s) => s,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize locator_webhook: {err}"),
-                );
-            }
-        };
-        let new_doc = match toml_s.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid locator_webhook payload: {err}"),
-                );
-            }
-        };
-        table["locator_webhook"] = new_doc.as_item().clone();
+    if let Some(registrar_expires) = payload.registrar_expires {
+        table["registrar_expires"] = value(i64::from(registrar_expires));
         modified = true;
+    }
+
+    if let Some(max_registrar_expires) = payload.max_registrar_expires {
+        table["max_registrar_expires"] = value(i64::from(max_registrar_expires));
+        modified = true;
+    }
+
+    if let Some(webhook) = payload.locator_webhook {
+        if webhook.url.is_empty() {
+            if table.contains_key("locator_webhook") {
+                table.remove("locator_webhook");
+                modified = true;
+            }
+        } else {
+            let toml_s = match toml::to_string(&webhook) {
+                Ok(s) => s,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to serialize locator_webhook: {err}"),
+                    );
+                }
+            };
+            let new_doc = match toml_s.parse::<DocumentMut>() {
+                Ok(doc) => doc,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid locator_webhook payload: {err}"),
+                    );
+                }
+            };
+            table["locator_webhook"] = new_doc.as_item().clone();
+            modified = true;
+        }
+    }
+
+    if let Some(webhook) = payload.rwi_webhook {
+        if webhook.url.is_empty() {
+            remove_rwi_webhook = true;
+        } else {
+            let toml_s = match toml::to_string(&webhook) {
+                Ok(s) => s,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to serialize rwi_webhook: {err}"),
+                    );
+                }
+            };
+            let new_doc = match toml_s.parse::<DocumentMut>() {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid rwi_webhook payload: {err}"),
+                    );
+                }
+            };
+            rwi_webhook_value = Some(new_doc.as_item().clone());
+        }
     }
 
     if let Some(backends) = payload.user_backends {
@@ -1752,25 +1923,42 @@ pub(crate) async fn update_proxy_settings(
     }
 
     if let Some(router) = payload.http_router {
-        let toml_s = match toml::to_string(&router) {
-            Ok(s) => s,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize http_router: {err}"),
-                );
+        if router.url.is_empty() {
+            if table.contains_key("http_router") {
+                table.remove("http_router");
+                modified = true;
             }
-        };
-        let new_doc = match toml_s.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid http_router payload: {err}"),
-                );
-            }
-        };
-        table["http_router"] = new_doc.as_item().clone();
+        } else {
+            let toml_s = match toml::to_string(&router) {
+                Ok(s) => s,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to serialize http_router: {err}"),
+                    );
+                }
+            };
+            let new_doc = match toml_s.parse::<DocumentMut>() {
+                Ok(doc) => doc,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid http_router payload: {err}"),
+                    );
+                }
+            };
+            table["http_router"] = new_doc.as_item().clone();
+            modified = true;
+        }
+    }
+
+    // Write rwi_webhook at root level (after table borrow is done)
+    if let Some(value) = rwi_webhook_value {
+        doc["rwi_webhook"] = value;
+        modified = true;
+    }
+    if remove_rwi_webhook {
+        doc.remove("rwi_webhook");
         modified = true;
     }
 
@@ -2004,6 +2192,14 @@ pub(crate) async fn update_storage_settings(
                     }
                 }
 
+                if let Some(force_file) = policy_payload.force_file {
+                    if force_file {
+                        table["force_file"] = value(true);
+                    } else {
+                        table.remove("force_file");
+                    }
+                }
+
                 doc["recording"] = Item::Table(table);
             }
             None => {
@@ -2123,6 +2319,28 @@ pub(crate) async fn update_security_settings(
     if let Some(val) = payload.dos_scan_block_duration_secs {
         let table = ensure_table_mut(&mut doc, "proxy");
         table["dos_scan_block_duration_secs"] = value(val as i64);
+        modified = true;
+    }
+
+    // Channel capacities
+    if let Some(val) = payload.session_cmd_channel_capacity {
+        let table = ensure_table_mut(&mut doc, "proxy");
+        table["session_cmd_channel_capacity"] = value(val as i64);
+        modified = true;
+    }
+    if let Some(val) = payload.session_state_channel_capacity {
+        let table = ensure_table_mut(&mut doc, "proxy");
+        table["session_state_channel_capacity"] = value(val as i64);
+        modified = true;
+    }
+    if let Some(val) = payload.media_cmd_channel_capacity {
+        let table = ensure_table_mut(&mut doc, "proxy");
+        table["media_cmd_channel_capacity"] = value(val as i64);
+        modified = true;
+    }
+    if let Some(val) = payload.media_event_channel_capacity {
+        let table = ensure_table_mut(&mut doc, "proxy");
+        table["media_event_channel_capacity"] = value(val as i64);
         modified = true;
     }
 
@@ -2486,7 +2704,7 @@ async fn cluster_reload_sse_handler(
     };
 
     let app = app_state.clone();
-    tokio::spawn(async move {
+    crate::utils::spawn(async move {
         macro_rules! sse_send {
             ($event_type:expr, $data:expr) => {
                 let tx = tx.clone();
@@ -2559,6 +2777,9 @@ async fn cluster_reload_sse_handler(
             .clone()
             .unwrap_or_else(|| "/ami/v1".to_string());
 
+        let mut peer_results_summary: Vec<serde_json::Value> = Vec::new();
+        let mut any_error = false;
+
         for peer in &peers {
             let peer_label = format!("{}:{}", peer.addr, peer.ami_port);
             sse_send!(
@@ -2570,36 +2791,46 @@ async fn cluster_reload_sse_handler(
                 "http://{}:{}{}/cluster/reload_sync",
                 peer.addr, peer.ami_port, ami_path
             );
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default();
+            let opts = crate::http_util::HttpFetchOptions::new()
+                .with_timeout(std::time::Duration::from_secs(120));
 
-            match client.post(&url).json(&payload).send().await {
-                Ok(resp) => match resp.json::<serde_json::Value>().await {
-                    Ok(peer_results) => {
-                        sse_send!(
-                            "progress",
-                            serde_json::json!({"type": "node_complete", "node": &peer_label, "result": peer_results})
-                        );
+            let start = std::time::Instant::now();
+            let req = reqwest::Client::new().post(&url).json(&payload);
+            match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+                Ok(resp) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(peer_results) => {
+                            sse_send!(
+                                "progress",
+                                serde_json::json!({"type": "node_complete", "node": &peer_label, "elapsed_ms": elapsed_ms, "result": peer_results})
+                            );
+                            peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "ok", "elapsed_ms": elapsed_ms}));
+                        }
+                        Err(e) => {
+                            sse_send!(
+                                "progress",
+                                serde_json::json!({"type": "node_error", "node": &peer_label, "elapsed_ms": elapsed_ms, "error": format!("Invalid JSON: {}", e)})
+                            );
+                            any_error = true;
+                            peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "error", "elapsed_ms": elapsed_ms, "error": format!("Invalid JSON: {}", e)}));
+                        }
                     }
-                    Err(e) => {
-                        sse_send!(
-                            "progress",
-                            serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Invalid JSON: {}", e)})
-                        );
-                    }
-                },
+                }
                 Err(e) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
                     sse_send!(
                         "progress",
-                        serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Connection failed: {}", e)})
+                        serde_json::json!({"type": "node_error", "node": &peer_label, "elapsed_ms": elapsed_ms, "error": format!("Connection failed: {}", e)})
                     );
+                    any_error = true;
+                    peer_results_summary.push(serde_json::json!({"node": &peer_label, "status": "error", "elapsed_ms": elapsed_ms, "error": format!("Connection failed: {}", e)}));
                 }
             }
         }
 
-        sse_send!("complete", serde_json::json!({"type": "complete"}));
+        let overall_status = if any_error { "error" } else { "ok" };
+        sse_send!("complete", serde_json::json!({"type": "complete", "overall_status": overall_status, "peers": peer_results_summary}));
     });
 
     let sse_stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -3144,17 +3375,9 @@ pub(crate) async fn test_locator_webhook(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let mut request = client.post(&payload.url);
-    if let Some(headers) = payload.headers {
-        for (k, v) in headers {
-            request = request.header(k, v);
-        }
-    }
+    let opts = crate::http_util::HttpFetchOptions::new()
+        .with_timeout(std::time::Duration::from_secs(5))
+        .with_headers(payload.headers.unwrap_or_default());
 
     let test_event = json!({
         "event": "test",
@@ -3162,24 +3385,38 @@ pub(crate) async fn test_locator_webhook(
         "message": "RustPBX locator webhook test"
     });
 
-    match request.json(&test_event).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                Json(json!({
-                    "status": "ok",
-                    "message": format!("Webhook test successful: HTTP {}", resp.status()),
-                }))
-                .into_response()
-            } else {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Webhook returned error: HTTP {}", resp.status()),
-                )
-            }
-        }
+    let req = reqwest::Client::new().post(&payload.url).json(&test_event);
+    match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+        Ok(resp) => Json(json!({
+            "status": "ok",
+            "message": format!("Webhook test successful: HTTP {}", resp.status()),
+        }))
+        .into_response(),
         Err(err) => json_error(
             StatusCode::BAD_REQUEST,
             format!("Webhook request failed: {}", err),
+        ),
+    }
+}
+
+pub(crate) async fn test_rwi_webhook(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<TestRwiWebhookPayload>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    match crate::rwi::webhook::send_test_event(&payload.url, payload.headers.as_ref()).await {
+        Ok(()) => Json(json!({
+            "status": "ok",
+            "message": "RWI webhook test successful",
+        }))
+        .into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_REQUEST,
+            format!("RWI webhook request failed: {}", err),
         ),
     }
 }
@@ -3192,17 +3429,9 @@ pub(crate) async fn test_http_router(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let mut request = client.post(&payload.url);
-    if let Some(headers) = payload.headers {
-        for (k, v) in headers {
-            request = request.header(k, v);
-        }
-    }
+    let opts = crate::http_util::HttpFetchOptions::new()
+        .with_timeout(std::time::Duration::from_secs(5))
+        .with_headers(payload.headers.unwrap_or_default());
 
     let test_request = json!({
         "call_id": "test-call-id",
@@ -3213,24 +3442,39 @@ pub(crate) async fn test_http_router(
         "direction": "internal"
     });
 
-    match request.json(&test_request).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                Json(json!({
-                    "status": "ok",
-                    "message": format!("HTTP Router test successful: HTTP {}", resp.status()),
-                }))
-                .into_response()
-            } else {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("HTTP Router returned error: HTTP {}", resp.status()),
-                )
-            }
-        }
+    let req = reqwest::Client::new().post(&payload.url).json(&test_request);
+    match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+        Ok(resp) => Json(json!({
+            "status": "ok",
+            "message": format!("HTTP Router test successful: HTTP {}", resp.status()),
+        }))
+        .into_response(),
         Err(err) => json_error(
             StatusCode::BAD_REQUEST,
             format!("HTTP Router request failed: {}", err),
+        ),
+    }
+}
+
+pub(crate) async fn test_auto_external_ip(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<TestAutoExternalIpPayload>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let url = payload.url.unwrap_or_default();
+    match crate::auto_external_ip::detect_external_ip(&url).await {
+        Ok(ip) => Json(json!({
+            "status": "ok",
+            "ip": ip.to_string(),
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Auto external IP detection failed: {}", e),
         ),
     }
 }
@@ -3250,12 +3494,16 @@ pub(crate) async fn test_user_backend(
         }))
         .into_response(),
         UserBackendConfig::Http { url, .. } => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
+            let opts = crate::http_util::HttpFetchOptions::new()
+                .with_timeout(std::time::Duration::from_secs(5));
 
-            match client.get(&url).send().await {
+            match crate::http_util::execute_request(
+                reqwest::Client::new().get(&url),
+                &opts.headers,
+                opts.timeout,
+            )
+            .await
+            {
                 Ok(resp) => Json(json!({
                     "status": "ok",
                     "message": format!("HTTP backend reachable: HTTP {}", resp.status()),
@@ -3581,9 +3829,7 @@ mod tests {
             .await
             .expect("connect sqlite memory");
         Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(
-            Arc::new(crate::callrecord::DefaultCallRecordFormatter::default()),
-            db,
+        ConsoleState::initialize(db,
             ConsoleConfig::default(),
         )
         .await

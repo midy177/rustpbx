@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use ipnetwork::IpNetwork;
 use regex::Regex;
+use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -45,7 +46,12 @@ pub struct TrunkConfig {
     pub backup_dest: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        alias = "allow_codecs",
+        alias = "audio_codecs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub codec: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
@@ -117,6 +123,72 @@ pub struct TrunkConfig {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub did_numbers: Vec<String>,
+
+    /// Per-trunk ringback/early-media audio configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ringback: Option<RingbackAudio>,
+}
+
+/// Per-trunk ringback/early-media audio configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RingbackAudio {
+    /// Ringback/waiting tone — played as 183 early media while callee rings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring: Option<String>,
+    /// Busy tone — played as 183 early media before sending 486
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy: Option<String>,
+    /// Reject tone — played as 183 early media before sending 603
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject: Option<String>,
+    /// Offline/unavailable tone — played as 183 early media before sending 480
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
+    /// Not-found tone — played as 183 early media before sending 404
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notfound: Option<String>,
+    /// How many seconds to play the tone before sending the final rejection.
+    /// Defaults to 2 seconds when not set (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_duration_secs: Option<u32>,
+}
+
+impl RingbackAudio {
+    /// Get the audio file for a specific SIP status code
+    pub fn for_status(&self, code: &rsipstack::sip::StatusCode) -> Option<&str> {
+        match code {
+            c if *c == rsipstack::sip::StatusCode::BusyHere => self.busy.as_deref(),
+            c if *c == rsipstack::sip::StatusCode::TemporarilyUnavailable => {
+                self.offline.as_deref()
+            }
+            c if *c == rsipstack::sip::StatusCode::NotFound => self.notfound.as_deref(),
+            c if *c == rsipstack::sip::StatusCode::Decline => self.reject.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if any failure tone (busy/reject/offline/notfound) is configured
+    pub fn has_failure_tone(&self) -> bool {
+        self.busy.is_some()
+            || self.reject.is_some()
+            || self.offline.is_some()
+            || self.notfound.is_some()
+    }
+
+    /// Get the play duration before rejection for a given status code.
+    /// Returns `None` if no tone is configured for the given status code.
+    pub fn play_duration_for(
+        &self,
+        code: &rsipstack::sip::StatusCode,
+    ) -> Option<std::time::Duration> {
+        if self.for_status(code).is_some() {
+            Some(std::time::Duration::from_secs(
+                self.play_duration_secs.unwrap_or(2) as u64,
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,6 +286,7 @@ impl Default for TrunkConfig {
             media_mode: None,
             video_policy: None,
             did_numbers: Vec::new(),
+            ringback: None,
             origin: ConfigOrigin::embedded(),
         }
     }
@@ -373,8 +446,6 @@ pub struct RouteRule {
     pub description: Option<String>,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default)]
-    pub direction: RouteDirection,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_trunks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -413,7 +484,6 @@ impl Default for RouteRule {
             name: String::new(),
             description: None,
             priority: 0,
-            direction: RouteDirection::Any,
             source_trunks: Vec::new(),
             source_trunk_ids: Vec::new(),
             match_conditions: MatchConditions::default(),
@@ -963,4 +1033,47 @@ fn matches_user_prefix(pattern: &str, value: &str) -> Result<bool> {
     let regex =
         Regex::new(trimmed).map_err(|err| anyhow!("invalid regex '{}': {}", trimmed, err))?;
     Ok(regex.is_match(value))
+}
+
+/// Resolve a transport enum from a lowercase string (e.g. "udp", "tcp", "tls", "ws", "wss").
+/// Returns `None` for unrecognized values.
+pub fn resolve_transport_from_str(s: &str) -> Option<rsipstack::sip::transport::Transport> {
+    match s.to_lowercase().as_str() {
+        "udp" => Some(rsipstack::sip::transport::Transport::Udp),
+        "tcp" => Some(rsipstack::sip::transport::Transport::Tcp),
+        "tls" => Some(rsipstack::sip::transport::Transport::Tls),
+        "ws" => Some(rsipstack::sip::transport::Transport::Ws),
+        "wss" => Some(rsipstack::sip::transport::Transport::Wss),
+        _ => None,
+    }
+}
+
+pub fn extract_via_ip(origin: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    let via = origin.via_header().ok()?;
+    let (_, target) = rsipstack::transport::SipConnection::parse_target_from_via(via).ok()?;
+    target.host.try_into().ok()
+}
+
+pub fn extract_from_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin
+        .from_header()
+        .ok()
+        .and_then(|h| h.uri().ok())
+        .and_then(|uri| uri.user().map(|u| u.to_string()))
+}
+
+pub fn extract_to_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin
+        .to_header()
+        .ok()
+        .and_then(|h| h.uri().ok())
+        .and_then(|uri| uri.user().map(|u| u.to_string()))
+}
+
+pub fn extract_request_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin.uri.user().map(|u| u.to_string())
+}
+
+pub fn escape_sip_quoted(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
 }

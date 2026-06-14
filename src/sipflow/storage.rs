@@ -1,9 +1,11 @@
 use crate::config::SipFlowSubdirs;
 use crate::sipflow::protocol::{MsgType, Packet};
-use crate::sipflow::{SipFlowItem, SipFlowMsgType};
+use crate::sipflow::rtp_stats::{MediaStatsAccumulator, parse_rtp_stats_header};
+use crate::sipflow::{SipFlowItem, SipFlowMediaStats, SipFlowMsgType};
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, Local, Timelike};
+use futures::TryStreamExt;
 use lru::LruCache;
 use sqlx::{ConnectOptions, Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::fs::{File, OpenOptions};
@@ -12,6 +14,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const RAW_RECORD_HEADER_LEN: u64 = 10;
+const RAW_READ_THROUGH_GAP: u64 = 64 * 1024;
 
 pub struct StorageManager {
     base_path: PathBuf,
@@ -49,34 +53,123 @@ pub struct ProcessedPacket {
     pub comp_size: usize,
 }
 
+#[derive(sqlx::FromRow)]
+struct MediaPacketRow {
+    leg: i32,
+    src: String,
+    timestamp: i64,
+    offset: i64,
+    size: i64,
+}
+
+struct StoredMediaPacket {
+    leg: i32,
+    src: String,
+    timestamp: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SipPacketRow {
+    src: String,
+    dst: String,
+    timestamp: i64,
+    offset: i64,
+    size: i64,
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct MediaSourceRow {
+    pub leg: i32,
+    pub src: String,
+}
+
 pub fn process_packet(packet: Packet) -> ProcessedPacket {
-    let mut callid = None;
-    if matches!(packet.msg_type, MsgType::Sip) {
-        callid = extract_callid(&packet.payload);
+    let Packet {
+        msg_type,
+        src,
+        dst,
+        timestamp,
+        call_id,
+        leg,
+        payload,
+    } = packet;
+    let mut callid = call_id;
+    let src_addr = format!("{}:{}", src.0, src.1);
+    let dst_addr = format!("{}:{}", dst.0, dst.1);
+    let payload = payload;
+
+    if matches!(msg_type, MsgType::Sip) && callid.is_none() {
+        callid = extract_callid(&payload);
     }
 
-    let orig_size = packet.payload.len();
+    let orig_size = payload.len();
     let (payload, comp_size, _compressed) = if orig_size >= 96 {
-        if let Ok(data) = zstd::encode_all(&packet.payload[..], 3) {
+        if let Ok(data) = zstd::encode_all(&payload[..], 3) {
             let size = data.len();
             (data.into(), size, true)
         } else {
-            (packet.payload, orig_size, false)
+            (payload, orig_size, false)
         }
     } else {
-        (packet.payload, orig_size, false)
+        (payload, orig_size, false)
     };
 
     ProcessedPacket {
-        msg_type: packet.msg_type,
+        msg_type,
         callid,
-        src: format!("{}:{}", packet.src.0, packet.src.1),
-        dst: format!("{}:{}", packet.dst.0, packet.dst.1),
-        leg: None, // Will be set by caller for RTP packets
-        timestamp: packet.timestamp,
+        src: src_addr,
+        dst: dst_addr,
+        leg,
+        timestamp,
         payload,
         orig_size,
         comp_size,
+    }
+}
+
+fn seek_or_read_through(
+    raw_file: &mut File,
+    current_pos: &mut Option<u64>,
+    target_pos: u64,
+) -> std::io::Result<()> {
+    if let Some(pos) = *current_pos
+        && pos <= target_pos
+        && target_pos - pos <= RAW_READ_THROUGH_GAP
+    {
+        let mut remaining = target_pos - pos;
+        let mut discard = [0u8; 8192];
+        while remaining > 0 {
+            let len = remaining.min(discard.len() as u64) as usize;
+            raw_file.read_exact(&mut discard[..len])?;
+            remaining -= len as u64;
+        }
+        *current_pos = Some(target_pos);
+        return Ok(());
+    }
+
+    raw_file.seek(SeekFrom::Start(target_pos))?;
+    *current_pos = Some(target_pos);
+    Ok(())
+}
+
+fn read_raw_payload(
+    raw_file: &mut File,
+    current_pos: &mut Option<u64>,
+    offset: u64,
+    size: usize,
+) -> std::io::Result<Vec<u8>> {
+    let payload_offset = offset + RAW_RECORD_HEADER_LEN;
+    seek_or_read_through(raw_file, current_pos, payload_offset)?;
+
+    let mut buf = vec![0u8; size];
+    raw_file.read_exact(&mut buf)?;
+    *current_pos = Some(payload_offset + size as u64);
+
+    if buf.starts_with(&ZSTD_MAGIC) {
+        zstd::decode_all(&buf[..])
+    } else {
+        Ok(buf)
     }
 }
 
@@ -116,7 +209,7 @@ impl StorageManager {
             self.call_id_cache.clear();
         }
 
-        let file = self.raw_file.as_mut().unwrap();
+        let file = self.raw_file.as_mut().ok_or_else(|| anyhow::anyhow!("raw_file not initialized after rotate"))?;
         let offset = file.metadata()?.len();
 
         file.write_all(&0x5346u16.to_be_bytes())?; // Magic
@@ -232,6 +325,11 @@ impl StorageManager {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_media_call ON media_msgs(call_id)")
             .execute(&mut conn)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_media_call_timestamp ON media_msgs(call_id, timestamp)",
+        )
+        .execute(&mut conn)
+        .await?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -293,7 +391,14 @@ impl StorageManager {
                     MsgType::Rtp => {
                         let leg = meta.leg.unwrap_or(0);
                         sqlx::query(
-                            "INSERT INTO media_msgs (call_id, leg, src, timestamp, offset, size) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO media_msgs (
+                                call_id,
+                                leg,
+                                src,
+                                timestamp,
+                                offset,
+                                size
+                            ) VALUES (?, ?, ?, ?, ?, ?)",
                         )
                         .bind(call_id)
                         .bind(leg)
@@ -337,16 +442,21 @@ impl StorageManager {
             let mut conn =
                 SqliteConnection::connect(&format!("sqlite:{}", db_path.to_string_lossy())).await?;
             let mut raw_file = File::open(raw_path)?;
+            let mut current_pos = None;
 
             // Query using JOIN with call_meta
-            let rows = sqlx::query(
-                "SELECT s.src, s.dst, s.timestamp, s.offset, s.size 
+            let rows = sqlx::query_as::<_, SipPacketRow>(
+                "SELECT s.src AS src,
+                        s.dst AS dst,
+                        s.timestamp AS timestamp,
+                        s.offset AS offset,
+                        s.size AS size
                  FROM sip_msgs s
                  JOIN call_meta c ON s.call_id = c.id
                   WHERE c.callid = ?
                   AND s.timestamp >= ?
                   AND s.timestamp <= ?
-                 ORDER BY s.timestamp ASC",
+                 ORDER BY s.offset ASC",
             )
             .bind(callid)
             .bind(start_ts)
@@ -355,36 +465,18 @@ impl StorageManager {
             .await?;
 
             for row in rows {
-                use sqlx::Row;
-                let src: String = row.get(0);
-                let dst: String = row.get(1);
-                let ts: i64 = row.get(2);
-                let offset: i64 = row.get(3);
-                let size: i64 = row.get(4);
-
-                let mut buf = vec![0u8; size as usize];
-                let raw_msg = (|| -> std::io::Result<Vec<u8>> {
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 10))?;
-                    raw_file.read_exact(&mut buf)?;
-
-                    // Try to decompress, read orig_size from data.raw header
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 2))?;
-                    let mut orig_size_buf = [0u8; 4];
-                    raw_file.read_exact(&mut orig_size_buf)?;
-                    if buf.starts_with(&ZSTD_MAGIC) {
-                        zstd::decode_all(&buf[..])
-                    } else {
-                        Ok(buf)
-                    }
-                })()?;
+                let offset = u64::try_from(row.offset)?;
+                let size = usize::try_from(row.size)?;
+                let raw_msg = read_raw_payload(&mut raw_file, &mut current_pos, offset, size)?;
 
                 results.push(SipFlowItem {
-                    src_addr: src,
-                    dst_addr: dst,
-                    timestamp: ts as u64,
+                    src_addr: row.src,
+                    dst_addr: row.dst,
+                    timestamp: row.timestamp as u64,
                     payload: Bytes::from(raw_msg),
                     msg_type: SipFlowMsgType::Sip,
                     seq: 0,
+                    leg: None,
                 });
             }
         }
@@ -413,13 +505,18 @@ impl StorageManager {
             let mut conn =
                 SqliteConnection::connect(&format!("sqlite:{}", db_path.to_string_lossy())).await?;
             let mut raw_file = File::open(raw_path)?;
+            let mut current_pos = None;
 
-            let rows = sqlx::query(
-                "SELECT s.src, s.dst, s.timestamp, s.offset, s.size
+            let rows = sqlx::query_as::<_, SipPacketRow>(
+                "SELECT s.src AS src,
+                        s.dst AS dst,
+                        s.timestamp AS timestamp,
+                        s.offset AS offset,
+                        s.size AS size
                  FROM sip_msgs s
                   WHERE s.timestamp >= ?
                   AND s.timestamp <= ?
-                 ORDER BY s.timestamp ASC",
+                 ORDER BY s.offset ASC",
             )
             .bind(start_ts)
             .bind(end_ts)
@@ -427,35 +524,18 @@ impl StorageManager {
             .await?;
 
             for row in rows {
-                use sqlx::Row;
-                let src: String = row.get(0);
-                let dst: String = row.get(1);
-                let ts: i64 = row.get(2);
-                let offset: i64 = row.get(3);
-                let size: i64 = row.get(4);
-
-                let mut buf = vec![0u8; size as usize];
-                let raw_msg = (|| -> std::io::Result<Vec<u8>> {
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 10))?;
-                    raw_file.read_exact(&mut buf)?;
-
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 2))?;
-                    let mut orig_size_buf = [0u8; 4];
-                    raw_file.read_exact(&mut orig_size_buf)?;
-                    if buf.starts_with(&ZSTD_MAGIC) {
-                        zstd::decode_all(&buf[..])
-                    } else {
-                        Ok(buf)
-                    }
-                })()?;
+                let offset = u64::try_from(row.offset)?;
+                let size = usize::try_from(row.size)?;
+                let raw_msg = read_raw_payload(&mut raw_file, &mut current_pos, offset, size)?;
 
                 results.push(SipFlowItem {
-                    src_addr: src,
-                    dst_addr: dst,
-                    timestamp: ts as u64,
+                    src_addr: row.src,
+                    dst_addr: row.dst,
+                    timestamp: row.timestamp as u64,
                     payload: Bytes::from(raw_msg),
                     msg_type: SipFlowMsgType::Sip,
                     seq: 0,
+                    leg: None,
                 });
             }
         }
@@ -469,8 +549,39 @@ impl StorageManager {
         callid: &str,
         start_dt: DateTime<Local>,
         end_dt: DateTime<Local>,
-    ) -> Result<Vec<(i32, String, usize)>> {
+    ) -> Result<Vec<SipFlowMediaStats>> {
         let mut results = std::collections::HashMap::new();
+        for packet in self.query_media_packets(callid, start_dt, end_dt).await? {
+            let header = parse_rtp_stats_header(&packet.payload);
+            let key = (packet.leg, packet.src.clone(), header.map(|h| h.ssrc));
+            results
+                .entry(key)
+                .or_insert_with(|| {
+                    MediaStatsAccumulator::new(
+                        packet.leg,
+                        packet.src,
+                        header.map(|h| h.ssrc),
+                    )
+                })
+                .observe(packet.timestamp as u64, header);
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|(_, accumulator)| accumulator.into_stats())
+            .collect())
+    }
+
+    pub(crate) async fn query_media_sources(
+        &mut self,
+        callid: &str,
+        start_dt: DateTime<Local>,
+        end_dt: DateTime<Local>,
+    ) -> Result<Vec<MediaSourceRow>> {
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let start_ts = Self::datetime_to_storage_ts(start_dt);
+        let end_ts = Self::datetime_to_storage_ts(end_dt);
         let folders = self.get_folders_in_range(start_dt, end_dt);
 
         for dir in folders {
@@ -483,39 +594,40 @@ impl StorageManager {
             let mut conn =
                 SqliteConnection::connect(&format!("sqlite:{}", db_path.to_string_lossy())).await?;
 
-            let rows = sqlx::query(
-                "SELECT m.leg, m.src, COUNT(*) as count 
+            let mut rows = sqlx::query_as::<_, MediaSourceRow>(
+                "SELECT m.leg AS leg,
+                        m.src AS src
                  FROM media_msgs m
                  JOIN call_meta c ON m.call_id = c.id
                  WHERE c.callid = ?
-                 GROUP BY m.leg, m.src",
+                 AND m.timestamp >= ?
+                 AND m.timestamp <= ?
+                 ORDER BY m.timestamp ASC, m.id ASC",
             )
             .bind(callid)
-            .fetch_all(&mut conn)
-            .await?;
+            .bind(start_ts)
+            .bind(end_ts)
+            .fetch(&mut conn);
 
-            for row in rows {
-                use sqlx::Row;
-                let leg: i32 = row.get(0);
-                let src: String = row.get(1);
-                let count: i64 = row.get(2);
-                *results.entry((leg, src)).or_insert(0) += count as usize;
+            while let Some(row) = rows.try_next().await? {
+                if seen.insert((row.leg, row.src.clone())) {
+                    results.push(row);
+                }
             }
         }
 
-        Ok(results
-            .into_iter()
-            .map(|((leg, src), count)| (leg, src, count))
-            .collect())
+        Ok(results)
     }
 
-    pub async fn query_media(
+    async fn query_media_packets(
         &mut self,
         callid: &str,
         start_dt: DateTime<Local>,
         end_dt: DateTime<Local>,
-    ) -> Result<Vec<(i32, u64, Vec<u8>)>> {
+    ) -> Result<Vec<StoredMediaPacket>> {
         let mut results = Vec::new();
+        let start_ts = Self::datetime_to_storage_ts(start_dt);
+        let end_ts = Self::datetime_to_storage_ts(end_dt);
         let folders = self.get_folders_in_range(start_dt, end_dt);
 
         for dir in folders {
@@ -529,47 +641,57 @@ impl StorageManager {
             let mut conn =
                 SqliteConnection::connect(&format!("sqlite:{}", db_path.to_string_lossy())).await?;
             let mut raw_file = File::open(raw_path)?;
+            let mut current_pos = None;
 
-            let rows = sqlx::query(
-                "SELECT s.offset, s.size, s.timestamp, s.leg
+            let rows = sqlx::query_as::<_, MediaPacketRow>(
+                "SELECT s.leg AS leg,
+                        s.src AS src,
+                        s.timestamp AS timestamp,
+                        s.offset AS offset,
+                        s.size AS size
                  FROM media_msgs s
                  JOIN call_meta c ON s.call_id = c.id
                  WHERE c.callid = ?
-                 ORDER BY s.timestamp ASC",
+                 AND s.timestamp >= ?
+                 AND s.timestamp <= ?
+                 ORDER BY s.offset ASC",
             )
             .bind(callid)
+            .bind(start_ts)
+            .bind(end_ts)
             .fetch_all(&mut conn)
             .await?;
 
             for row in rows {
-                use sqlx::Row;
-                let offset: i64 = row.get(0);
-                let size: i64 = row.get(1);
-                let ts: i64 = row.get(2);
-                let leg: i32 = row.get(3);
+                let offset = u64::try_from(row.offset)?;
+                let size = usize::try_from(row.size)?;
+                let payload =
+                    read_raw_payload(&mut raw_file, &mut current_pos, offset, size)?;
 
-                let mut buf = vec![0u8; size as usize];
-                let raw_payload = (|| -> std::io::Result<Vec<u8>> {
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 10))?;
-                    raw_file.read_exact(&mut buf)?;
-
-                    // Try to decompress
-                    raw_file.seek(SeekFrom::Start(offset as u64 + 2))?;
-                    let mut orig_size_buf = [0u8; 4];
-                    raw_file.read_exact(&mut orig_size_buf)?;
-
-                    if buf.starts_with(&ZSTD_MAGIC) {
-                        zstd::decode_all(&buf[..])
-                    } else {
-                        Ok(buf)
-                    }
-                })()?;
-
-                results.push((leg, ts as u64, raw_payload));
+                results.push(StoredMediaPacket {
+                    leg: row.leg,
+                    src: row.src,
+                    timestamp: row.timestamp as u64,
+                    payload,
+                });
             }
         }
-        results.sort_by_key(|r| r.1);
+
         Ok(results)
+    }
+
+    pub async fn query_media(
+        &mut self,
+        callid: &str,
+        start_dt: DateTime<Local>,
+        end_dt: DateTime<Local>,
+    ) -> Result<Vec<(i32, u64, Vec<u8>)>> {
+        Ok(self
+            .query_media_packets(callid, start_dt, end_dt)
+            .await?
+            .into_iter()
+            .map(|packet| (packet.leg, packet.timestamp, packet.payload))
+            .collect())
     }
 
     fn get_folders_in_range(&self, start: DateTime<Local>, end: DateTime<Local>) -> Vec<PathBuf> {
@@ -656,6 +778,8 @@ mod tests {
             src: (IpAddr::from([127, 0, 0, 1]), 5060),
             dst: (IpAddr::from([127, 0, 0, 2]), 5060),
             timestamp: ts_micros,
+            call_id: None,
+            leg: None,
             payload: Bytes::from(payload),
         })
     }
@@ -672,6 +796,8 @@ mod tests {
             src: (IpAddr::from([127, 0, 0, 1]), 30000),
             dst: (IpAddr::from([127, 0, 0, 2]), 30002),
             timestamp: ts_micros,
+            call_id: None,
+            leg: None,
             payload: Bytes::from(payload.to_vec()),
         });
         packet.callid = Some(call_id.to_string());
@@ -689,6 +815,61 @@ mod tests {
         let msg2 = b"INVITE sip:test@example.com SIP/2.0\r\ni: compact-form-id\r\n";
         let callid2 = extract_callid(msg2);
         assert_eq!(callid2, Some("compact-form-id".to_string()));
+    }
+
+    #[test]
+    fn test_process_packet_applies_rtp_metadata() {
+        let rtp = Bytes::from_static(b"\x80\x00\x00\x2a\x00\x00\x00\xa0\x00\x00\x00\x01payload");
+
+        let processed = process_packet(Packet {
+            msg_type: MsgType::Rtp,
+            src: (IpAddr::from([198, 51, 100, 10]), 5004),
+            dst: (IpAddr::from([127, 0, 0, 1]), 0),
+            timestamp: 123_456,
+            call_id: Some("remote-call-1".to_string()),
+            leg: Some(1),
+            payload: rtp.clone(),
+        });
+
+        assert_eq!(processed.callid, Some("remote-call-1".to_string()));
+        assert_eq!(processed.leg, Some(1));
+        assert_eq!(processed.src, "198.51.100.10:5004");
+        assert_eq!(processed.payload, rtp);
+        assert_eq!(processed.orig_size, rtp.len());
+    }
+
+    #[tokio::test]
+    async fn test_rtp_metadata_writes_queryable_media() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = StorageManager::new(dir.path(), 1000, 3600, 128, SipFlowSubdirs::None);
+        let timestamp = chrono::Utc::now().timestamp_micros() as u64;
+        let rtp = Bytes::from_static(b"\x80\x00\x00\x2a\x00\x00\x00\xa0\x00\x00\x00\x01payload");
+
+        let processed = process_packet(Packet {
+            msg_type: MsgType::Rtp,
+            src: (IpAddr::from([203, 0, 113, 10]), 6000),
+            dst: (IpAddr::from([127, 0, 0, 1]), 0),
+            timestamp,
+            call_id: Some("remote-call-2".to_string()),
+            leg: Some(0),
+            payload: rtp.clone(),
+        });
+        storage.write_processed(processed).await.expect("write RTP");
+        storage.force_flush().await.expect("flush");
+
+        let packets = storage
+            .query_media(
+                "remote-call-2",
+                local_dt_from_micros(timestamp as i64 - 1),
+                local_dt_from_micros(timestamp as i64 + 1),
+            )
+            .await
+            .expect("query media");
+
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].0, 0);
+        assert_eq!(packets[0].1, timestamp);
+        assert_eq!(packets[0].2, rtp.to_vec());
     }
 
     #[tokio::test]
@@ -730,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_media_and_stats_use_call_id_within_selected_folders() {
+    async fn test_query_media_and_stats_filter_receive_timestamp_within_selected_folders() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut storage = StorageManager::new(dir.path(), 1000, 3600, 128, SipFlowSubdirs::None);
 
@@ -749,7 +930,7 @@ mod tests {
                 t0,
                 call_id,
                 0,
-                "LegA_127.0.0.1:4000",
+                "127.0.0.1:4000",
                 p0,
             ))
             .await
@@ -759,7 +940,7 @@ mod tests {
                 t1,
                 call_id,
                 0,
-                "LegA_127.0.0.1:4000",
+                "127.0.0.1:4000",
                 p1,
             ))
             .await
@@ -769,7 +950,7 @@ mod tests {
                 t2,
                 call_id,
                 0,
-                "LegA_127.0.0.1:4000",
+                "127.0.0.1:4000",
                 p2,
             ))
             .await
@@ -785,13 +966,11 @@ mod tests {
             .expect("query media");
         assert_eq!(
             packets.len(),
-            3,
-            "expected all media packets for the call id in the selected folder"
+            1,
+            "expected only media packets in the receive timestamp range"
         );
-        assert_eq!(packets[0].1, t0);
-        assert_eq!(packets[1].1, t1);
-        assert_eq!(packets[2].1, t2);
-        assert_eq!(packets[1].2, p1.to_vec(), "payload should match t1 packet");
+        assert_eq!(packets[0].1, t1);
+        assert_eq!(packets[0].2, p1.to_vec(), "payload should match t1 packet");
 
         let stats = storage
             .query_media_stats(
@@ -803,7 +982,86 @@ mod tests {
             .expect("query media stats");
 
         assert_eq!(stats.len(), 1, "expected one (leg,src) stats row");
-        assert_eq!(stats[0].0, 0);
-        assert_eq!(stats[0].2, 3, "expected all packets for the call id");
+        assert_eq!(stats[0].leg, 0);
+        assert_eq!(
+            stats[0].packet_count, 1,
+            "expected only packets in the receive timestamp range"
+        );
+
+        let sources = storage
+            .query_media_sources(call_id, start, end)
+            .await
+            .expect("query media sources");
+        assert_eq!(sources.len(), 1, "expected one unique media source");
+        assert_eq!(sources[0].leg, 0);
+        assert_eq!(sources[0].src, "127.0.0.1:4000");
+    }
+
+    /// Reproduction: `query_flow_in_range` loads ALL calls' SIP data in the time
+    /// range, not just one call.  When `build_payload_maps` (called during WAV
+    /// generation) uses this function, it loads every concurrent call's SIP
+    /// messages into memory — a major contributor to OOM under load.
+    #[tokio::test]
+    async fn repro_query_flow_in_range_loads_all_calls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = StorageManager::new(dir.path(), 1000, 3600, 128, SipFlowSubdirs::None);
+
+        let base = chrono::Utc::now().timestamp_micros() as u64;
+
+        // Simulate 50 concurrent calls, each with 10 SIP messages.
+        for i in 0..50u64 {
+            let call_id = format!("call-{i}");
+            for j in 0..10u64 {
+                storage
+                    .write_processed(make_sip_processed(base + i * 100 + j, &call_id))
+                    .await
+                    .expect("write sip");
+            }
+        }
+
+        // Write 5 RTP packets for only ONE call.
+        for j in 0..5u64 {
+            storage
+                .write_processed(make_rtp_processed(
+                    base + j,
+                    "call-0",
+                    0,
+                    "127.0.0.1:4000",
+                    b"\x80\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01payload",
+                ))
+                .await
+                .expect("write rtp");
+        }
+        storage.force_flush().await.expect("flush");
+
+        let start = local_dt_from_micros(base as i64 - 1);
+        let end = local_dt_from_micros(base as i64 + 10_000);
+
+        // query_flow WITH call_id filter → only this call's SIP messages.
+        let one_call = storage
+            .query_flow("call-0", start, end)
+            .await
+            .expect("query_flow");
+        assert_eq!(one_call.len(), 10, "query_flow returns only call-0's 10 SIP msgs");
+
+        // query_flow_in_range WITHOUT call_id filter → ALL calls' SIP messages!
+        let all_calls = storage
+            .query_flow_in_range(start, end)
+            .await
+            .expect("query_flow_in_range");
+        assert_eq!(
+            all_calls.len(),
+            500,
+            "query_flow_in_range loads ALL 50 calls × 10 msgs = 500 items"
+        );
+
+        // ── The bug ──────────────────────────────────────────────
+        // build_payload_maps only needs call-0's SIP messages (10 items)
+        // to determine codecs, but query_flow_in_range loads 500 items
+        // — 50× more data than necessary into memory.
+        // With hundreds of concurrent calls this difference is enormous
+        // and directly contributes to the OOM crashes observed in
+        // production (~3 GB RSS → kernel kill).
+        // ─────────────────────────────────────────────────────────
     }
 }

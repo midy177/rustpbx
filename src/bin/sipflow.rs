@@ -7,11 +7,12 @@ use axum::{
 };
 use chrono::{Local, TimeZone};
 use clap::Parser;
+use rustpbx::config::SipFlowSubdirs;
 use rustpbx::sipflow::{
     protocol::{Packet, parse_packet},
     storage::{StorageManager, process_packet},
+    wav_utils::generate_wav_to_writer_ex,
 };
-use rustpbx::{config::SipFlowSubdirs, sipflow::wav_utils::generate_wav_from_packets_ex};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -81,7 +82,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Packet>(args.buffer_size);
 
     // UDP Receiver Task
-    tokio::spawn(async move {
+    rustpbx::utils::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -99,7 +100,7 @@ async fn main() -> Result<()> {
 
     // Storage Worker Task
     let storage_worker = storage.clone();
-    tokio::spawn(async move {
+    rustpbx::utils::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -185,9 +186,47 @@ async fn media_handler(
         .get("format")
         .map(|s| s.to_lowercase() == "pcm")
         .unwrap_or(false);
+    let stats_only = params
+        .get("stats")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let start_dt = Local.timestamp_opt(start_ts_param, 0).unwrap();
     let end_dt = Local.timestamp_opt(end_ts_param, 0).unwrap();
+
+    if stats_only {
+        let stats = {
+            let mut mg = state.storage.lock().await;
+            mg.query_media_stats(&callid, start_dt, end_dt)
+                .await
+                .unwrap_or_default()
+        };
+        let stats_json: Vec<_> = stats
+            .into_iter()
+            .map(|stat| {
+                serde_json::json!({
+                    "leg": stat.leg,
+                    "src": stat.src,
+                    "count": stat.packet_count,
+                    "packet_count": stat.packet_count,
+                    "lost_packets": stat.lost_packets,
+                    "expected_packets": stat.expected_packets,
+                    "loss_percent": stat.loss_percent,
+                    "jitter_ms": stat.jitter_ms,
+                    "ssrc": stat.ssrc,
+                    "payload_type": stat.payload_type,
+                    "clock_rate": stat.clock_rate,
+                })
+            })
+            .collect();
+
+        return axum::Json(serde_json::json!({
+            "status": "success",
+            "callid": callid,
+            "stats": stats_json
+        }))
+        .into_response();
+    }
 
     let packets = {
         let mut mg = state.storage.lock().await;
@@ -196,17 +235,62 @@ async fn media_handler(
             .unwrap_or_default()
     };
 
-    match generate_wav_from_packets_ex(&packets, force_pcm) {
-        Ok(wav_data) => axum::response::Response::builder()
-            .header("Content-Type", "audio/wav")
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{}.wav\"", callid),
+    if packets.is_empty() {
+        return (axum::http::StatusCode::NOT_FOUND, "No media found").into_response();
+    }
+
+    let mut temp_file = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string(),
             )
-            .body(axum::body::Body::from(wav_data))
-            .unwrap()
+                .into_response();
+        }
+    };
+
+    match generate_wav_to_writer_ex(&packets, force_pcm, &mut temp_file) {
+        Ok(_) => {
+            let file_len = match temp_file.as_file().metadata() {
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            };
+            let path = temp_file.path().to_owned();
+            std::mem::forget(temp_file);
+
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        e.to_string(),
+                    )
+                        .into_response();
+                }
+            };
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+
+            let response = axum::response::Response::builder()
+                .header("Content-Type", "audio/wav")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}.wav\"", callid),
+                )
+                .header("Content-Length", file_len)
+                .body(body)
+                .unwrap();
+
+            let _ = std::fs::remove_file(&path);
+            response
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+        )
             .into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -224,20 +308,24 @@ mod tests {
         let mut packets = Vec::new(); // should use Vec<(i32, u64, Vec<u8>)>
         let payload = vec![0x7F; 160]; // Silence
 
-        // 12 bytes dummy header
+        // 12 bytes RTP header
         let mut header = vec![0u8; 12];
+        header[0] = 0x80; // RTP v2
         header[1] = 0; // PCMU
 
         let mut p1 = header.clone();
+        p1[4..8].copy_from_slice(&1000u32.to_be_bytes());
         p1.extend_from_slice(&payload);
         packets.push((0, 1000u64, p1));
 
         let mut p2 = header.clone();
+        p2[4..8].copy_from_slice(&1000u32.to_be_bytes());
         p2.extend_from_slice(&payload);
         packets.push((1, 1000u64, p2));
 
         // Next 20ms
         let mut p3 = header.clone();
+        p3[4..8].copy_from_slice(&1160u32.to_be_bytes());
         p3.extend_from_slice(&payload);
         packets.push((0, 1160u64, p3));
 

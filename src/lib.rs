@@ -1,11 +1,13 @@
 pub mod addons;
+pub mod api;
 pub mod app;
+pub mod auth;
+pub mod auto_external_ip;
 pub mod call;
 pub mod callrecord;
 pub mod config;
 #[cfg(feature = "console")]
 pub mod console;
-pub mod fixtures;
 pub mod handler;
 pub mod license;
 
@@ -19,6 +21,7 @@ pub mod rwi;
 pub mod sipflow;
 pub mod storage;
 pub mod tls_reloader;
+pub mod http_util;
 pub mod tts;
 pub mod utils;
 pub mod version;

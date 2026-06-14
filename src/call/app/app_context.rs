@@ -1,3 +1,6 @@
+use crate::call::app::CallApp;
+use crate::call::app::ivr::trace::IvrTraceCollector;
+use crate::call::runtime::PostCallHook;
 use crate::config::Config;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
@@ -19,6 +22,13 @@ pub struct CallInfo {
     pub direction: String,
     /// When the session started.
     pub started_at: DateTime<Utc>,
+    /// All SIP headers from the original INVITE (excluding standard transport
+    /// headers like Via, Max-Forwards, Call-ID, CSeq, Content-Length).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub sip_headers: HashMap<String, String>,
+    /// Name of the matched routing rule that dispatched this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_name: Option<String>,
 }
 
 pub struct AppSharedState {
@@ -96,6 +106,31 @@ pub struct ApplicationContext {
 
     /// System configuration.
     pub config: Arc<Config>,
+
+    /// RWI gateway for emitting real-time events.
+    pub rwi_gateway: Option<crate::rwi::RwiGatewayRef>,
+
+    /// IVR step trace collector for debugging (optional).
+    pub ivr_trace: Option<Arc<IvrTraceCollector>>,
+
+    /// Custom call app factories (registered by addons).
+    pub app_factories: Arc<
+        Vec<(
+            &'static str,
+            Arc<
+                dyn Fn(
+                        &str,
+                        Option<serde_json::Value>,
+                        &ApplicationContext,
+                    ) -> Option<Box<dyn CallApp>>
+                    + Send
+                    + Sync,
+            >,
+        )>,
+    >,
+
+    /// Post-call hook (registered by callcenter addon).
+    pub post_call_hook: Option<Arc<dyn PostCallHook>>,
 }
 
 impl ApplicationContext {
@@ -108,6 +143,10 @@ impl ApplicationContext {
             http_client: reqwest::Client::new(),
             call_info,
             config,
+            rwi_gateway: None,
+            ivr_trace: None,
+            app_factories: Arc::new(Vec::new()),
+            post_call_hook: None,
         }
     }
 
@@ -137,6 +176,31 @@ impl ApplicationContext {
     }
 }
 
+/// Extract all SIP headers from a request into a `HashMap`, skipping standard
+/// transport/dialog headers that already have typed representations.
+pub fn extract_sip_headers(request: &rsipstack::sip::Request) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    for h in request.headers.iter() {
+        let skip = matches!(
+            h,
+            rsipstack::sip::Header::Via(_)
+                | rsipstack::sip::Header::MaxForwards(_)
+                | rsipstack::sip::Header::CallId(_)
+                | rsipstack::sip::Header::CSeq(_)
+                | rsipstack::sip::Header::ContentLength(_)
+                | rsipstack::sip::Header::ContentType(_)
+                | rsipstack::sip::Header::From(_)
+                | rsipstack::sip::Header::To(_)
+                | rsipstack::sip::Header::UserAgent(_)
+                | rsipstack::sip::Header::Allow(_)
+        );
+        if !skip {
+            headers.insert(h.name().to_string(), h.value().to_string());
+        }
+    }
+    headers
+}
+
 impl std::fmt::Debug for ApplicationContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApplicationContext")
@@ -156,6 +220,8 @@ mod tests {
             callee: "sip:bob@example.com".to_string(),
             direction: "inbound".to_string(),
             started_at: Utc::now(),
+            sip_headers: HashMap::new(),
+            route_name: None,
         }
     }
 
@@ -189,5 +255,69 @@ mod tests {
         // Overwrite
         ctx.set_var("lang", "en").await;
         assert_eq!(ctx.get_var("lang").await, Some("en".to_string()));
+    }
+
+    #[test]
+    fn test_routed_headers_override_originals_in_call_info() {
+        // Simulate the merge logic used in SipSession::new():
+        // routed headers should override original SIP request headers
+        use rsipstack::sip::{Header, Request, Method, Uri};
+
+        let mut req = Request {
+            method: Method::Invite,
+            uri: Uri::try_from("sip:test@pbx.com").unwrap(),
+            version: rsipstack::sip::Version::V2,
+            headers: vec![
+                Header::Other("X-Custom".to_string(), "original-value".to_string()),
+                Header::Other("X-Forwarded-For".to_string(), "192.168.1.1".to_string()),
+            ].into(),
+            body: vec![],
+        };
+        // Add a typed header to ensure it's still skipped by extract
+        req.headers.push(
+            rsipstack::sip::typed::From {
+                display_name: None,
+                uri: Uri::try_from("sip:alice@example.com").unwrap(),
+                params: vec![],
+            }.into(),
+        );
+
+        let original = extract_sip_headers(&req);
+        assert_eq!(original.get("X-Custom").unwrap(), "original-value");
+        assert_eq!(original.get("X-Forwarded-For").unwrap(), "192.168.1.1");
+        assert!(original.get("From").is_none(), "From header should be skipped");
+
+        // Simulate routing-modified headers (overriding X-Custom, adding P-Asserted-Identity)
+        let routed_headers: Option<Vec<Header>> = Some(vec![
+            Header::Other("X-Custom".to_string(), "routing-value".to_string()),
+            Header::Other("P-Asserted-Identity".to_string(), "<sip:routing@pbx.com>".to_string()),
+        ]);
+
+        // Apply the same merge logic as in sip_session.rs
+        let mut merged = original;
+        if let Some(ref routed) = routed_headers {
+            for h in routed {
+                merged.insert(h.name().to_string(), h.value().to_string());
+            }
+        }
+
+        // Verify routing headers override originals
+        assert_eq!(
+            merged.get("X-Custom").unwrap(),
+            "routing-value",
+            "routed headers should override original"
+        );
+        // Verify unmodified original headers are preserved
+        assert_eq!(
+            merged.get("X-Forwarded-For").unwrap(),
+            "192.168.1.1",
+            "unmodified original headers should persist"
+        );
+        // Verify new headers from routing are added
+        assert_eq!(
+            merged.get("P-Asserted-Identity").unwrap(),
+            "<sip:routing@pbx.com>",
+            "new routing headers should be present"
+        );
     }
 }

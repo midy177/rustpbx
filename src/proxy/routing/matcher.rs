@@ -14,9 +14,14 @@ use tracing::info;
 
 use crate::{
     call::{DialDirection, RoutingState, policy::PolicyCheckStatus},
-    config::{DialplanHints, RouteResult},
-    proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
+    config::{DialplanHints, MediaProxyMode, RouteResult},
+    proxy::routing::{
+        ActionType, MediaMode, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig,
+    },
 };
+
+// Debug routes are now stored in ProxyDataContext.debug_routes
+// and checked upstream in call.rs before calling match_invite.
 
 #[derive(Debug, Default, Clone)]
 pub struct RouteTrace {
@@ -144,9 +149,16 @@ async fn match_invite_impl(
     mut trace: Option<&mut RouteTrace>,
 ) -> Result<RouteResult> {
     let mut option = option;
+    let mut source_hints = None;
+    if let Some(trunk) =
+        source_trunk.and_then(|source| trunks.and_then(|trunks| trunks.get(&source.name)))
+    {
+        merge_trunk_media_hints(&mut source_hints, trunk);
+    }
+
     let routes = match routes {
         Some(routes) => routes,
-        None => return Ok(RouteResult::NotHandled(option, None)),
+        None => return Ok(RouteResult::NotHandled(option, source_hints)),
     };
 
     // Extract URI information early to avoid borrowing conflicts
@@ -165,10 +177,6 @@ async fn match_invite_impl(
     // Traverse routing rules by priority
     for rule in routes {
         if let Some(true) = rule.disabled {
-            continue;
-        }
-
-        if !rule.direction.matches(direction) {
             continue;
         }
 
@@ -274,16 +282,11 @@ async fn match_invite_impl(
             }
         }
 
-        let hints = if !rule.codecs.is_empty() || rule.disable_ice_servers.is_some() {
-            let mut hints = DialplanHints::default();
-            if !rule.codecs.is_empty() {
-                hints.allow_codecs = Some(rule.codecs.clone());
-            }
+        let mut hints = source_hints.clone();
+        if rule.disable_ice_servers.is_some() {
+            let hints = hints.get_or_insert_with(DialplanHints::default);
             hints.disable_ice_servers = rule.disable_ice_servers;
-            Some(hints)
-        } else {
-            None
-        };
+        }
 
         // Handle based on action type
         match rule.action.get_action_type() {
@@ -383,6 +386,7 @@ async fn match_invite_impl(
                         }
 
                         apply_trunk_config(&mut option, trunk_config)?;
+                        merge_trunk_media_hints(&mut hints, trunk_config);
                         info!(
                             "Selected trunk: {} for destination: {}",
                             selected_trunk, trunk_config.dest
@@ -390,6 +394,11 @@ async fn match_invite_impl(
                     } else {
                         info!("Trunk '{}' not found in configuration", selected_trunk);
                     }
+                }
+                if !rule.codecs.is_empty() {
+                    hints
+                        .get_or_insert_with(DialplanHints::default)
+                        .allow_codecs = Some(rule.codecs.clone());
                 }
                 return Ok(RouteResult::Forward(option, hints));
             }
@@ -489,10 +498,16 @@ async fn match_invite_impl(
                                 }
                             }
                             apply_trunk_config(&mut option, trunk_config)?;
+                            merge_trunk_media_hints(&mut hints, trunk_config);
                         }
                     }
                 }
 
+                if !rule.codecs.is_empty() {
+                    hints
+                        .get_or_insert_with(DialplanHints::default)
+                        .allow_codecs = Some(rule.codecs.clone());
+                }
                 return Ok(RouteResult::Queue {
                     option,
                     queue: queue_plan,
@@ -516,7 +531,7 @@ async fn match_invite_impl(
         }
     }
 
-    Ok(RouteResult::NotHandled(option, None))
+    Ok(RouteResult::NotHandled(option, source_hints))
 }
 
 /// Context for rule matching to reduce function arguments
@@ -711,7 +726,6 @@ fn extract_regex_captures(pattern: &str, value: &str) -> Result<Option<Vec<Strin
         return Ok(None);
     }
 
-    // Compile pattern as regex to obtain capture groups
     let regex =
         Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
     if let Some(captures) = regex.captures(value) {
@@ -745,7 +759,6 @@ fn matches_pattern(pattern: &str, value: &str) -> Result<bool> {
         return Ok(pattern == value);
     }
 
-    // Use regex matching
     let regex =
         Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
     Ok(regex.is_match(value))
@@ -1146,18 +1159,10 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
         .try_into()
         .map_err(|e| anyhow!("Invalid trunk destination '{}': {:?}", trunk.dest, e))?;
 
-    let transport = if let Some(transport_str) = &trunk.transport {
-        match transport_str.to_lowercase().as_str() {
-            "udp" => Some(rsipstack::sip::transport::Transport::Udp),
-            "tcp" => Some(rsipstack::sip::transport::Transport::Tcp),
-            "tls" => Some(rsipstack::sip::transport::Transport::Tls),
-            "ws" => Some(rsipstack::sip::transport::Transport::Ws),
-            "wss" => Some(rsipstack::sip::transport::Transport::Wss),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let transport = trunk
+        .transport
+        .as_deref()
+        .and_then(super::resolve_transport_from_str);
 
     option.destination = Some(SipAddr {
         r#type: transport,
@@ -1198,4 +1203,41 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
     }
 
     Ok(())
+}
+
+fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkConfig) {
+    if trunk.codec.is_empty()
+        && trunk.media_mode.is_none()
+        && trunk.video_policy.is_none()
+        && trunk.recording.is_none()
+        && trunk.ringback.is_none()
+    {
+        return;
+    }
+
+    let hints = hints.get_or_insert_with(DialplanHints::default);
+    if !trunk.codec.is_empty() {
+        hints.allow_codecs = Some(trunk.codec.clone());
+    }
+    if let Some(media_mode) = trunk.media_mode.clone() {
+        hints.media_mode = Some(trunk_media_mode_to_proxy_mode(media_mode));
+    }
+    if let Some(video_policy) = trunk.video_policy.clone() {
+        hints.video_policy = Some(video_policy);
+    }
+    if let Some(recording) = trunk.recording.clone() {
+        hints.recording = Some(recording);
+    }
+    if let Some(ringback) = &trunk.ringback {
+        hints.ringback = Some(ringback.clone());
+    }
+}
+
+fn trunk_media_mode_to_proxy_mode(mode: MediaMode) -> MediaProxyMode {
+    match mode {
+        MediaMode::None => MediaProxyMode::None,
+        MediaMode::Bypass => MediaProxyMode::Bypass,
+        MediaMode::Auto => MediaProxyMode::Auto,
+        MediaMode::ForceTranscode => MediaProxyMode::All,
+    }
 }

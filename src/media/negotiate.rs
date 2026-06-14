@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use audio_codec::CodecType;
 use rustrtc::{Attribute, MediaKind, SdpType, SessionDescription};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 /// Parsed RTP codec information from SDP
 #[derive(Debug, Clone)]
@@ -13,15 +13,15 @@ pub struct CodecInfo {
 }
 
 impl CodecInfo {
+    fn clamp_channels(channels: u16) -> u8 {
+        if channels > u8::MAX as u16 { u8::MAX } else { channels as u8 }
+    }
+
     pub fn to_params(&self) -> rustrtc::RtpCodecParameters {
         rustrtc::RtpCodecParameters {
             payload_type: self.payload_type,
             clock_rate: self.clock_rate,
-            channels: if self.channels > 255 {
-                255
-            } else {
-                self.channels as u8
-            },
+            channels: Self::clamp_channels(self.channels),
         }
     }
 
@@ -51,11 +51,7 @@ impl CodecInfo {
             payload_type: self.payload_type,
             codec_name,
             clock_rate: self.clock_rate,
-            channels: if self.channels > u8::MAX as u16 {
-                u8::MAX
-            } else {
-                self.channels as u8
-            },
+            channels: Self::clamp_channels(self.channels),
             fmtp: default_fmtp,
             rtcp_fbs: vec![],
         })
@@ -78,7 +74,7 @@ pub struct NegotiationResult {
 }
 
 /// A single negotiated codec with its RTP parameters from SDP answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedCodec {
     pub codec: CodecType,
     pub payload_type: u8,
@@ -88,7 +84,7 @@ pub struct NegotiatedCodec {
 
 /// Per-leg negotiated media profile extracted from an SDP answer.
 /// Contains the selected audio codec, video codec, and the selected DTMF entry for that answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedLegProfile {
     pub audio: Option<NegotiatedCodec>,
     pub video: Option<NegotiatedCodec>,
@@ -108,38 +104,24 @@ impl Default for NegotiatedLegProfile {
     }
 }
 
+/// Bridge codec lists for caller-facing and callee-facing sides.
+#[derive(Debug, Clone)]
+pub struct BridgeCodecLists {
+    pub caller_side: Vec<CodecInfo>,
+    pub callee_side: Vec<CodecInfo>,
+}
+
 /// Media negotiator for SDP parsing and codec selection
 pub struct MediaNegotiator;
 
-/// Codec lists for both sides of a WebRTC↔RTP transport bridge.
-#[derive(Debug, Clone)]
-pub struct BridgeCodecLists {
-    /// Codecs for the caller-facing side of the bridge
-    pub caller_side: Vec<CodecInfo>,
-    /// Codecs for the callee-facing side of the bridge
-    pub callee_side: Vec<CodecInfo>,
-    /// Codecs that are supported by BOTH sides (intersection of caller_side and callee_side).
-    /// This preserves caller payload types for common codecs.
-    pub common: Vec<CodecInfo>,
-}
-
 impl MediaNegotiator {
-    fn parse_audio_section(sdp_str: &str) -> Option<rustrtc::MediaSection> {
+    fn parse_media_section(sdp_str: &str, kind: MediaKind) -> Option<rustrtc::MediaSection> {
         SessionDescription::parse(SdpType::Answer, sdp_str)
             .or_else(|_| SessionDescription::parse(SdpType::Offer, sdp_str))
             .ok()?
             .media_sections
             .into_iter()
-            .find(|m| m.kind == MediaKind::Audio)
-    }
-
-    fn parse_video_section(sdp_str: &str) -> Option<rustrtc::MediaSection> {
-        SessionDescription::parse(SdpType::Answer, sdp_str)
-            .or_else(|_| SessionDescription::parse(SdpType::Offer, sdp_str))
-            .ok()?
-            .media_sections
-            .into_iter()
-            .find(|m| m.kind == MediaKind::Video)
+            .find(|m| m.kind == kind)
     }
 
     fn parse_rtpmap_attributes(
@@ -264,7 +246,7 @@ impl MediaNegotiator {
         let mut extracted = ExtractedCodecs::default();
 
         // Extract audio codecs
-        if let Some(section) = Self::parse_audio_section(sdp_str) {
+        if let Some(section) = Self::parse_media_section(sdp_str, MediaKind::Audio) {
             for codec in Self::extract_ordered_codecs_from_section(&section) {
                 if codec.is_dtmf() {
                     extracted.dtmf.push(codec);
@@ -275,7 +257,7 @@ impl MediaNegotiator {
         }
 
         // Extract video codecs
-        if let Some(section) = Self::parse_video_section(sdp_str) {
+        if let Some(section) = Self::parse_media_section(sdp_str, MediaKind::Video) {
             for codec in Self::extract_ordered_codecs_from_section(&section) {
                 extracted.video.push(codec);
             }
@@ -379,21 +361,6 @@ impl MediaNegotiator {
         ]
     }
 
-    fn supported_codecs_for_transport(is_webrtc: bool) -> Vec<CodecType> {
-        if is_webrtc {
-            Self::default_webrtc_codecs()
-        } else {
-            Self::default_rtp_codecs()
-        }
-    }
-
-    fn allowed_supported_codecs(is_webrtc: bool, allow_codecs: &[CodecType]) -> Vec<CodecType> {
-        Self::supported_codecs_for_transport(is_webrtc)
-            .into_iter()
-            .filter(|codec| allow_codecs.is_empty() || allow_codecs.contains(codec))
-            .collect()
-    }
-
     pub(crate) fn codec_info_for_type(codec_type: CodecType) -> CodecInfo {
         CodecInfo {
             payload_type: codec_type.payload_type(),
@@ -403,12 +370,79 @@ impl MediaNegotiator {
         }
     }
 
-    /// Get preferred codec from a list
-    pub fn get_preferred_codec(codecs: &[CodecType]) -> Option<CodecType> {
-        codecs
-            .iter()
-            .find(|c| **c != CodecType::TelephoneEvent)
-            .copied()
+    fn codec_info_rtpmap(info: &CodecInfo) -> String {
+        let codec_name = match info.codec {
+            CodecType::PCMU => "PCMU",
+            CodecType::PCMA => "PCMA",
+            CodecType::G722 => "G722",
+            CodecType::G729 => "G729",
+            #[cfg(feature = "opus")]
+            CodecType::Opus => "opus",
+            CodecType::TelephoneEvent => "telephone-event",
+        };
+
+        match info.channels {
+            0 | 1 => format!("{}/{}", codec_name, info.clock_rate),
+            channels => format!("{}/{}/{}", codec_name, info.clock_rate, channels),
+        }
+    }
+
+    fn audio_clock_rates_in_order(codecs: &[CodecInfo]) -> Vec<u32> {
+        let mut rates = Vec::new();
+        let mut seen = HashSet::new();
+
+        for codec in codecs {
+            if codec.is_dtmf() || !codec.codec.is_audio() {
+                continue;
+            }
+            if seen.insert(codec.clock_rate) {
+                rates.push(codec.clock_rate);
+            }
+        }
+
+        rates
+    }
+
+    fn next_telephone_event_payload_type(used_pts: &HashSet<u8>) -> u8 {
+        let default_pt = CodecType::TelephoneEvent.payload_type();
+        if !used_pts.contains(&default_pt) {
+            return default_pt;
+        }
+
+        ((default_pt + 1)..=127)
+            .chain(96..default_pt)
+            .find(|pt| !used_pts.contains(pt))
+            .unwrap_or(default_pt)
+    }
+
+    fn append_telephone_events_for_audio(
+        result: &mut Vec<CodecInfo>,
+        offered_dtmf: &[CodecInfo],
+        generate_missing: bool,
+    ) {
+        let clock_rates = Self::audio_clock_rates_in_order(result);
+        if clock_rates.is_empty() {
+            return;
+        }
+
+        let mut used_pts: HashSet<u8> = result.iter().map(|codec| codec.payload_type).collect();
+        for clock_rate in clock_rates {
+            if let Some(dtmf) = offered_dtmf.iter().find(|codec| {
+                codec.clock_rate == clock_rate && !used_pts.contains(&codec.payload_type)
+            }) {
+                used_pts.insert(dtmf.payload_type);
+                result.push(dtmf.clone());
+            } else if generate_missing {
+                let payload_type = Self::next_telephone_event_payload_type(&used_pts);
+                used_pts.insert(payload_type);
+                result.push(CodecInfo {
+                    payload_type,
+                    codec: CodecType::TelephoneEvent,
+                    clock_rate,
+                    channels: 1,
+                });
+            }
+        }
     }
 
     /// Extract a negotiated leg profile from an SDP answer.
@@ -456,7 +490,12 @@ impl MediaNegotiator {
             }
         };
 
-        NegotiatedLegProfile { audio, video, dtmf, transport: rustrtc::TransportMode::Rtp }
+        NegotiatedLegProfile {
+            audio,
+            video,
+            dtmf,
+            transport: rustrtc::TransportMode::Rtp,
+        }
     }
 
     fn attr_payload_type(attr: &rustrtc::sdp::Attribute) -> Option<u8> {
@@ -464,33 +503,20 @@ impl MediaNegotiator {
         value.split_whitespace().next()?.parse::<u8>().ok()
     }
 
-    fn codec_signature(codec: &CodecInfo) -> String {
-        format!("{:?}/{}/{}", codec.codec, codec.clock_rate, codec.channels)
-    }
-
-    /// Restrict generated SDP to the subset of codecs that also appear in a
-    /// reference SDP, and mirror the reference media directions.
+    /// Restrict generated SDP video to the subset of codecs that also appear in
+    /// a reference SDP, and mirror reference media directions.
     ///
     /// The generated SDP stays the source of truth for WebRTC-specific SDP, ICE,
-    /// DTLS, and candidates. Filtering is done by codec identity using the
-    /// generated SDP order, while preserving payload types already chosen by the
-    /// local PeerConnection.
-    ///
-    /// `filter_audio_to_reference=true` is for pass-through/performance mode:
-    /// both legs must share one audio codec. `false` is for transcoding mode:
-    /// keep the local leg's generated audio codecs and let each leg negotiate
-    /// independently.
+    /// DTLS, and candidates. Audio codecs are not filtered here; all generated
+    /// audio SDP should be rewritten by the shared codec policy helpers.
     pub fn restrict_sdp_to_reference_codecs(
         sdp_type: SdpType,
         sdp: &str,
         reference_sdp_type: SdpType,
         reference_sdp: &str,
-        filter_audio_to_reference: bool,
     ) -> Option<String> {
         let mut desc = SessionDescription::parse(sdp_type, sdp).ok()?;
         let reference_desc = SessionDescription::parse(reference_sdp_type, reference_sdp).ok()?;
-        let source_codecs = Self::extract_codec_params(sdp);
-        let reference_codecs = Self::extract_codec_params(reference_sdp);
         let source_video_caps = desc.to_video_capabilities();
         let reference_video_caps = reference_desc.to_video_capabilities();
 
@@ -505,39 +531,6 @@ impl MediaNegotiator {
                 .find(|section| section.kind == MediaKind::Audio)
             {
                 audio_section.direction = reference_audio.direction;
-            }
-
-            let accepted_by_reference: HashSet<String> = reference_codecs
-                .audio
-                .iter()
-                .chain(reference_codecs.dtmf.iter())
-                .map(Self::codec_signature)
-                .collect();
-
-            if filter_audio_to_reference && !accepted_by_reference.is_empty() {
-                let mut allowed_pts = Vec::new();
-                let mut seen_pts = HashSet::new();
-                for codec in source_codecs.audio.iter().chain(source_codecs.dtmf.iter()) {
-                    let signature = Self::codec_signature(codec);
-                    if accepted_by_reference.contains(&signature)
-                        && seen_pts.insert(codec.payload_type)
-                    {
-                        allowed_pts.push(codec.payload_type);
-                    }
-                }
-                if allowed_pts.is_empty() {
-                    return None;
-                }
-
-                audio_section.formats = allowed_pts.iter().map(|pt| pt.to_string()).collect();
-                audio_section
-                    .attributes
-                    .retain(|attr| match attr.key.as_str() {
-                        "rtpmap" | "fmtp" | "rtcp-fb" => {
-                            Self::attr_payload_type(attr).is_none_or(|pt| allowed_pts.contains(&pt))
-                        }
-                        _ => true,
-                    });
             }
         }
 
@@ -661,116 +654,81 @@ impl MediaNegotiator {
         )
     }
 
-    /// Build codec list for callee offer in anchored media mode.
+    /// Build codec list for an outgoing offer to the callee.
     ///
     /// Algorithm:
-    /// 1. Keep caller's codecs that PBX supports (preserving caller's order and PT)
-    /// 2. Append extras: iterate allow_codecs in config order (or default transport order
-    ///    when allow_codecs is empty), appending PBX-supported codecs not already present
-    /// 3. For DTMF: if the caller offered telephone-event, keep compatible
-    ///    telephone-event entries and append missing variants required by audio codecs
-    ///    (8000 for narrowband codecs, 48000 for Opus)
-    pub fn build_callee_codec_offer(caller_sdp: &str, is_webrtc: bool) -> Vec<CodecInfo> {
-        Self::build_callee_codec_offer_with_allow(caller_sdp, is_webrtc, &[])
-    }
-
+    /// 1. Use the configured policy order. When policy is empty, use the PBX default order.
+    /// 2. Offer caller-common codecs first in that order, preserving caller PT.
+    /// 3. Append policy codecs the caller did not offer, using local default PTs. These
+    ///    extras allow transcoding when the callee cannot use any caller codec.
+    /// 4. For DTMF: append telephone-event entries after the final audio codec
+    ///    list, one per audio RTP clock rate, preserving the final audio clock-rate
+    ///    order. Caller-offered telephone-event PTs are reused when their rate
+    ///    matches; missing rates are generated locally.
     pub fn build_callee_codec_offer_with_allow(
         caller_sdp: &str,
-        is_webrtc: bool,
         allow_codecs: &[CodecType],
     ) -> Vec<CodecInfo> {
         let extracted = Self::extract_codec_params(caller_sdp);
-        let supported = Self::allowed_supported_codecs(is_webrtc, allow_codecs);
+        let codec_order = if allow_codecs.is_empty() {
+            Self::default_rtp_codecs()
+        } else {
+            allow_codecs.to_vec()
+        };
+        let offer_order: Vec<_> = codec_order
+            .into_iter()
+            .filter(|codec| *codec != CodecType::TelephoneEvent && codec.is_audio())
+            .collect();
 
         let mut result: Vec<CodecInfo> = Vec::new();
-        let mut seen_codecs: BTreeSet<CodecType> = BTreeSet::new();
 
-        // 1. Keep caller's audio codecs that PBX supports (preserve order & PT)
-        for codec in &extracted.audio {
-            if supported.contains(&codec.codec) {
-                result.push(codec.clone());
-                seen_codecs.insert(codec.codec);
+        for codec_type in &offer_order {
+            if let Some(codec) = extracted
+                .audio
+                .iter()
+                .find(|codec| codec.codec == *codec_type)
+                .cloned()
+            {
+                result.push(codec);
             }
         }
 
-        // 2. Append extras in allow_codecs order (admin/trunk preference).
-        //    When allow_codecs is empty (no restriction), use the default transport order.
-        let extras_order: Vec<CodecType> = if allow_codecs.is_empty() {
-            supported.clone()
-        } else {
-            allow_codecs
-                .iter()
-                .filter(|c| supported.contains(c))
-                .copied()
-                .collect()
-        };
-        for codec_type in extras_order {
-            if codec_type == CodecType::TelephoneEvent {
-                continue; // handle DTMF separately
-            }
-            if !seen_codecs.contains(&codec_type) {
+        for codec_type in offer_order {
+            if !extracted.audio.iter().any(|codec| codec.codec == codec_type) {
                 result.push(Self::codec_info_for_type(codec_type));
-                seen_codecs.insert(codec_type);
             }
         }
 
-        if !extracted.dtmf.is_empty() {
-            // Telephone-event clock rate must match the RTP clock of the media stream:
-            //   - 8000 Hz for G.711, G.729, G.722 (G.722's RTP clock is 8000 despite wideband audio)
-            //   - 48000 Hz for Opus
-            // Filter caller's DTMF entries to only include rates relevant to the audio
-            // codecs actually present in the result.  This avoids orphaned TE/48000 entries
-            // when Opus was in the caller offer but was excluded by allow_codecs, and
-            // correctly triggers TE/48000 generation when Opus was added as an extra.
-            let has_opus = result.iter().any(|c| c.codec == CodecType::Opus);
-            let has_non_opus = result
-                .iter()
-                .any(|c| c.codec.is_audio() && c.codec != CodecType::Opus);
-
-            let mut seen_dtmf_rates: HashSet<u32> = HashSet::new();
-            for dtmf in &extracted.dtmf {
-                let relevant = match dtmf.clock_rate {
-                    48000 => has_opus,
-                    _ => has_non_opus, // 8000 (and any non-standard rate) — covers G.711/G.729/G.722
-                };
-                if relevant {
-                    result.push(dtmf.clone());
-                    seen_dtmf_rates.insert(dtmf.clock_rate);
-                }
-            }
-
-            // Ensure every audio clock domain has a telephone-event entry.
-            // This is needed when an extra codec was added (e.g., Opus via allow_codecs)
-            // whose RTP clock rate differs from what the caller originally offered.
-            let mut needed_rates: Vec<u32> = Vec::new();
-            if has_non_opus && !seen_dtmf_rates.contains(&8000) {
-                needed_rates.push(8000);
-            }
-            if has_opus && !seen_dtmf_rates.contains(&48000) {
-                needed_rates.push(48000);
-            }
-
-            let mut used_pts: HashSet<u8> = result.iter().map(|c| c.payload_type).collect();
-            for rate in needed_rates {
-                let default_pt = CodecType::TelephoneEvent.payload_type();
-                let pt = if !used_pts.contains(&default_pt) {
-                    default_pt
-                } else {
-                    (96..=127)
-                        .find(|p| !used_pts.contains(p))
-                        .unwrap_or(default_pt)
-                };
-                used_pts.insert(pt);
-                result.push(CodecInfo {
-                    payload_type: pt,
-                    clock_rate: rate,
-                    channels: 1,
-                    codec: CodecType::TelephoneEvent,
-                });
-            }
-        }
+        Self::append_telephone_events_for_audio(&mut result, &extracted.dtmf, true);
 
         result
+    }
+
+    /// Remove codecs that should not be advertised in generated WebRTC offers.
+    ///
+    /// If filtering removes every audio codec, fall back to the WebRTC default
+    /// offer set so the generated SDP does not contain a DTMF-only audio m-line.
+    pub fn filter_webrtc_offer_codecs(
+        caller_sdp: &str,
+        codecs: Vec<CodecInfo>,
+    ) -> Vec<CodecInfo> {
+        let mut filtered: Vec<_> = codecs
+            .into_iter()
+            .filter(|codec| codec.codec != CodecType::G729)
+            .collect();
+
+        let audio_clock_rates: HashSet<_> =
+            Self::audio_clock_rates_in_order(&filtered).into_iter().collect();
+        if audio_clock_rates.is_empty() {
+            return Self::build_callee_codec_offer_with_allow(
+                caller_sdp,
+                &Self::default_webrtc_codecs(),
+            );
+        }
+
+        filtered
+            .retain(|codec| !codec.is_dtmf() || audio_clock_rates.contains(&codec.clock_rate));
+        filtered
     }
 
     pub fn rewrite_sdp_codec_list(sdp: &str, new_codecs: &[CodecInfo]) -> Option<String> {
@@ -789,7 +747,7 @@ impl MediaNegotiator {
             section.formats.clear();
             section
                 .attributes
-                .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
+                .retain(|a| !matches!(a.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
 
             let mut seen_pts = HashSet::new();
             for info in new_codecs {
@@ -800,7 +758,7 @@ impl MediaNegotiator {
                 section.formats.push(pt.to_string());
                 section.attributes.push(Attribute {
                     key: "rtpmap".to_string(),
-                    value: Some(format!("{} {}", pt, info.codec.rtpmap())),
+                    value: Some(format!("{} {}", pt, Self::codec_info_rtpmap(info))),
                 });
                 if let Some(fmtp) = info.codec.fmtp() {
                     section.attributes.push(Attribute {
@@ -814,90 +772,70 @@ impl MediaNegotiator {
         Some(desc.to_sdp_string())
     }
 
-    pub fn build_caller_answer_codec_list(caller_sdp: &str, is_webrtc: bool) -> Vec<CodecInfo> {
-        Self::build_caller_answer_codec_list_with_allow(caller_sdp, is_webrtc, &[])
-    }
-
-    pub fn build_caller_answer_codec_list_with_allow(
-        caller_sdp: &str,
-        is_webrtc: bool,
-        allow_codecs: &[CodecType],
-    ) -> Vec<CodecInfo> {
-        let extracted = Self::extract_codec_params(caller_sdp);
-        let supported = Self::allowed_supported_codecs(is_webrtc, allow_codecs);
-
-        let mut result = Vec::new();
-        for codec in extracted.audio {
-            if supported.contains(&codec.codec) {
-                result.push(codec);
-            }
-        }
-        for codec in extracted.dtmf {
-            result.push(codec);
-        }
-
-        result
-    }
-
-    /// Build codec lists for a transport bridge (WebRTC↔RTP).
+    /// Build a codec list constrained by an offer and an ordered preference list.
     ///
-    /// Algorithm:
-    /// 1. Caller side is a strict subset of the caller offer, filtered by transport support and `allow_codecs`
-    /// 2. Callee side: caller's supported codecs first (in caller order), then extras from
-    ///    allow_codecs in config order
-    /// 3. Compute the intersection (common) for codec-aligned fallback paths
+    /// The returned audio codecs are always a subset of the offer and keep the
+    /// order of `preferred_codecs`. When `preferred_codecs` is empty, or none
+    /// of the preferred codecs exists in the offer, this falls back to the
+    /// offer's audio codec order.
+    /// Build both caller-side and callee-side codec lists for a bridge.
+    ///
+    /// `caller_sdp` is the SDP from the caller.
+    /// `caller_is_webrtc` / `callee_is_webrtc` control WebRTC-specific filtering
+    /// (e.g., G729 removal from WebRTC sides).
+    /// `allow_codecs` specifies the allowed codec set (pass-through or generated).
     pub fn build_bridge_codec_lists(
         caller_sdp: &str,
         caller_is_webrtc: bool,
         callee_is_webrtc: bool,
         allow_codecs: &[CodecType],
     ) -> BridgeCodecLists {
-        let caller_side = Self::build_caller_answer_codec_list_with_allow(
-            caller_sdp,
-            caller_is_webrtc,
-            allow_codecs,
-        );
-        let callee_side =
-            Self::build_callee_codec_offer_with_allow(caller_sdp, callee_is_webrtc, allow_codecs);
+        let mut caller_side = Self::build_codec_list_from_offer(caller_sdp, allow_codecs);
+        let mut callee_side = Self::build_callee_codec_offer_with_allow(caller_sdp, allow_codecs);
 
-        // Keep caller payload types for common codecs; side-specific lists can differ
-        // when the bridge configures transcoders after both legs answer.
-        let common: Vec<CodecInfo> = caller_side
+        if caller_is_webrtc {
+            caller_side = Self::filter_webrtc_offer_codecs(caller_sdp, caller_side);
+        }
+        if callee_is_webrtc {
+            callee_side = Self::filter_webrtc_offer_codecs(caller_sdp, callee_side);
+        }
+
+        BridgeCodecLists { caller_side, callee_side }
+    }
+
+    pub fn build_codec_list_from_offer(
+        offer_sdp: &str,
+        preferred_codecs: &[CodecType],
+    ) -> Vec<CodecInfo> {
+        let extracted = Self::extract_codec_params(offer_sdp);
+        let policy: Vec<_> = preferred_codecs
             .iter()
-            .filter(|c| callee_side.iter().any(|cc| cc.codec == c.codec))
-            .cloned()
+            .copied()
+            .filter(|codec| *codec != CodecType::TelephoneEvent && codec.is_audio())
             .collect();
 
-        BridgeCodecLists {
-            caller_side,
-            callee_side,
-            common,
-        }
-    }
+        let mut audio = Vec::new();
 
-    pub fn extract_ssrc(sdp: &str) -> Option<u32> {
-        // Try parsing as Answer first, then Offer if it fails (though usually it's Answer)
-        let session = SessionDescription::parse(SdpType::Answer, sdp)
-            .or_else(|_| SessionDescription::parse(SdpType::Offer, sdp))
-            .ok()?;
-
-        for section in session.media_sections {
-            if section.kind == MediaKind::Audio {
-                for attr in section.attributes {
-                    if attr.key == "ssrc"
-                        && let Some(value) = attr.value
-                    {
-                        // value format: "12345 cname:..." or just "12345"
-                        let ssrc_str = value.split_whitespace().next()?;
-                        if let Ok(ssrc) = ssrc_str.parse::<u32>() {
-                            return Some(ssrc);
-                        }
-                    }
-                }
+        for codec_type in &policy {
+            if let Some(codec) = extracted
+                .audio
+                .iter()
+                .find(|codec| codec.codec == *codec_type)
+                .cloned()
+            {
+                audio.push(codec);
             }
         }
-        None
+
+        if audio.is_empty() {
+            audio = extracted.audio.clone();
+        }
+
+        let mut result = audio;
+        Self::append_telephone_events_for_audio(&mut result, &extracted.dtmf, false);
+        result
     }
+
 }
 
 #[cfg(test)]
@@ -1320,32 +1258,27 @@ a=rtpmap:111 opus/48000/2\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            true,  // caller is WebRTC
-            false, // callee is RTP
-            &[CodecType::PCMU, CodecType::TelephoneEvent],
-        );
+        let policy = &[CodecType::PCMU, CodecType::TelephoneEvent];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
         // Caller side: Opus offered but filtered out (not in allow_codecs), PCMU kept
-        assert!(lists.caller_side.iter().any(|c| c.codec == CodecType::PCMU));
+        assert!(caller_side.iter().any(|c| c.codec == CodecType::PCMU));
         assert!(
-            !lists.caller_side.iter().any(|c| c.codec == CodecType::Opus),
+            !caller_side.iter().any(|c| c.codec == CodecType::Opus),
             "Opus not in allow_codecs"
         );
         assert!(
-            lists
-                .caller_side
+            caller_side
                 .iter()
                 .any(|c| c.codec == CodecType::TelephoneEvent)
         );
 
         // Callee side: only PCMU + telephone-event
-        assert!(lists.callee_side.iter().any(|c| c.codec == CodecType::PCMU));
-        assert!(!lists.callee_side.iter().any(|c| c.codec == CodecType::Opus));
+        assert!(callee_side.iter().any(|c| c.codec == CodecType::PCMU));
+        assert!(!callee_side.iter().any(|c| c.codec == CodecType::Opus));
         assert!(
-            lists
-                .callee_side
+            callee_side
                 .iter()
                 .any(|c| c.codec == CodecType::TelephoneEvent)
         );
@@ -1364,15 +1297,16 @@ a=rtpmap:111 opus/48000/2\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            true,  // caller is WebRTC
-            false, // callee is RTP
-            &[CodecType::Opus, CodecType::PCMU, CodecType::TelephoneEvent],
-        );
+        let policy = &[
+            CodecType::Opus,
+            CodecType::PCMU,
+            CodecType::TelephoneEvent,
+        ];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
         // Caller side: Opus first (caller offered it, it's in allow_codecs)
-        let caller_audio: Vec<_> = lists.caller_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let caller_audio: Vec<_> = caller_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(
             caller_audio[0].codec,
             CodecType::Opus,
@@ -1385,7 +1319,7 @@ a=rtpmap:101 telephone-event/8000\r\n";
         );
 
         // Callee side: Opus first per allow_codecs order
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let callee_audio: Vec<_> = callee_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(
             callee_audio[0].codec,
             CodecType::Opus,
@@ -1394,10 +1328,10 @@ a=rtpmap:101 telephone-event/8000\r\n";
         assert_eq!(callee_audio[1].codec, CodecType::PCMU);
     }
 
-    /// RTP caller offers G729+PCMU, callee is WebRTC →
-    /// G729 is NOT in WebRTC supported set, so callee side drops G729
+    /// RTP caller offers G729+PCMU and policy includes both.
+    /// Codec policy is independent from the SDP transport envelope.
     #[test]
-    fn test_bridge_codecs_g729_dropped_for_webrtc_side() {
+    fn test_bridge_codecs_keep_policy_codecs() {
         let caller_sdp = "v=0\r\n\
 o=- 1 1 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -1407,32 +1341,33 @@ a=rtpmap:18 G729/8000\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent],
-        );
+        let policy = &[
+            CodecType::G729,
+            CodecType::PCMU,
+            CodecType::TelephoneEvent,
+        ];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
-        // Caller side (RTP): G729 is in allow_codecs and supported for RTP
+        // Caller side: G729 is in policy and was offered.
         assert!(
-            lists.caller_side.iter().any(|c| c.codec == CodecType::G729),
-            "G729 OK on RTP caller side"
+            caller_side.iter().any(|c| c.codec == CodecType::G729),
+            "G729 must remain on caller side"
         );
-        assert!(lists.caller_side.iter().any(|c| c.codec == CodecType::PCMU));
+        assert!(caller_side.iter().any(|c| c.codec == CodecType::PCMU));
 
-        // Callee side (WebRTC): G729 NOT in WebRTC supported set → dropped
         assert!(
-            !lists.callee_side.iter().any(|c| c.codec == CodecType::G729),
-            "G729 dropped on WebRTC callee side"
+            callee_side.iter().any(|c| c.codec == CodecType::G729),
+            "G729 must remain on callee side because policy owns the codec list"
         );
         assert!(
-            lists.callee_side.iter().any(|c| c.codec == CodecType::PCMU),
-            "PCMU kept on WebRTC callee side"
+            callee_side.iter().any(|c| c.codec == CodecType::PCMU),
+            "PCMU must remain on callee side"
         );
     }
 
-    /// allow_codecs=[] → each side is filtered only by its own transport support.
+    /// allow_codecs=[] means no policy restriction: generated offers can use
+    /// the PBX default order, while the caller-facing side stays offer-constrained.
     #[test]
     fn test_bridge_codecs_empty_allow_codecs_fallback() {
         let caller_sdp = "v=0\r\n\
@@ -1443,29 +1378,63 @@ m=audio 10000 RTP/AVP 0 101\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[],   // empty allow_codecs
-        );
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[]);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, &[]);
 
-        let caller_audio: Vec<_> = lists.caller_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let caller_audio: Vec<_> = caller_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(caller_audio.len(), 1);
         assert_eq!(caller_audio[0].codec, CodecType::PCMU);
 
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let callee_audio: Vec<_> = callee_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert!(
             callee_audio
                 .iter()
                 .any(|codec| codec.codec == CodecType::PCMU),
-            "Callee side should include supported PCMU"
+            "Callee side should include caller-offered PCMU"
         );
         assert!(
             callee_audio
                 .iter()
                 .any(|codec| codec.codec == CodecType::G722),
-            "Callee side should include generated WebRTC-supported codecs"
+            "Empty policy should allow PBX-default extras on generated offers"
+        );
+    }
+
+    #[test]
+    fn test_passthrough_offer_never_generates_missing_policy_codecs() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+
+        let policy = &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent];
+        let generated_offer = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            policy,
+        );
+        assert!(
+            generated_offer.iter().any(|codec| codec.codec == CodecType::G729),
+            "Generated offers can add policy codecs for transcoding"
+        );
+
+        let passthrough_offer = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let passthrough_audio: Vec<_> = passthrough_offer
+            .iter()
+            .filter(|codec| !codec.is_dtmf())
+            .collect();
+        assert_eq!(passthrough_audio.len(), 1);
+        assert_eq!(passthrough_audio[0].codec, CodecType::PCMU);
+        assert!(
+            !passthrough_offer.iter().any(|codec| codec.codec == CodecType::G729),
+            "Pass-through offers must not advertise codecs missing from the caller offer"
+        );
+        assert!(
+            passthrough_offer
+                .iter()
+                .any(|codec| codec.codec == CodecType::TelephoneEvent)
         );
     }
 
@@ -1480,15 +1449,11 @@ m=audio 10000 RTP/AVP 0 101\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            false, // callee is RTP
-            &[CodecType::PCMU, CodecType::TelephoneEvent],
-        );
+        let policy = &[CodecType::PCMU, CodecType::TelephoneEvent];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
-        let caller_pcmu = lists
-            .caller_side
+        let caller_pcmu = caller_side
             .iter()
             .find(|c| c.codec == CodecType::PCMU)
             .unwrap();
@@ -1497,8 +1462,7 @@ a=rtpmap:101 telephone-event/8000\r\n";
             "Caller side should preserve caller PT 0"
         );
 
-        let callee_pcmu = lists
-            .callee_side
+        let callee_pcmu = callee_side
             .iter()
             .find(|c| c.codec == CodecType::PCMU)
             .unwrap();
@@ -1508,8 +1472,9 @@ a=rtpmap:101 telephone-event/8000\r\n";
         );
     }
 
-    /// Caller-side DTMF payload types and sample rates must come from the caller SDP.
-    /// Callee-side DTMF is generated from callee transport/policy.
+    /// Caller-side DTMF payload types come from the caller SDP, but only for
+    /// clock rates matching the final caller-side audio codecs.
+    /// Callee-side DTMF follows the final callee-side audio clock rates.
     #[test]
     fn test_bridge_codecs_preserves_caller_dtmf_payload_types_and_rates() {
         let caller_sdp = "v=0\r\n\
@@ -1521,37 +1486,209 @@ a=rtpmap:111 opus/48000/2\r\n\
 a=rtpmap:101 telephone-event/8000\r\n\
 a=rtpmap:110 telephone-event/48000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            true,  // caller is WebRTC
-            false, // callee is RTP
-            &[CodecType::Opus, CodecType::TelephoneEvent],
-        );
+        let policy = &[CodecType::Opus, CodecType::TelephoneEvent];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
-        let caller_dtmf: Vec<_> = lists
-            .caller_side
+        let caller_dtmf: Vec<_> = caller_side
             .iter()
             .filter(|c| c.codec == CodecType::TelephoneEvent)
             .collect();
-        assert_eq!(caller_dtmf.len(), 2);
-        assert_eq!(caller_dtmf[0].payload_type, 101);
-        assert_eq!(caller_dtmf[0].clock_rate, 8000);
-        assert_eq!(caller_dtmf[1].payload_type, 110);
-        assert_eq!(caller_dtmf[1].clock_rate, 48000);
+        assert_eq!(caller_dtmf.len(), 1);
+        assert_eq!(caller_dtmf[0].payload_type, 110);
+        assert_eq!(caller_dtmf[0].clock_rate, 48000);
 
-        let callee_dtmf: Vec<_> = lists
-            .callee_side
+        let callee_dtmf: Vec<_> = callee_side
             .iter()
             .filter(|c| c.codec == CodecType::TelephoneEvent)
             .collect();
         // Callee has Opus only (no non-Opus audio), so only TE/48000 is relevant.
         assert_eq!(callee_dtmf.len(), 1);
+        assert_eq!(callee_dtmf[0].payload_type, 110);
         assert_eq!(callee_dtmf[0].clock_rate, 48000);
     }
 
-    /// Reverse direction: RTP caller → WebRTC callee
-    /// Caller offers PCMA first, allow_codecs=[Opus,PCMU,PCMA] →
-    /// caller side keeps caller-offered codecs, callee side keeps that order and appends missing codecs.
+    #[test]
+    fn test_callee_offer_generates_dtmf_when_caller_omits_it() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::PCMU],
+        );
+
+        let dtmf: Vec<_> = codecs.iter().filter(|c| c.is_dtmf()).collect();
+        assert_eq!(dtmf.len(), 1);
+        assert_eq!(dtmf[0].payload_type, 101);
+        assert_eq!(dtmf[0].clock_rate, 8000);
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn test_callee_offer_appends_dtmf_in_final_audio_clock_order() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::PCMU, CodecType::Opus],
+        );
+
+        let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
+        assert_eq!(audio[0].codec, CodecType::PCMU);
+        assert_eq!(audio[1].codec, CodecType::Opus);
+
+        let dtmf: Vec<_> = codecs.iter().filter(|c| c.is_dtmf()).collect();
+        assert_eq!(dtmf.len(), 2);
+        assert_eq!(dtmf[0].payload_type, 101);
+        assert_eq!(dtmf[0].clock_rate, 8000);
+        assert_eq!(dtmf[1].payload_type, 102);
+        assert_eq!(dtmf[1].clock_rate, 48000);
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn test_caller_answer_filters_dtmf_by_final_audio_clock_rate() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 12345 UDP/TLS/RTP/SAVPF 111 0 101 110\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=rtpmap:110 telephone-event/48000\r\n";
+
+        let codecs =
+            MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[CodecType::PCMU]);
+
+        let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].codec, CodecType::PCMU);
+
+        let dtmf: Vec<_> = codecs.iter().filter(|c| c.is_dtmf()).collect();
+        assert_eq!(dtmf.len(), 1);
+        assert_eq!(dtmf[0].payload_type, 101);
+        assert_eq!(dtmf[0].clock_rate, 8000);
+    }
+
+    #[test]
+    fn test_caller_answer_does_not_generate_missing_dtmf() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let codecs =
+            MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[CodecType::PCMU]);
+
+        assert!(!codecs.iter().any(|c| c.is_dtmf()));
+    }
+
+    #[test]
+    fn test_caller_answer_prefers_peer_answered_codec() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 9 0 8 101\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+        let codecs =
+            MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[CodecType::PCMA]);
+
+        let audio: Vec<_> = codecs.iter().filter(|codec| !codec.is_dtmf()).collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].codec, CodecType::PCMA);
+        assert_eq!(audio[0].payload_type, 8);
+    }
+
+    #[test]
+    fn test_offer_constrained_list_is_subset_in_preferred_order() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 9 0 8 101\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_codec_list_from_offer(
+            caller_sdp,
+            &[CodecType::PCMA, CodecType::G729, CodecType::PCMU],
+        );
+
+        let audio: Vec<_> = codecs.iter().filter(|codec| !codec.is_dtmf()).collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].codec, CodecType::PCMA);
+        assert_eq!(audio[0].payload_type, 8);
+        assert_eq!(audio[1].codec, CodecType::PCMU);
+        assert_eq!(audio[1].payload_type, 0);
+        assert!(!codecs.iter().any(|codec| codec.codec == CodecType::G729));
+    }
+
+    #[test]
+    fn test_caller_answer_falls_back_to_offered_codec_for_transcoding() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 9 101\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+        let codecs = MediaNegotiator::build_codec_list_from_offer(
+            caller_sdp,
+            &[CodecType::PCMA, CodecType::PCMU],
+        );
+
+        let audio: Vec<_> = codecs.iter().filter(|codec| !codec.is_dtmf()).collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].codec, CodecType::G722);
+        assert_eq!(audio[0].payload_type, 9);
+    }
+
+    #[test]
+    fn test_offer_constrained_list_uses_policy_order_without_peer_answer() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 8 0 101\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_codec_list_from_offer(
+            caller_sdp,
+            &[CodecType::PCMU, CodecType::PCMA],
+        );
+
+        let audio: Vec<_> = codecs.iter().filter(|codec| !codec.is_dtmf()).collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].codec, CodecType::PCMU);
+        assert_eq!(audio[0].payload_type, 0);
+        assert_eq!(audio[1].codec, CodecType::PCMA);
+        assert_eq!(audio[1].payload_type, 8);
+    }
+
+    /// Reverse direction: RTP caller → WebRTC callee.
+    /// The caller-facing capability list follows policy order for caller-offered codecs,
+    /// and the callee offer appends policy codecs the caller did not offer.
     #[test]
     fn test_bridge_codecs_rtp_caller_webrtc_callee() {
         let caller_sdp = "v=0\r\n\
@@ -1563,32 +1700,28 @@ a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[
-                CodecType::Opus,
-                CodecType::PCMU,
-                CodecType::PCMA,
-                CodecType::TelephoneEvent,
-            ],
-        );
+        let policy = &[
+            CodecType::Opus,
+            CodecType::PCMU,
+            CodecType::PCMA,
+            CodecType::TelephoneEvent,
+        ];
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, policy);
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, policy);
 
-        let caller_audio: Vec<_> = lists.caller_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let caller_audio: Vec<_> = caller_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(
             caller_audio[0].codec,
-            CodecType::PCMA,
-            "Caller side preserves PCMA first from caller SDP"
+            CodecType::PCMU,
+            "Caller side follows policy order for common codecs"
         );
-        assert_eq!(caller_audio[1].codec, CodecType::PCMU);
+        assert_eq!(caller_audio[1].codec, CodecType::PCMA);
         assert_eq!(caller_audio.len(), 2);
-        assert!(!lists.caller_side.iter().any(|c| c.codec == CodecType::Opus));
+        assert!(!caller_side.iter().any(|c| c.codec == CodecType::Opus));
 
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
-        // New algorithm: caller codecs first (PCMA, PCMU in caller order), then Opus appended as extra
-        assert_eq!(callee_audio[0].codec, CodecType::PCMA);
-        assert_eq!(callee_audio[1].codec, CodecType::PCMU);
+        let callee_audio: Vec<_> = callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        assert_eq!(callee_audio[0].codec, CodecType::PCMU);
+        assert_eq!(callee_audio[1].codec, CodecType::PCMA);
         assert_eq!(callee_audio[2].codec, CodecType::Opus);
         assert_eq!(callee_audio.len(), 3);
     }
@@ -1648,15 +1781,14 @@ a=fmtp:103 profile-level-id=42801F; packetization-mode=1\r\n";
             answer_sdp,
             SdpType::Answer,
             callee_answer,
-            true,
         )
         .unwrap();
 
-        assert!(filtered.contains("m=audio 9 UDP/TLS/RTP/SAVPF 96 0 126"));
+        assert!(filtered.contains("m=audio 9 UDP/TLS/RTP/SAVPF 96 0 110 126"));
         assert!(filtered.contains("a=rtpmap:96 opus/48000/2"));
         assert!(filtered.contains("a=rtpmap:0 PCMU/8000"));
+        assert!(filtered.contains("a=rtpmap:110 telephone-event/48000"));
         assert!(filtered.contains("a=rtpmap:126 telephone-event/8000"));
-        assert!(!filtered.contains("a=rtpmap:110 telephone-event/48000"));
         assert!(!filtered.contains("a=rtpmap:101 telephone-event/8000"));
         assert!(filtered.contains("m=video 9 UDP/TLS/RTP/SAVPF 103"));
         assert!(filtered.contains("a=recvonly"));
@@ -1714,7 +1846,6 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f
             answer_sdp,
             SdpType::Answer,
             callee_answer,
-            true,
         )
         .unwrap();
 
@@ -1758,7 +1889,6 @@ a=rtpmap:126 telephone-event/8000\r\n";
             answer_sdp,
             SdpType::Answer,
             callee_answer,
-            false,
         )
         .unwrap();
 
@@ -1811,161 +1941,6 @@ a=rtpmap:126 telephone-event/8000\r\n";
         }
     }
 
-    /// RTP caller offers G729+PCMU, WebRTC callee.
-    /// common must exclude G729 because WebRTC does not support it.
-    #[test]
-    fn test_bridge_codecs_common_excludes_transport_unsupported() {
-        let caller_sdp = "v=0\r\n\
-o=- 1 1 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-m=audio 10000 RTP/AVP 18 0 101\r\n\
-a=rtpmap:18 G729/8000\r\n\
-a=rtpmap:0 PCMU/8000\r\n\
-a=rtpmap:101 telephone-event/8000\r\n";
-
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[],
-        );
-
-        // common: only PCMU (both sides support it) + telephone-event
-        assert!(
-            !lists.common.iter().any(|c| c.codec == CodecType::G729),
-            "G729 must NOT be in common (WebRTC does not support it)"
-        );
-        assert!(
-            lists.common.iter().any(|c| c.codec == CodecType::PCMU),
-            "PCMU must be in common (both sides support it)"
-        );
-        assert!(
-            lists
-                .common
-                .iter()
-                .any(|c| c.codec == CodecType::TelephoneEvent),
-            "TelephoneEvent must be in common"
-        );
-
-        let first_audio = lists.common.iter().find(|c| !c.is_dtmf());
-        assert!(
-            first_audio.is_some(),
-            "Common must have at least one audio codec"
-        );
-        assert_eq!(
-            first_audio.unwrap().codec,
-            CodecType::PCMU,
-            "First common audio codec should be PCMU (G729 excluded)"
-        );
-    }
-
-    /// RTP caller offers G729+PCMA+PCMU, WebRTC callee.
-    /// common should preserve caller's ordering: G729 excluded, PCMA first.
-    #[test]
-    fn test_bridge_codecs_common_preserves_caller_ordering() {
-        let caller_sdp = "v=0\r\n\
-o=- 1 1 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-m=audio 10000 RTP/AVP 18 8 0 101\r\n\
-a=rtpmap:18 G729/8000\r\n\
-a=rtpmap:8 PCMA/8000\r\n\
-a=rtpmap:0 PCMU/8000\r\n\
-a=rtpmap:101 telephone-event/8000\r\n";
-
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[],
-        );
-
-        let common_audio: Vec<_> = lists.common.iter().filter(|c| !c.is_dtmf()).collect();
-        assert_eq!(common_audio.len(), 2, "2 common audio codecs: PCMA + PCMU");
-        assert_eq!(
-            common_audio[0].codec,
-            CodecType::PCMA,
-            "PCMA must be first in common (caller ordered PCMA before PCMU)"
-        );
-        assert_eq!(
-            common_audio[1].codec,
-            CodecType::PCMU,
-            "PCMU must be second in common"
-        );
-        assert!(
-            !lists.common.iter().any(|c| c.codec == CodecType::G729),
-            "G729 excluded from common"
-        );
-    }
-
-    /// When both sides are the same transport type, common follows the caller offer
-    /// while callee_side can still include additional policy-generated codecs.
-    #[test]
-    fn test_bridge_codecs_common_identical_when_same_transport() {
-        let caller_sdp = "v=0\r\n\
-o=- 1 1 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-m=audio 9 UDP/TLS/RTP/SAVPF 111 0 101\r\n\
-a=rtpmap:111 opus/48000/2\r\n\
-a=rtpmap:0 PCMU/8000\r\n\
-a=rtpmap:101 telephone-event/8000\r\n";
-
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            true, // caller is WebRTC
-            true, // callee is WebRTC
-            &[],
-        );
-
-        let common_audio: Vec<_> = lists.common.iter().filter(|c| !c.is_dtmf()).collect();
-        let caller_audio: Vec<_> = lists.caller_side.iter().filter(|c| !c.is_dtmf()).collect();
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
-
-        assert_eq!(common_audio.len(), caller_audio.len());
-        for (c, a) in common_audio.iter().zip(caller_audio.iter()) {
-            assert_eq!(c.codec, a.codec, "common and caller_side must match");
-        }
-        assert!(
-            callee_audio.len() >= common_audio.len(),
-            "callee_side can include additional generated codecs"
-        );
-    }
-
-    /// When allow_codecs explicitly filters to a subset, common should
-    /// also reflect that filtering.
-    #[test]
-    fn test_bridge_codecs_common_respects_allow_codecs() {
-        let caller_sdp = "v=0\r\n\
-o=- 1 1 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-m=audio 10000 RTP/AVP 18 8 0 101\r\n\
-a=rtpmap:18 G729/8000\r\n\
-a=rtpmap:8 PCMA/8000\r\n\
-a=rtpmap:0 PCMU/8000\r\n\
-a=rtpmap:101 telephone-event/8000\r\n";
-
-        // Only allow PCMU + telephone-event
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP
-            true,  // callee is WebRTC
-            &[CodecType::PCMU, CodecType::TelephoneEvent],
-        );
-
-        let common_audio: Vec<_> = lists.common.iter().filter(|c| !c.is_dtmf()).collect();
-        assert_eq!(
-            common_audio.len(),
-            1,
-            "Only PCMU allowed, so only PCMU in common"
-        );
-        assert_eq!(common_audio[0].codec, CodecType::PCMU);
-        assert!(!lists.common.iter().any(|c| c.codec == CodecType::G729));
-        assert!(!lists.common.iter().any(|c| c.codec == CodecType::PCMA));
-    }
-
     /// PSTN caller offers AMR/EVS codecs at dynamic PTs 96/111.
     /// These PTs already have rtpmap entries with unrecognized codec names.
     /// The codec parser must NOT fall back to mapping PT 96/111 to Opus,
@@ -1987,76 +1962,43 @@ a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:100 telephone-event/8000\r\n";
 
-        let lists = MediaNegotiator::build_bridge_codec_lists(
-            caller_sdp,
-            false, // caller is RTP (PSTN)
-            true,  // callee is WebRTC
-            &[],
-        );
+        let caller_side = MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[]);
 
         assert!(
-            !lists.caller_side.iter().any(|c| c.payload_type == 96),
+            !caller_side.iter().any(|c| c.payload_type == 96),
             "PT 96 must NOT appear (it was AMR, not Opus)"
         );
         assert!(
-            !lists.caller_side.iter().any(|c| c.payload_type == 111),
+            !caller_side.iter().any(|c| c.payload_type == 111),
             "PT 111 must NOT appear (it was EVS, not Opus)"
         );
         assert!(
-            !lists.caller_side.iter().any(|c| c.payload_type == 98),
+            !caller_side.iter().any(|c| c.payload_type == 98),
             "PT 98 must NOT appear (it was AMR-WB)"
         );
         assert!(
-            !lists.caller_side.iter().any(|c| c.payload_type == 106),
+            !caller_side.iter().any(|c| c.payload_type == 106),
             "PT 106 must NOT appear (it was EVS)"
         );
-        assert!(
-            !lists.common.iter().any(|c| c.payload_type == 96),
-            "Common must NOT include PT 96"
-        );
-        assert!(
-            !lists.common.iter().any(|c| c.payload_type == 111),
-            "Common must NOT include PT 111"
-        );
 
-        // Supported codecs must appear with correct caller PTs
-        let has_g729 = lists
-            .caller_side
+        // Recognized codecs must appear with correct caller PTs
+        let has_g729 = caller_side
             .iter()
             .any(|c| c.codec == CodecType::G729 && c.payload_type == 18);
         assert!(has_g729, "G729 at PT 18 must appear in caller_side");
-        let has_pcma = lists
-            .caller_side
+        let has_pcma = caller_side
             .iter()
             .any(|c| c.codec == CodecType::PCMA && c.payload_type == 8);
         assert!(has_pcma, "PCMA at PT 8 must appear in caller_side");
-        let has_pcmu = lists
-            .caller_side
+        let has_pcmu = caller_side
             .iter()
             .any(|c| c.codec == CodecType::PCMU && c.payload_type == 0);
         assert!(has_pcmu, "PCMU at PT 0 must appear in caller_side");
 
-        // common excludes G729 (WebRTC doesn't support it)
-        let common_g729 = lists.common.iter().any(|c| c.codec == CodecType::G729);
-        assert!(!common_g729, "G729 must NOT be in common (WebRTC callee)");
-        let common_pcma = lists.common.iter().any(|c| c.codec == CodecType::PCMA);
-        assert!(common_pcma, "PCMA must be in common");
-        let common_pcmu = lists.common.iter().any(|c| c.codec == CodecType::PCMU);
-        assert!(common_pcmu, "PCMU must be in common");
-        let common_dtmf = lists
-            .common
-            .iter()
-            .any(|c| c.codec == CodecType::TelephoneEvent);
-        assert!(common_dtmf, "TelephoneEvent must be in common");
-
         // Verify no Opus codecs are created from PT 96/111
         assert!(
-            !lists.caller_side.iter().any(|c| c.codec == CodecType::Opus),
+            !caller_side.iter().any(|c| c.codec == CodecType::Opus),
             "Opus must NOT appear in caller_side (PSTN didn't offer Opus)"
-        );
-        assert!(
-            !lists.common.iter().any(|c| c.codec == CodecType::Opus),
-            "Opus must NOT appear in common (PSTN didn't offer Opus)"
         );
     }
 
@@ -2071,15 +2013,12 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        // Performance (default): keep only caller's codecs
-        let lists = MediaNegotiator::build_bridge_codec_lists(
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(
             caller_sdp,
-            false, // caller RTP
-            false, // callee RTP
             &[CodecType::PCMU, CodecType::PCMA, CodecType::TelephoneEvent],
         );
 
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let callee_audio: Vec<_> = callee_side.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(
             callee_audio.len(),
             2,
@@ -2088,12 +2027,12 @@ a=rtpmap:101 telephone-event/8000\r\n";
         assert_eq!(
             callee_audio[0].codec,
             CodecType::PCMU,
-            "PCMU first (caller order)"
+            "PCMU first by policy order"
         );
         assert_eq!(
             callee_audio[1].codec,
             CodecType::PCMA,
-            "PCMA second (caller order)"
+            "PCMA second by policy order"
         );
         // G722/G729 should NOT appear (not offered by caller)
         assert!(!callee_audio.iter().any(|c| c.codec == CodecType::G722));
@@ -2111,11 +2050,8 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        // Quality: append missing codecs, order by quality
-        let lists = MediaNegotiator::build_bridge_codec_lists(
+        let callee_side = MediaNegotiator::build_callee_codec_offer_with_allow(
             caller_sdp,
-            false, // caller RTP
-            false, // callee RTP
             &[
                 CodecType::PCMU,
                 CodecType::PCMA,
@@ -2124,19 +2060,19 @@ a=rtpmap:101 telephone-event/8000\r\n";
             ],
         );
 
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let callee_audio: Vec<_> = callee_side.iter().filter(|c| !c.is_dtmf()).collect();
         // Caller offered PCMU, PCMA; G722 appended as extra from allow_codecs
-        // New algorithm: caller codecs first (caller order), extras appended in allow_codecs order
+        // Common codecs follow policy order; extras are appended in that same policy order.
         assert_eq!(callee_audio.len(), 3, "caller codecs + appended G722");
         assert_eq!(
             callee_audio[0].codec,
             CodecType::PCMU,
-            "PCMU first (caller order)"
+            "PCMU first by policy order"
         );
         assert_eq!(
             callee_audio[1].codec,
             CodecType::PCMA,
-            "PCMA second (caller order)"
+            "PCMA second by policy order"
         );
         assert_eq!(
             callee_audio[2].codec,
@@ -2146,10 +2082,10 @@ a=rtpmap:101 telephone-event/8000\r\n";
     }
 
     /// Regression test: when allow_codecs has PCMA before PCMU (e.g. config `codecs = ["pcma", "pcmu"]`)
-    /// and the caller offers G722(9), PCMU(0), PCMA(8), the Performance strategy must preserve
-    /// the caller's order for the surviving codecs (PCMU first, then PCMA), NOT the allow_codecs order.
+    /// and the caller offers G722(9), PCMU(0), PCMA(8), the outgoing offer must follow
+    /// the policy order for surviving codecs.
     #[test]
-    fn test_performance_strategy_preserves_caller_order_with_pcma_first_in_allow() {
+    fn test_policy_order_with_pcma_first_in_allow() {
         let caller_sdp = "v=0\r\n\
 o=- 1 1 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -2159,47 +2095,25 @@ a=rtpmap:9 G722/8000\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n";
 
-        // allow_codecs has PCMA first (as configured via `codecs = ["pcma", "pcmu"]`)
-        let lists = MediaNegotiator::build_bridge_codec_lists(
+        let callee_offer = MediaNegotiator::build_callee_codec_offer_with_allow(
             caller_sdp,
-            false, // caller RTP
-            false, // callee RTP
             &[CodecType::PCMA, CodecType::PCMU],
         );
 
-        let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
+        let callee_audio: Vec<_> = callee_offer.iter().filter(|c| !c.is_dtmf()).collect();
         assert_eq!(callee_audio.len(), 2, "G722 must be filtered out");
         assert_eq!(
             callee_audio[0].codec,
-            CodecType::PCMU,
-            "PCMU must be first (caller's order: 9,0,8 → 0 survives before 8)"
+            CodecType::PCMA,
+            "PCMA must be first by policy order"
         );
-        assert_eq!(callee_audio[0].payload_type, 0, "PCMU PT must be 0");
+        assert_eq!(callee_audio[0].payload_type, 8, "PCMA PT must be 8");
         assert_eq!(
             callee_audio[1].codec,
-            CodecType::PCMA,
-            "PCMA must be second (caller's order)"
-        );
-        assert_eq!(callee_audio[1].payload_type, 8, "PCMA PT must be 8");
-
-        // Also verify build_callee_codec_offer_with_allow directly
-        let callee_offer = MediaNegotiator::build_callee_codec_offer_with_allow(
-            caller_sdp,
-            false,
-            &[CodecType::PCMA, CodecType::PCMU],
-        );
-        let audio_only: Vec<_> = callee_offer.iter().filter(|c| !c.is_dtmf()).collect();
-        assert_eq!(audio_only.len(), 2);
-        assert_eq!(
-            audio_only[0].codec,
             CodecType::PCMU,
-            "PCMU must be first in callee offer (caller order preserved)"
+            "PCMU must be second by policy order"
         );
-        assert_eq!(
-            audio_only[1].codec,
-            CodecType::PCMA,
-            "PCMA must be second in callee offer"
-        );
+        assert_eq!(callee_audio[1].payload_type, 0, "PCMU PT must be 0");
     }
 
     /// Regression: wholesale trunk configured as `codecs = ["g729"]` produces
@@ -2220,7 +2134,6 @@ a=fmtp:101 0-15\r\n";
         // allow_codecs contains only G729 — no TelephoneEvent entry.
         let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
             caller_sdp,
-            false, // plain RTP trunk
             &[CodecType::G729],
         );
 
@@ -2238,7 +2151,7 @@ a=fmtp:101 0-15\r\n";
         );
     }
 
-    /// Symmetric regression: `build_caller_answer_codec_list_with_allow` must
+    /// Symmetric regression: final caller answer selection must
     /// include telephone-event in the answer back to the caller even when
     /// `allow_codecs` contains only audio codecs (e.g. the PCMU-only wholesale case).
     #[test]
@@ -2256,11 +2169,8 @@ a=fmtp:101 0-15\r\n";
         // allow_codecs=[PCMU] — caller offered PCMU, G729, and telephone-event.
         // Audio: PCMU passes, G729 filtered out.
         // DTMF: must always pass through regardless of allow_codecs.
-        let codecs = MediaNegotiator::build_caller_answer_codec_list_with_allow(
-            caller_sdp,
-            false,
-            &[CodecType::PCMU],
-        );
+        let codecs =
+            MediaNegotiator::build_codec_list_from_offer(caller_sdp, &[CodecType::PCMU]);
 
         let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
         let dtmf: Vec<_> = codecs
@@ -2295,7 +2205,6 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         let new_codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
             caller_sdp,
-            false,
             &[CodecType::PCMA, CodecType::PCMU],
         );
 
@@ -2318,7 +2227,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             "G722 rtpmap must be removed"
         );
 
-        // PCMU (0) must come before PCMA (8) — caller's preference order
+        // PCMA (8) must come before PCMU (0) by policy order.
         let m_line_pos = rewritten.find("m=audio").unwrap();
         let m_line_end = rewritten[m_line_pos..].find("\r\n").unwrap() + m_line_pos;
         let m_line = &rewritten[m_line_pos..m_line_end];
@@ -2329,9 +2238,291 @@ a=rtpmap:8 PCMA/8000\r\n";
             .find(" 8 ")
             .or_else(|| m_line.strip_suffix(" 8").map(|_| m_line.len() - 2));
         assert!(
-            pos_0 < pos_8,
-            "PCMU (PT 0) must appear before PCMA (PT 8) in m= line: {}",
+            pos_8 < pos_0,
+            "PCMA (PT 8) must appear before PCMU (PT 0) in m= line: {}",
             m_line
         );
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn test_rewrite_sdp_codec_list_uses_dtmf_clock_rate() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.10\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.10\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let new_codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::PCMU, CodecType::Opus],
+        );
+
+        let rewritten = MediaNegotiator::rewrite_sdp_codec_list(caller_sdp, &new_codecs)
+            .expect("rewrite must succeed");
+
+        assert!(rewritten.contains("a=rtpmap:101 telephone-event/8000"));
+        assert!(rewritten.contains("a=rtpmap:102 telephone-event/48000"));
+    }
+
+    #[test]
+    fn test_negotiate_codec_g722_selected_when_first_in_local() {
+        let local_codecs = vec![CodecType::G722, CodecType::PCMU, CodecType::PCMA];
+        let remote_sdp = "v=0\r\n\
+            o=- 1234 1234 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 0 9 8 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let result = MediaNegotiator::negotiate_codec(&local_codecs, remote_sdp).unwrap();
+        assert_eq!(
+            result.codec,
+            CodecType::G722,
+            "G722 is first in local preference and present in remote, should be selected"
+        );
+        assert_eq!(result.params.payload_type, 9);
+    }
+
+    #[test]
+    fn test_negotiate_codec_g729_selected() {
+        let local_codecs = vec![CodecType::G729, CodecType::PCMU];
+        let remote_sdp = "v=0\r\n\
+            o=- 1234 1234 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 0 18 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let result = MediaNegotiator::negotiate_codec(&local_codecs, remote_sdp).unwrap();
+        assert_eq!(
+            result.codec,
+            CodecType::G729,
+            "G729 is first in local preference and present in remote"
+        );
+        assert_eq!(result.params.payload_type, 18);
+    }
+
+    #[test]
+    fn test_select_best_codec_g722_first_in_remote() {
+        let codecs = vec![
+            CodecInfo {
+                payload_type: 9,
+                codec: CodecType::G722,
+                clock_rate: 8000,
+                channels: 1,
+            },
+            CodecInfo {
+                payload_type: 0,
+                codec: CodecType::PCMU,
+                clock_rate: 8000,
+                channels: 1,
+            },
+        ];
+        let allowed: Vec<CodecType> = vec![];
+        let best = MediaNegotiator::select_best_codec(&codecs, &allowed).unwrap();
+        assert_eq!(
+            best.codec,
+            CodecType::G722,
+            "G722 first in remote, empty allow → pick G722"
+        );
+    }
+
+    #[test]
+    fn test_select_best_codec_g729_allowed() {
+        let codecs = vec![
+            CodecInfo {
+                payload_type: 0,
+                codec: CodecType::PCMU,
+                clock_rate: 8000,
+                channels: 1,
+            },
+            CodecInfo {
+                payload_type: 18,
+                codec: CodecType::G729,
+                clock_rate: 8000,
+                channels: 1,
+            },
+        ];
+        let allowed = vec![CodecType::G729];
+        let best = MediaNegotiator::select_best_codec(&codecs, &allowed).unwrap();
+        assert_eq!(
+            best.codec,
+            CodecType::G729,
+            "Only G729 allowed, scan past PCMU"
+        );
+        assert_eq!(best.payload_type, 18);
+    }
+
+    #[test]
+    fn test_extract_leg_profile_g722() {
+        let sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 9 101\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let profile = MediaNegotiator::extract_leg_profile(sdp);
+        assert!(profile.audio.is_some());
+        let audio = profile.audio.unwrap();
+        assert_eq!(audio.codec, CodecType::G722);
+        assert_eq!(audio.payload_type, 9);
+        assert!(profile.dtmf.is_some());
+    }
+
+    #[test]
+    fn test_extract_leg_profile_g729() {
+        let sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 0 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let profile = MediaNegotiator::extract_leg_profile(sdp);
+        assert!(profile.audio.is_some());
+        let audio = profile.audio.unwrap();
+        assert_eq!(
+            audio.codec,
+            CodecType::G729,
+            "First audio codec in answer = G729"
+        );
+        assert_eq!(audio.payload_type, 18);
+    }
+
+    #[test]
+    fn test_build_callee_offer_g722_preserves_caller_pt() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 9 0 101\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::G722, CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let g722 = codecs.iter().find(|c| c.codec == CodecType::G722).unwrap();
+        assert_eq!(g722.payload_type, 9, "G722 PT must preserve caller's PT 9");
+    }
+
+    #[test]
+    fn test_build_callee_offer_g729_preserves_caller_pt() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 0 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let g729 = codecs.iter().find(|c| c.codec == CodecType::G729).unwrap();
+        assert_eq!(
+            g729.payload_type, 18,
+            "G729 PT must preserve caller's PT 18"
+        );
+    }
+
+    #[test]
+    fn test_webrtc_offer_filter_removes_g729() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 0 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::G729, CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let codecs = MediaNegotiator::filter_webrtc_offer_codecs(caller_sdp, codecs);
+        let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].codec, CodecType::PCMU);
+        assert!(!codecs.iter().any(|c| c.codec == CodecType::G729));
+    }
+
+    #[test]
+    fn test_webrtc_offer_filter_falls_back_when_policy_is_g729_only() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            &[CodecType::G729, CodecType::TelephoneEvent],
+        );
+        let codecs = MediaNegotiator::filter_webrtc_offer_codecs(caller_sdp, codecs);
+        let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
+        assert!(!audio.is_empty(), "WebRTC offer must keep an audio codec");
+        assert!(!codecs.iter().any(|c| c.codec == CodecType::G729));
+    }
+
+    #[test]
+    fn test_build_callee_offer_g722_with_16k_rtpmap() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 9 0\r\n\
+            a=rtpmap:9 G722/16000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+
+        let codecs = MediaNegotiator::build_callee_codec_offer_with_allow(caller_sdp, &[]);
+        let g722 = codecs.iter().find(|c| c.codec == CodecType::G722);
+        assert!(g722.is_some(), "G722 should be in callee offer");
+        let g722 = g722.unwrap();
+        assert_eq!(g722.payload_type, 9);
+    }
+
+    #[test]
+    fn test_build_caller_answer_filters_g729_when_not_allowed() {
+        let caller_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 0 9 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+
+        let codecs = MediaNegotiator::build_codec_list_from_offer(
+            caller_sdp,
+            &[CodecType::PCMU, CodecType::TelephoneEvent],
+        );
+        let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
+        assert_eq!(audio.len(), 1, "Only PCMU should survive");
+        assert_eq!(audio[0].codec, CodecType::PCMU);
+        assert!(!codecs.iter().any(|c| c.codec == CodecType::G729));
+        assert!(!codecs.iter().any(|c| c.codec == CodecType::G722));
     }
 }

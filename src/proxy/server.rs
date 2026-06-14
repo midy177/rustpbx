@@ -5,6 +5,7 @@ use super::{
     user::{UserBackend, build_user_backend},
 };
 use crate::{
+    auto_external_ip,
     call::{TransactionCookie, policy::FrequencyLimiter},
     callrecord::{
         CallRecordSender,
@@ -80,7 +81,9 @@ pub struct SipServerInner {
     pub storage: Option<crate::storage::Storage>,
     pub presence_manager: Arc<PresenceManager>,
     pub addon_registry: Option<Arc<crate::addons::registry::AddonRegistry>>,
-    pub rwi_gateway: Option<Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>>,
+    pub rwi_gateway: Option<crate::rwi::RwiGatewayRef>,
+    /// IVR step trace collector (set by IVR Editor addon, accessed by StepIvrApp).
+    pub ivr_trace: Option<Arc<crate::call::app::ivr::trace::IvrTraceCollector>>,
     pub tls_listener: Option<rsipstack::transport::TlsListenerConnection>,
     pub queue_manager: Arc<crate::call::runtime::QueueManager>,
     pub conference_manager: Arc<crate::call::runtime::ConferenceManager>,
@@ -101,6 +104,16 @@ pub struct SipServerInner {
     pub trunk_health: Option<crate::proxy::trunk_health::HealthStateMap>,
     /// Session lifecycle hooks (connected, held, unheld, ended).
     pub session_hooks: Arc<Vec<Arc<dyn crate::proxy::proxy_call::session_hooks::CallSessionHook>>>,
+    /// Resolved contact username (from config or random hex).
+    pub contact_username: String,
+    /// Resolved CNAME for SDP ssrc attributes (from config or random hex).
+    pub rtc_cname: String,
+    /// In-process media engine: handles bridge/playback/recording/MCU for all sessions.
+    pub media_engine: crate::media::engine::MediaEngine,
+}
+
+fn random_hex() -> String {
+    format!("{:016x}", rand::random::<u64>())
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -138,7 +151,8 @@ pub struct SipServerBuilder {
     /// Addon registry for accessing call applications (voicemail, ivr, etc.)
     addon_registry: Option<Arc<crate::addons::registry::AddonRegistry>>,
     /// RWI gateway to wire into the server for call-app factory use.
-    rwi_gateway: Option<Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>>,
+    rwi_gateway: Option<crate::rwi::RwiGatewayRef>,
+    ivr_trace: Option<Arc<crate::call::app::ivr::trace::IvrTraceCollector>>,
     /// AgentRegistry for agent management and presence state.
     agent_registry: Option<Arc<dyn crate::call::app::agent_registry::AgentRegistry>>,
     queue_location_enricher: Option<Arc<dyn crate::proxy::call::QueueLocationEnricher>>,
@@ -180,6 +194,7 @@ impl SipServerBuilder {
             no_bind: false,
             addon_registry: None,
             rwi_gateway: None,
+            ivr_trace: None,
             agent_registry: None,
             queue_location_enricher: None,
             skip_migrate: false,
@@ -327,10 +342,7 @@ impl SipServerBuilder {
         self
     }
 
-    pub fn with_rwi_gateway(
-        mut self,
-        gateway: Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>,
-    ) -> Self {
+    pub fn with_rwi_gateway(mut self, gateway: crate::rwi::RwiGatewayRef) -> Self {
         self.rwi_gateway = Some(gateway);
         self
     }
@@ -395,9 +407,11 @@ impl SipServerBuilder {
         };
 
         let locator = Arc::new(locator);
-        let rtp_config = self.rtp_config.unwrap_or_default();
+        let mut rtp_config = self.rtp_config.unwrap_or_default();
         let cancel_token = self.cancel_token.unwrap_or_default();
         let config = self.config.clone();
+        #[cfg(unix)]
+        log_rlimit_nofile();
         let transport_layer = TransportLayer::new(cancel_token.clone());
         // Clone of TLS listener for hot-reload support (initialized inside if !self.no_bind block)
         let mut tls_listener_clone: Option<rsipstack::transport::TlsListenerConnection> = None;
@@ -409,6 +423,29 @@ impl SipServerBuilder {
                 .addr
                 .parse::<IpAddr>()
                 .map_err(|e| anyhow!("failed to parse local ip address: {}", e))?;
+
+            // Auto-detect external IP if not manually configured
+            if rtp_config.external_ip.is_none() {
+                if let Some(ref url) = rtp_config.auto_external_ip {
+                    match auto_external_ip::detect_external_ip(url).await {
+                        Ok(ip) => {
+                            warn!(
+                                "auto_external_ip: detected {} from '{}'",
+                                ip,
+                                if url.is_empty() {
+                                    auto_external_ip::DEFAULT_AUTO_EXTERNAL_IP_URL
+                                } else {
+                                    url
+                                }
+                            );
+                            rtp_config.external_ip = Some(ip.to_string());
+                        }
+                        Err(e) => {
+                            warn!("auto_external_ip: detection failed: {}", e);
+                        }
+                    }
+                }
+            }
 
             let external_ip = match rtp_config.external_ip {
                 Some(ref s) => Some(
@@ -644,11 +681,13 @@ impl SipServerBuilder {
         let data_context = if let Some(ref context) = self.data_context {
             context.clone()
         } else {
-            Arc::new(
+            let dc = Arc::new(
                 ProxyDataContext::new(self.config.clone(), database.clone())
                     .await
                     .map_err(|err| anyhow!("failed to initialize proxy data context: {err}"))?,
-            )
+            );
+            self.data_context = Some(dc.clone());
+            dc
         };
 
         // Wire up the SIP endpoint for trunk registration, then reconcile so
@@ -693,6 +732,12 @@ impl SipServerBuilder {
         // Create conference manager with in-server audio mixing
         let conference_manager = Arc::new(crate::call::runtime::ConferenceManager::new());
 
+        // Create trunk health state map BEFORE inner so inner.trunk_health is populated
+        // (the health loop itself is spawned after inner since it needs endpoint/cancel_token).
+        let trunk_health_states: crate::proxy::trunk_health::HealthStateMap =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        self.trunk_health = Some(trunk_health_states.clone());
+
         let inner = Arc::new(SipServerInner {
             rtp_config,
             proxy_config: self.config.clone(),
@@ -720,6 +765,7 @@ impl SipServerBuilder {
             presence_manager,
             addon_registry: self.addon_registry,
             rwi_gateway: self.rwi_gateway,
+            ivr_trace: self.ivr_trace,
             tls_listener: tls_listener_clone,
             queue_manager,
             conference_manager,
@@ -733,6 +779,21 @@ impl SipServerBuilder {
                 .unwrap_or_else(|| Arc::new(crate::call::DefaultMediaPolicy)),
             trunk_health: self.trunk_health.clone(),
             session_hooks: Arc::new(self.session_hooks),
+            contact_username: self
+                .config
+                .contact_username
+                .clone()
+                .unwrap_or_else(random_hex),
+            rtc_cname: self.config.rtc_cname.clone().unwrap_or_else(random_hex),
+            media_engine: {
+                use crate::media::engine::{MediaEngine, MediaEngineConfig};
+                let (engine, handle) = MediaEngine::new(MediaEngineConfig {
+                    command_channel_capacity: self.config.media_cmd_channel_capacity,
+                    event_channel_capacity: self.config.media_event_channel_capacity,
+                });
+                let _task = engine.spawn(handle);
+                engine
+            },
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -818,8 +879,6 @@ impl SipServerBuilder {
         }
         // ── Trunk health check ──────────────────────────────────────
         if let Some(ref dc) = self.data_context {
-            let health_states: crate::proxy::trunk_health::HealthStateMap =
-                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let local_sip = format!(
                 "{}:{}",
                 self.config.addr,
@@ -829,13 +888,12 @@ impl SipServerBuilder {
             let dc = dc.clone();
             crate::proxy::trunk_health::spawn_health_loop(
                 move || dc.trunks_snapshot(),
-                health_states.clone(),
+                trunk_health_states,
                 ep,
                 local_sip,
                 30u64,
                 inner.cancel_token.clone(),
             );
-            self.trunk_health = Some(health_states);
         }
 
         advertised_methods
@@ -929,7 +987,17 @@ impl SipServer {
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {
+        let mut tx_count: u64 = 0;
         while let Some(mut tx) = incoming.recv().await {
+            crate::metrics::transaction::received();
+            tx_count += 1;
+            if tx_count % 100 == 0 {
+                let stats = self.inner.endpoint.inner.get_stats();
+                crate::metrics::transaction::set_endpoint_running(stats.running_transactions);
+                crate::metrics::transaction::set_endpoint_finished(stats.finished_transactions);
+                crate::metrics::transaction::set_endpoint_waiting_ack(stats.waiting_ack);
+                crate::metrics::transaction::set_running(self.inner.runnings_tx.load(Ordering::Relaxed));
+            }
             let modules = self.modules.clone();
 
             let token = tx
@@ -949,20 +1017,21 @@ impl SipServer {
                     runnings = runnings_tx.load(Ordering::Relaxed),
                     "max concurrency reached, not process this transaction"
                 );
+                crate::metrics::transaction::rejected("max_concurrency");
                 tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
                     .await
                     .ok();
                 continue;
             }
-            // Spam protection for OPTIONS requests
-            // If the OPTIONS request is out-of-dialog and the tag is not present, ignore it
-            if matches!(
-                tx.original.method,
-                rsipstack::sip::Method::Options
-                    | rsipstack::sip::method::Method::Info
-                    | rsipstack::sip::method::Method::Refer
-                    | rsipstack::sip::method::Method::Update
-            ) && self.inner.ignore_out_of_dialog_request
+            // Spam protection for out-of-dialog requests
+            if self.inner.ignore_out_of_dialog_request
+                && matches!(
+                    tx.original.method,
+                    rsipstack::sip::Method::Options
+                        | rsipstack::sip::method::Method::Info
+                        | rsipstack::sip::method::Method::Refer
+                        | rsipstack::sip::method::Method::Update
+                )
             {
                 let to_tag = tx
                     .original
@@ -970,9 +1039,24 @@ impl SipServer {
                     .and_then(|to| to.tag())
                     .ok()
                     .flatten();
-                let via = tx.original.via_header()?.value();
                 if to_tag.is_none() {
-                    info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
+                    let via_ip = crate::proxy::routing::extract_via_ip(&tx.original);
+                    let via_ip_str = via_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if tx.original.method == rsipstack::sip::Method::Options {
+                        let is_trunk = if let Some(ref ip) = via_ip {
+                            self.inner.data_context.find_trunk_by_ip(ip).await.is_some()
+                        } else {
+                            false
+                        };
+                        if is_trunk {
+                            info!(key = %tx.key, via_ip = %via_ip_str, "responding 200 OK OPTIONS (trunk health probe)");
+                            tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
+                            continue;
+                        }
+                    }
+                    debug!(key = %tx.key, via_ip = %via_ip_str, "ignoring out-of-dialog {} request", tx.original.method);
                     continue;
                 }
             }
@@ -997,6 +1081,7 @@ impl SipServer {
                         info!(key = %tx.key, "transaction cancelled");
                     }
                 };
+                crate::metrics::transaction::latency_seconds(start_time.elapsed().as_secs_f64());
                 runnings_tx.fetch_sub(1, Ordering::Relaxed);
                 let is_mid_dialog = tx
                     .original
@@ -1088,7 +1173,7 @@ impl SipServerInner {
         Some(rsipstack::sip::Uri {
             scheme: addr.r#type.map(|t| t.sip_scheme()),
             auth: Some(Auth {
-                user: "rustpbx".to_string(),
+                user: self.contact_username.clone(),
                 password: None,
             }),
             host_with_port: addr.addr,
@@ -1132,8 +1217,13 @@ impl SipServerInner {
                         }
                     }
                 }
+                let realms_empty = self.proxy_config.realms.as_ref().map_or(true, |v| v.is_empty());
                 if self.endpoint.get_addrs().iter().any(|addr| {
-                    if addr.addr.host.to_string() == host {
+                    let addr_host = addr.addr.host.to_string();
+                    if addr_host == host {
+                        port.map(|p| addr.addr.port == Some(p.into()))
+                            .unwrap_or(true)
+                    } else if realms_empty && (addr_host == "0.0.0.0" || addr_host == "::") {
                         port.map(|p| addr.addr.port == Some(p.into()))
                             .unwrap_or(true)
                     } else {
@@ -1174,4 +1264,21 @@ impl MessageInspector for CompositeMessageInspector {
         }
         msg
     }
+}
+
+#[cfg(unix)]
+fn log_rlimit_nofile() {
+    if let Ok(content) = std::fs::read_to_string("/proc/self/limits") {
+        for line in content.lines() {
+            if line.contains("open files") || line.contains("Max open files") {
+                info!("{line}");
+                return;
+            }
+        }
+    }
+    // Fallback: check current fd count vs a reasonable estimate
+    let count = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    info!("RLIMIT_NOFILE: current fd count ~{count}");
 }

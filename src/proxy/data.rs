@@ -20,9 +20,8 @@ use crate::{
     models::{routing, sip_trunk},
     proxy::routing::matcher::RouteResourceLookup,
     proxy::routing::{
-        CacPolicy, CallIdMode, ConfigOrigin, DestConfig, MatchConditions, MediaMode,
-        RewriteRules, RouteAction, RouteDirection, RouteQueueConfig, RouteRule, TrunkConfig,
-        VideoPolicy,
+        CacPolicy, CallIdMode, ConfigOrigin, DestConfig, MatchConditions, MediaMode, RewriteRules,
+        RouteAction, RouteQueueConfig, RouteRule, TrunkConfig, VideoPolicy,
     },
     proxy::trunk_registrar::TrunkRegistrar,
 };
@@ -35,6 +34,8 @@ pub struct ProxyDataContext {
     acl_rules: RwLock<Vec<String>>,
     db: Option<DatabaseConnection>,
     trunk_registrar: Arc<TrunkRegistrar>,
+    /// Debug routes — temporary overrides set by IVR Editor.
+    pub debug_routes: RwLock<HashMap<String, (String, Option<serde_json::Value>)>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +74,7 @@ impl ProxyDataContext {
             acl_rules: RwLock::new(Vec::new()),
             db,
             trunk_registrar,
+            debug_routes: RwLock::new(HashMap::new()),
         };
         let _ = ctx.reload_trunks(false, None).await?;
         let _ = ctx.reload_queues(false, None).await?;
@@ -174,6 +176,13 @@ impl ProxyDataContext {
         Self::read_queue_document(path)
     }
 
+    pub fn resolve_ivr_file(&self, ivr_name: &str) -> String {
+        let config = self.config.read().unwrap().clone();
+        let ivr_dir = config.generated_ivr_dir();
+        resolve_ivr_name_to_path(ivr_name, &ivr_dir)
+    }
+
+
     fn resolve_reference_path(base: &Path, reference: &str) -> PathBuf {
         let candidate = Path::new(reference);
         if candidate.is_absolute() {
@@ -241,6 +250,12 @@ impl ProxyDataContext {
         if let Some(ref info) = generated {
             generated_entries = info.entries;
         }
+        let generated_path = if generated.is_none() {
+            resolve_generated_path(&config.trunks_files, &default_dir, "trunks.generated.toml")
+                .filter(|p| p.exists())
+        } else {
+            None
+        };
         let mut trunks: HashMap<String, TrunkConfig> = HashMap::new();
         let mut config_count = 0usize;
         let mut file_count = 0usize;
@@ -266,6 +281,12 @@ impl ProxyDataContext {
         if let Some(ref info) = generated {
             let generated_pattern = vec![info.path.clone()];
             let (generated_trunks, _) = load_trunks_from_files(&generated_pattern)?;
+            trunks.extend(generated_trunks);
+        } else if let Some(ref path) = generated_path {
+            info!(path = %path.display(), "loading previously generated trunks file");
+            let generated_pattern = vec![path.to_string_lossy().to_string()];
+            let (generated_trunks, _) = load_trunks_from_files(&generated_pattern)?;
+            generated_entries = generated_trunks.len();
             trunks.extend(generated_trunks);
         }
 
@@ -611,7 +632,7 @@ impl ProxyDataContext {
                 .collect::<HashMap<i64, String>>()
         };
 
-        let routes = load_routes_from_db(db, &trunk_lookup).await?;
+        let routes = load_routes_from_db(db, &trunk_lookup, Some(&config.generated_ivr_dir())).await?;
         let entries = routes.len();
         let backup = backup_existing_file(&target_path)?;
         write_routes_file(&target_path, &routes)?;
@@ -866,7 +887,11 @@ pub fn sbc_config_from_metadata(meta: &serde_json::Value) -> TrunkConfig {
     let from_bool = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_bool());
     let from_strs = |v: Option<&serde_json::Value>| -> Vec<String> {
         v.and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
@@ -887,37 +912,54 @@ pub fn sbc_config_from_metadata(meta: &serde_json::Value) -> TrunkConfig {
     });
 
     TrunkConfig {
-        call_id_mode: from_str(sbc.and_then(|s| s.get("call_id_mode"))).and_then(|s| match s.as_str() {
-            "transparent" => Some(CallIdMode::Transparent),
-            "rewrite" => Some(CallIdMode::Rewrite),
-            _ => None,
+        call_id_mode: from_str(sbc.and_then(|s| s.get("call_id_mode"))).and_then(|s| {
+            match s.as_str() {
+                "transparent" => Some(CallIdMode::Transparent),
+                "rewrite" => Some(CallIdMode::Rewrite),
+                _ => None,
+            }
         }),
         health_check_enabled: from_bool(sbc.and_then(|s| s.get("health_check_enabled"))),
         health_check_per_ip: from_bool(sbc.and_then(|s| s.get("health_check_per_ip"))),
-        health_check_interval_secs: sbc.and_then(|s| s.get("health_check_interval")).and_then(|v| v.as_u64()),
+        health_check_interval_secs: sbc
+            .and_then(|s| s.get("health_check_interval"))
+            .and_then(|v| v.as_u64()),
         health_check_probe_count: from_u64(sbc.and_then(|s| s.get("health_check_probe_count"))),
-        health_check_fallback_trunk: from_str(sbc.and_then(|s| s.get("health_check_fallback_trunk"))),
-        cac_policy: from_str(sbc.and_then(|s| s.get("cac_policy"))).and_then(|s| match s.as_str() {
-            "lossy" => Some(CacPolicy::Lossy),
-            "reject" => Some(CacPolicy::Reject),
-            "overflow" => Some(CacPolicy::Overflow),
-            _ => None,
+        health_check_fallback_trunk: from_str(
+            sbc.and_then(|s| s.get("health_check_fallback_trunk")),
+        ),
+        cac_policy: from_str(sbc.and_then(|s| s.get("cac_policy"))).and_then(|s| {
+            match s.as_str() {
+                "lossy" => Some(CacPolicy::Lossy),
+                "reject" => Some(CacPolicy::Reject),
+                "overflow" => Some(CacPolicy::Overflow),
+                _ => None,
+            }
         }),
         overflow_threshold: from_u64(sbc.and_then(|s| s.get("overflow_threshold"))),
-        media_mode: from_str(sbc.and_then(|s| s.get("media_mode"))).and_then(|s| match s.as_str() {
-            "none" => Some(MediaMode::None),
-            "bypass" => Some(MediaMode::Bypass),
-            "auto" => Some(MediaMode::Auto),
-            "force_transcode" => Some(MediaMode::ForceTranscode),
-            _ => None,
+        media_mode: from_str(sbc.and_then(|s| s.get("media_mode"))).and_then(|s| {
+            match s.as_str() {
+                "none" => Some(MediaMode::None),
+                "bypass" => Some(MediaMode::Bypass),
+                "auto" => Some(MediaMode::Auto),
+                "force_transcode" => Some(MediaMode::ForceTranscode),
+                _ => None,
+            }
         }),
-        video_policy: from_str(sbc.and_then(|s| s.get("video_policy"))).and_then(|s| match s.as_str() {
-            "pass_through" => Some(VideoPolicy::PassThrough),
-            "strip" => Some(VideoPolicy::Strip),
-            "transcode" => Some(VideoPolicy::Transcode),
-            _ => None,
+        video_policy: from_str(sbc.and_then(|s| s.get("video_policy"))).and_then(|s| {
+            match s.as_str() {
+                "pass_through" => Some(VideoPolicy::PassThrough),
+                "strip" => Some(VideoPolicy::Strip),
+                "transcode" => Some(VideoPolicy::Transcode),
+                _ => None,
+            }
         }),
-        header_rules: sbc.and_then(|s| s.get("header_rules")).and_then(|v| serde_json::from_value(v.clone()).ok()),
+        header_rules: sbc
+            .and_then(|s| s.get("header_rules"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        ringback: sbc
+            .and_then(|s| s.get("ringback"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
         codec: codecs,
         recording: if recording.is_some() { recording } else { None },
         ..Default::default()
@@ -925,7 +967,11 @@ pub fn sbc_config_from_metadata(meta: &serde_json::Value) -> TrunkConfig {
 }
 
 fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
-    let dest = model.sip_server.clone().or(model.outbound_proxy.clone()).unwrap_or_default();
+    let dest = model
+        .sip_server
+        .clone()
+        .or(model.outbound_proxy.clone())
+        .unwrap_or_default();
 
     let backup_dest = model
         .outbound_proxy
@@ -982,7 +1028,9 @@ fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
             .register_extra_headers
             .and_then(|v| serde_json::from_value(v).ok()),
         rewrite_hostport: model.rewrite_hostport,
-        did_numbers: model.did_numbers.clone()
+        did_numbers: model
+            .did_numbers
+            .clone()
             .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
             .unwrap_or_default(),
         origin: ConfigOrigin::embedded(),
@@ -993,19 +1041,48 @@ fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
     if let Some(ref meta) = model.metadata {
         if meta.get("sbc").is_some() {
             let sbc = sbc_config_from_metadata(meta);
-            if sbc.call_id_mode.is_some() { trunk.call_id_mode = sbc.call_id_mode; }
-            if sbc.health_check_enabled.is_some() { trunk.health_check_enabled = sbc.health_check_enabled; }
-            if sbc.health_check_per_ip.is_some() { trunk.health_check_per_ip = sbc.health_check_per_ip; }
-            if sbc.health_check_interval_secs.is_some() { trunk.health_check_interval_secs = sbc.health_check_interval_secs; }
-            if sbc.health_check_probe_count.is_some() { trunk.health_check_probe_count = sbc.health_check_probe_count; }
-            if sbc.health_check_fallback_trunk.is_some() { trunk.health_check_fallback_trunk = sbc.health_check_fallback_trunk; }
-            if sbc.cac_policy.is_some() { trunk.cac_policy = sbc.cac_policy; }
-            if sbc.overflow_threshold.is_some() { trunk.overflow_threshold = sbc.overflow_threshold; }
-            if sbc.media_mode.is_some() { trunk.media_mode = sbc.media_mode; }
-            if sbc.video_policy.is_some() { trunk.video_policy = sbc.video_policy; }
-            if sbc.header_rules.is_some() { trunk.header_rules = sbc.header_rules; }
-            if !sbc.codec.is_empty() { trunk.codec = sbc.codec; }
-            if sbc.recording.is_some() { trunk.recording = sbc.recording; }
+            if sbc.call_id_mode.is_some() {
+                trunk.call_id_mode = sbc.call_id_mode;
+            }
+            if sbc.health_check_enabled.is_some() {
+                trunk.health_check_enabled = sbc.health_check_enabled;
+            }
+            if sbc.health_check_per_ip.is_some() {
+                trunk.health_check_per_ip = sbc.health_check_per_ip;
+            }
+            if sbc.health_check_interval_secs.is_some() {
+                trunk.health_check_interval_secs = sbc.health_check_interval_secs;
+            }
+            if sbc.health_check_probe_count.is_some() {
+                trunk.health_check_probe_count = sbc.health_check_probe_count;
+            }
+            if sbc.health_check_fallback_trunk.is_some() {
+                trunk.health_check_fallback_trunk = sbc.health_check_fallback_trunk;
+            }
+            if sbc.cac_policy.is_some() {
+                trunk.cac_policy = sbc.cac_policy;
+            }
+            if sbc.overflow_threshold.is_some() {
+                trunk.overflow_threshold = sbc.overflow_threshold;
+            }
+            if sbc.media_mode.is_some() {
+                trunk.media_mode = sbc.media_mode;
+            }
+            if sbc.video_policy.is_some() {
+                trunk.video_policy = sbc.video_policy;
+            }
+            if sbc.header_rules.is_some() {
+                trunk.header_rules = sbc.header_rules;
+            }
+            if !sbc.codec.is_empty() {
+                trunk.codec = sbc.codec;
+            }
+            if sbc.recording.is_some() {
+                trunk.recording = sbc.recording;
+            }
+            if sbc.ringback.is_some() {
+                trunk.ringback = sbc.ringback;
+            }
         }
     }
 
@@ -1015,6 +1092,7 @@ fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
 pub(crate) async fn load_routes_from_db(
     db: &DatabaseConnection,
     trunk_lookup: &HashMap<i64, String>,
+    ivr_dir: Option<&Path>,
 ) -> Result<Vec<RouteRule>> {
     let models = routing::Entity::find()
         .filter(routing::Column::IsActive.eq(true))
@@ -1024,7 +1102,7 @@ pub(crate) async fn load_routes_from_db(
 
     let mut routes = Vec::new();
     for model in models {
-        if let Some(route) = convert_route(model, trunk_lookup).context("convert route")? {
+        if let Some(route) = convert_route(model, trunk_lookup, ivr_dir).context("convert route")? {
             routes.push(route);
         }
     }
@@ -1058,6 +1136,7 @@ struct RouteMetadataAction {
 fn convert_route(
     model: routing::Model,
     trunk_lookup: &HashMap<i64, String>,
+    ivr_dir: Option<&Path>,
 ) -> Result<Option<RouteRule>> {
     let mut match_conditions = MatchConditions::default();
     if let Some(pattern) = model.source_pattern.clone()
@@ -1120,13 +1199,8 @@ fn convert_route(
         && let Ok(doc) = serde_json::from_value::<RouteMetadataDocument>(metadata)
         && let Some(meta_action) = doc.action
     {
-        apply_route_metadata(&mut action, meta_action);
+        apply_route_metadata(&mut action, meta_action, ivr_dir);
     }
-
-    let direction = match model.direction {
-        routing::RoutingDirection::Inbound => RouteDirection::Inbound,
-        routing::RoutingDirection::Outbound => RouteDirection::Outbound,
-    };
 
     let mut source_trunks = Vec::new();
     let mut source_trunk_ids = Vec::new();
@@ -1141,7 +1215,6 @@ fn convert_route(
         name: model.name,
         description: model.description,
         priority: model.priority,
-        direction,
         source_trunks,
         source_trunk_ids,
         match_conditions,
@@ -1156,7 +1229,36 @@ fn convert_route(
     Ok(Some(route))
 }
 
-fn apply_route_metadata(action: &mut RouteAction, meta: RouteMetadataAction) {
+fn sanitize_ivr_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn resolve_ivr_name_to_path(name: &str, ivr_dir: &Path) -> String {
+    let sanitized = sanitize_ivr_filename(name);
+    let hand_written = ivr_dir.join(format!("{}.toml", sanitized));
+    if hand_written.exists() {
+        return hand_written.to_string_lossy().to_string();
+    }
+    let generated = ivr_dir.join(format!("{}.generated.toml", sanitized));
+    if generated.exists() {
+        return generated.to_string_lossy().to_string();
+    }
+    hand_written.to_string_lossy().to_string()
+}
+
+fn apply_route_metadata(
+    action: &mut RouteAction,
+    meta: RouteMetadataAction,
+    ivr_dir: Option<&Path>,
+) {
     let target_type = meta
         .target_type
         .as_deref()
@@ -1176,8 +1278,13 @@ fn apply_route_metadata(action: &mut RouteAction, meta: RouteMetadataAction) {
         }
         "ivr" => {
             if let Some(file) = sanitize_metadata_string(meta.ivr_file) {
+                let file_path = if let Some(dir) = ivr_dir {
+                    resolve_ivr_name_to_path(&file, dir)
+                } else {
+                    file
+                };
                 action.app = Some("ivr".to_string());
-                action.app_params = Some(serde_json::json!({ "file": file }));
+                action.app_params = Some(serde_json::json!({ "file": file_path }));
             }
         }
         _ => {}
@@ -1404,7 +1511,7 @@ mod tests {
             voicemail_extension: None,
             ivr_file: None,
         };
-        apply_route_metadata(&mut action, meta);
+        apply_route_metadata(&mut action, meta, None);
         assert_eq!(action.queue.as_deref(), Some("queues/support.toml"));
     }
 
@@ -1417,7 +1524,7 @@ mod tests {
             voicemail_extension: Some("1001".to_string()),
             ivr_file: None,
         };
-        apply_route_metadata(&mut action, meta);
+        apply_route_metadata(&mut action, meta, None);
         assert_eq!(action.app.as_deref(), Some("voicemail"));
         let params = action.app_params.unwrap();
         assert_eq!(params["extension"], "1001");
@@ -1432,7 +1539,7 @@ mod tests {
             voicemail_extension: None,
             ivr_file: Some("config/ivr/main.toml".to_string()),
         };
-        apply_route_metadata(&mut action, meta);
+        apply_route_metadata(&mut action, meta, None);
         assert_eq!(action.app.as_deref(), Some("ivr"));
         let params = action.app_params.unwrap();
         assert_eq!(params["file"], "config/ivr/main.toml");
@@ -1484,5 +1591,72 @@ mod tests {
             trunks.values().any(|t| !t.inbound_hosts.is_empty()),
             "one trunk has inbound_hosts — warning should fire"
         );
+    }
+
+    #[test]
+    fn sbc_config_extracts_ringback_from_metadata() {
+        let meta: serde_json::Value = serde_json::from_str(
+            r#"{
+            "sbc": {
+                "ringback": {
+                    "busy": "/sounds/busy.wav",
+                    "reject": "/sounds/reject.wav",
+                    "play_duration_secs": 5
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let cfg = sbc_config_from_metadata(&meta);
+        let rb = cfg.ringback.as_ref().expect("ringback should be parsed");
+        assert_eq!(rb.busy, Some("/sounds/busy.wav".to_string()));
+        assert_eq!(rb.reject, Some("/sounds/reject.wav".to_string()));
+        assert_eq!(rb.play_duration_secs, Some(5));
+    }
+
+    #[test]
+    fn sbc_config_ringback_absent_when_not_in_metadata() {
+        let meta: serde_json::Value =
+            serde_json::from_str(r#"{"sbc": {"media_mode": "bypass"}}"#).unwrap();
+        let cfg = sbc_config_from_metadata(&meta);
+        assert!(
+            cfg.ringback.is_none(),
+            "no ringback field → ringback should be None"
+        );
+    }
+
+    #[test]
+    fn convert_trunk_merges_sbc_ringback() {
+        let model = sip_trunk::Model {
+            id: 1,
+            name: "test".to_string(),
+            sip_server: Some("sip:1.2.3.4:5060".to_string()),
+            metadata: Some(serde_json::json!({
+                "sbc": {
+                    "ringback": {
+                        "offline": "/sounds/offline.wav",
+                        "notfound": "/sounds/notfound.wav"
+                    }
+                }
+            })),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        let rb = trunk.ringback.as_ref().expect("ringback should be merged");
+        assert_eq!(rb.offline, Some("/sounds/offline.wav".to_string()));
+        assert_eq!(rb.notfound, Some("/sounds/notfound.wav".to_string()));
+    }
+
+    #[test]
+    fn convert_trunk_no_ringback_without_sbc_metadata() {
+        let model = sip_trunk::Model {
+            id: 2,
+            name: "test-no-sbc".to_string(),
+            sip_server: Some("sip:5.6.7.8:5060".to_string()),
+            metadata: None,
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert!(trunk.ringback.is_none(), "no metadata → no ringback");
     }
 }

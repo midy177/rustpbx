@@ -45,7 +45,7 @@ fn make_auth() -> RwiAuthRef {
 
 async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegistry>) {
     let auth = make_auth();
-    let gateway: RwiGatewayRef = Arc::new(tokio::sync::RwLock::new(RwiGateway::new()));
+    let gateway: RwiGatewayRef = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
     let registry = Arc::new(ActiveProxyCallRegistry::new());
 
     let auth_c = auth.clone();
@@ -81,7 +81,7 @@ async fn start_test_server() -> (String, RwiGatewayRef, Arc<ActiveProxyCallRegis
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    rustpbx::utils::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
@@ -489,38 +489,48 @@ async fn test_leg_timeline_via_call_resume() {
 
     // Cache events
     {
-        let gw = gateway.read().await;
+        let gw = gateway.read();
 
         // Simulate call lifecycle events
         let events = vec![
-            rustpbx::rwi::RwiEvent::CallIncoming(rustpbx::rwi::CallIncomingData {
+            rustpbx::rwi::CallIncoming { {
                 call_id: "timeline-call".to_string(),
                 context: "timeline-test".to_string(),
                 caller: "sip:customer@test.com".to_string(),
                 callee: "sip:service@test.com".to_string(),
-                direction: "inbound".to_string(),
+                dial_direction: "inbound".to_string(),
                 trunk: None,
                 sip_headers: std::collections::HashMap::new(),
+                root_call_id: None,
+                caller_name: None,
+                callee_name: None,
+                called_phone: None,
+                app_id: None,
+                routing_target: None,
+                uuid: None,
+                routing_path: None,
             }),
-            rustpbx::rwi::RwiEvent::CallAnswered {
+            rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallAnswered  { 
                 call_id: "timeline-call".to_string(),
             },
-            rustpbx::rwi::RwiEvent::CallBridged {
+            rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallBridged  { 
                 leg_a: "timeline-call".to_string(),
                 leg_b: "agent-leg".to_string(),
             },
-            rustpbx::rwi::RwiEvent::CallUnbridged {
+            rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallUnbridged  { 
                 call_id: "timeline-call".to_string(),
             },
-            rustpbx::rwi::RwiEvent::CallTransferred {
+            rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallTransferred  { 
                 call_id: "timeline-call".to_string(),
             },
         ];
 
         for event in events {
             gw.cache_event(&"timeline-call".to_string(), &event);
-        }
-    }
+        }, None);
+
+    }, None);
+
 
     // Resume the call and verify events
     let (_, json) = req(
@@ -553,4 +563,5 @@ async fn test_leg_timeline_via_call_resume() {
     );
 
     ws.close(None).await.unwrap();
-}
+}, None);
+

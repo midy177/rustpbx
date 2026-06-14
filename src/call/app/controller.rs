@@ -8,7 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 /// An audio playback session.
 #[derive(Debug, Clone)]
@@ -139,7 +139,8 @@ impl CallController {
         code: Option<u16>,
     ) -> anyhow::Result<()> {
         self.session
-            .send_command(CallCommand::Hangup(HangupCommand::all(reason, code)))?;
+            .send_command_async(CallCommand::Hangup(HangupCommand::all(reason, code)))
+            .await?;
         Ok(())
     }
 
@@ -181,9 +182,14 @@ impl CallController {
     ) -> anyhow::Result<PlaybackHandle> {
         let path = file.into();
         let track_id = track_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let source = if path.starts_with("http://") || path.starts_with("https://") {
+            MediaSource::Url { url: path.clone() }
+        } else {
+            MediaSource::File { path: path.clone() }
+        };
         self.session.send_command(CallCommand::Play {
             leg_id: None,
-            source: MediaSource::File { path: path.clone() },
+            source,
             options: Some(PlayOptions {
                 loop_playback,
                 await_completion: false,
@@ -223,7 +229,7 @@ impl CallController {
         let tx = self.fired_timer_tx.clone();
         let cancelled = self.cancelled_timers.clone();
         let id_task = id.clone();
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             tokio::time::sleep(delay).await;
             // Only fire if not cancelled in the meantime.
             let was_cancelled = cancelled.lock().unwrap().remove(&id_task);
@@ -388,6 +394,33 @@ impl CallController {
         })?;
         Ok(())
     }
+
+    /// Remove (cancel) a set of call legs by their leg IDs.
+    ///
+    /// Each leg is sent a `LegRemove` command, which causes the SIP session
+    /// to send a BYE/CANCEL and clean up the dialog.
+    pub fn remove_legs(&self, leg_ids: &[String]) {
+        for leg_id in leg_ids {
+            if let Err(e) = self.session.send_command(CallCommand::LegRemove {
+                leg_id: LegId::from(leg_id.as_str()),
+            }) {
+                warn!("Failed to send LegRemove for {}: {}", leg_id, e);
+            }
+        }
+    }
+
+    /// Inject an AudioComplete event into the app event loop.
+    ///
+    /// Used internally when no audio file is available to play
+    /// (e.g., TTS text was requested but no TTS service is configured)
+    /// so the application can continue to the next step instead of
+    /// waiting indefinitely for an AudioComplete event.
+    pub fn signal_audio_complete(&self, track_id: String, interrupted: bool) {
+        self.session.send_app_event(ControllerEvent::AudioComplete {
+            track_id,
+            interrupted,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -402,9 +435,9 @@ mod tests {
     fn make_controller_with_channels() -> (
         CallController,
         mpsc::UnboundedSender<ControllerEvent>,
-        mpsc::UnboundedReceiver<CallCommand>,
+        mpsc::Receiver<CallCommand>,
     ) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Create a minimal SipSessionHandle for testing
@@ -420,7 +453,7 @@ mod tests {
 
         // Spawn a task that monitors commands and sends RecordingComplete when StopRecording is received
         let event_tx_clone = event_tx.clone();
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 if matches!(cmd, CallCommand::StopRecording) {
                     // Simulate the session processing the stop and sending back RecordingComplete
@@ -448,7 +481,7 @@ mod tests {
         let (mut controller, event_tx, mut cmd_rx) = make_controller_with_channels();
 
         // Spawn a task that sends Hangup instead of RecordingComplete
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             // Wait for StopRecording command
             while let Some(cmd) = cmd_rx.recv().await {
                 if matches!(cmd, CallCommand::StopRecording) {
@@ -471,7 +504,7 @@ mod tests {
         let (mut controller, event_tx, mut cmd_rx) = make_controller_with_channels();
 
         let event_tx_clone = event_tx.clone();
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             // Wait for StopRecording command
             while let Some(cmd) = cmd_rx.recv().await {
                 if matches!(cmd, CallCommand::StopRecording) {

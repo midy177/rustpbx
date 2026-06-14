@@ -1,10 +1,10 @@
 use super::{ProxyAction, ProxyModule, server::SipServerRef};
 use crate::call::runtime::SessionId;
 use crate::call::{
-    CalleeDisplayName, CalleeOfflineMarker, DialDirection, DialStrategy, Dialplan, Location,
-    MediaConfig, RouteInvite, RoutingState, SipUser, TransactionCookie, TrunkContext,
+    CalleeDisplayName, CalleeOfflineMarker, DialDirection, DialStrategy, Dialplan, DialplanFlow,
+    Location, MediaConfig, RouteInvite, RoutingState, SipUser, TransactionCookie, TrunkContext,
 };
-use crate::config::{ProxyConfig, RouteResult};
+use crate::config::{ProxyConfig, RecordingPolicy, RouteResult};
 use crate::media::{Track, recorder::RecorderOption};
 use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
 use crate::proxy::data::ProxyDataContext;
@@ -13,6 +13,9 @@ use crate::proxy::proxy_call::sip_session::SipSession;
 use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
     matcher::{RouteResourceLookup, match_invite},
+};
+use crate::proxy::routing::{
+    extract_from_user as routing_extract_from_user, extract_to_user as routing_extract_to_user,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -27,8 +30,7 @@ use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::transaction::key::TransactionRole;
 use rsipstack::transaction::transaction::Transaction;
-use rsipstack::transport::SipConnection;
-use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -81,7 +83,7 @@ fn q850_cause_from_status(code: &rsipstack::sip::StatusCode) -> u16 {
 }
 
 fn escape_reason_text(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    crate::proxy::routing::escape_sip_quoted(text)
 }
 
 /// Decide what to do when routing returned NotHandled (no explicit forward/queue).
@@ -115,6 +117,25 @@ pub fn q850_reason_value(code: &rsipstack::sip::StatusCode, detail: Option<&str>
     )
 }
 
+/// Verdict returned by a [`DialplanInspector`].
+///
+/// Allows an inspector to continue the chain, finalize the dialplan
+/// (skipping remaining inspectors), or reject the call outright.
+pub enum DialplanVerdict {
+    /// Pass the (possibly modified) dialplan to the next inspector.
+    Continue(Dialplan),
+    /// The dialplan is final — skip remaining inspectors.
+    Final(Dialplan),
+    /// Reject the call with the given error.
+    Reject(RouteError),
+}
+
+impl From<Dialplan> for DialplanVerdict {
+    fn from(dp: Dialplan) -> Self {
+        DialplanVerdict::Continue(dp)
+    }
+}
+
 #[async_trait]
 pub trait DialplanInspector: Send + Sync {
     async fn inspect_dialplan(
@@ -122,7 +143,7 @@ pub trait DialplanInspector: Send + Sync {
         dialplan: Dialplan,
         cookie: &TransactionCookie,
         original: &rsipstack::sip::Request,
-    ) -> Result<Dialplan, RouteError>;
+    ) -> DialplanVerdict;
 }
 
 /// Context passed to [`QueueLocationEnricher::enrich`].
@@ -220,6 +241,19 @@ impl RouteInvite for DefaultRouteInvite {
             }
         }
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
+        // Check debug routes before standard routing
+        if let Some(callee_user) = origin.uri.user() {
+            let callee_str = callee_user.to_string();
+            let debug_routes = self.data_context.debug_routes.read().unwrap();
+            if let Some((app_name, app_params)) = debug_routes.get(&callee_str) {
+                return Ok(RouteResult::Application {
+                    option,
+                    app_name: app_name.clone(),
+                    app_params: app_params.clone(),
+                    auto_answer: true,
+                });
+            }
+        }
         match_invite(
             if trunks_snapshot.is_empty() {
                 None
@@ -252,6 +286,19 @@ impl RouteInvite for DefaultRouteInvite {
             self.build_context(origin, direction).await;
 
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
+        // Check debug routes before standard routing (preview mode)
+        if let Some(callee_user) = origin.uri.user() {
+            let callee_str = callee_user.to_string();
+            let debug_routes = self.data_context.debug_routes.read().unwrap();
+            if let Some((app_name, app_params)) = debug_routes.get(&callee_str) {
+                return Ok(RouteResult::Application {
+                    option,
+                    app_name: app_name.clone(),
+                    app_params: app_params.clone(),
+                    auto_answer: true,
+                });
+            }
+        }
         match_invite(
             if trunks_snapshot.is_empty() {
                 None
@@ -308,9 +355,7 @@ impl DefaultRouteInvite {
             return build_source_trunk(name.clone(), config, direction);
         }
 
-        let via = origin.via_header().ok()?;
-        let (_, target) = SipConnection::parse_target_from_via(via).ok()?;
-        let ip: IpAddr = target.host.try_into().ok()?;
+        let ip = super::routing::extract_via_ip(origin)?;
         let name = self.data_context.find_trunk_by_ip(&ip).await?;
         let config = trunks.get(&name)?;
         build_source_trunk(name, config, direction)
@@ -318,19 +363,11 @@ impl DefaultRouteInvite {
 }
 
 fn extract_from_user(origin: &rsipstack::sip::Request) -> Option<String> {
-    origin
-        .from_header()
-        .ok()
-        .and_then(|header| header.uri().ok())
-        .and_then(|uri| uri.user().map(|u| u.to_string()))
+    routing_extract_from_user(origin)
 }
 
 fn extract_to_user(origin: &rsipstack::sip::Request) -> Option<String> {
-    origin
-        .to_header()
-        .ok()
-        .and_then(|header| header.uri().ok())
-        .and_then(|uri| uri.user().map(|u| u.to_string()))
+    routing_extract_to_user(origin)
 }
 
 fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<rsipstack::sip::Uri> {
@@ -348,6 +385,43 @@ fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<rsipstack::sip
         .map_err(anyhow::Error::from)?
         .uri()
         .map_err(anyhow::Error::from)
+}
+
+pub(crate) fn parse_allowed_codecs(codec_names: &[String]) -> Vec<CodecType> {
+    let mut allow_codecs = Vec::new();
+    for codec_name in codec_names {
+        let codec_name = codec_name.trim();
+        if codec_name.is_empty() {
+            continue;
+        }
+        match CodecType::try_from(codec_name) {
+            Ok(codec) if !allow_codecs.contains(&codec) => allow_codecs.push(codec),
+            Ok(_) => {}
+            Err(_) => warn!(codec = %codec_name, "Ignoring unsupported audio codec in allow list"),
+        }
+    }
+    allow_codecs
+}
+
+pub(crate) fn apply_allowed_codecs(
+    dialplan: &mut Dialplan,
+    preferred: Option<&[String]>,
+    fallback: Option<&[String]>,
+) {
+    if let Some(codec_names) = preferred {
+        let allow_codecs = parse_allowed_codecs(codec_names);
+        if !allow_codecs.is_empty() {
+            dialplan.allow_codecs = allow_codecs;
+            return;
+        }
+    }
+
+    if let Some(codec_names) = fallback {
+        let allow_codecs = parse_allowed_codecs(codec_names);
+        if !allow_codecs.is_empty() {
+            dialplan.allow_codecs = allow_codecs;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -604,7 +678,7 @@ impl CallModule {
                             Some(rsipstack::sip::StatusCode::ServerInternalError),
                         )));
                     }
-                    let ivr_file = format!("config/ivr/{}.toml", name);
+                    let ivr_file = self.inner.server.data_context.resolve_ivr_file(name);
                     forced_pending_app = Some((
                         "ivr".to_string(),
                         Some(serde_json::json!({ "file": ivr_file })),
@@ -649,6 +723,7 @@ impl CallModule {
             ..Default::default()
         };
 
+        let mut routed_headers: Option<Vec<rsipstack::sip::Header>> = None;
         let (preview_forward, pending_queue, pending_app, dialplan_hints) = if always_forwarding {
             (
                 forced_preview_forward,
@@ -678,12 +753,15 @@ impl CallModule {
                     return Err(RouteError::from((err, Some(code))));
                 }
                 RouteResult::Application {
-                    option: _,
+                    option,
                     app_name,
                     app_params,
                     auto_answer,
                     ..
-                } => (None, None, Some((app_name, app_params, auto_answer)), None),
+                } => {
+                    routed_headers = option.headers;
+                    (None, None, Some((app_name, app_params, auto_answer)), None)
+                }
             }
         };
 
@@ -716,7 +794,12 @@ impl CallModule {
             .unwrap_or_default();
 
         let mut dialplan = Dialplan::new(session_id, original.clone(), direction)
-            .with_caller(caller_uri)
+            .with_caller(
+                preview_forward
+                    .as_ref()
+                    .map(|option| option.caller.clone())
+                    .unwrap_or(caller_uri),
+            )
             .with_media(media_config)
             .with_recording(recording)
             .with_route_invite(route_invite)
@@ -724,13 +807,33 @@ impl CallModule {
 
         if let Some((app_name, app_params, auto_answer)) = pending_app {
             dialplan = dialplan.with_application(app_name, app_params, auto_answer);
+            dialplan.routed_headers = routed_headers;
         } else if let Some(queue) = pending_queue {
             dialplan = dialplan.with_queue(queue);
         } else {
             dialplan = dialplan.with_targets(targets);
         }
 
+        let trunk_codecs = cookie
+            .get_extension::<TrunkContext>()
+            .and_then(|ctx| {
+                self.inner
+                    .server
+                    .data_context
+                    .trunks_snapshot()
+                    .get(&ctx.name)
+                    .map(|trunk| trunk.codec.clone())
+            })
+            .filter(|codecs| !codecs.is_empty());
+        let fallback_codecs = trunk_codecs
+            .as_deref()
+            .or(self.inner.config.audio_codecs.as_deref());
+
         if let Some(mut hints) = dialplan_hints {
+            if let Some(policy) = hints.recording.take() {
+                dialplan.recording = policy.new_recording_config();
+                dialplan.recording_policy = Some(policy);
+            }
             if let Some(enabled) = hints.enable_recording {
                 dialplan.recording.enabled = enabled;
             }
@@ -754,38 +857,17 @@ impl CallModule {
             if hints.disable_ice_servers == Some(true) {
                 dialplan.media.ice_servers = None;
             }
-            if let Some(codecs) = hints.allow_codecs {
-                let mut allow_codecs = Vec::new();
-                for codec_name in codecs {
-                    if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
-                        allow_codecs.push(codec);
-                    }
-                }
-                if !allow_codecs.is_empty() {
-                    dialplan.allow_codecs = allow_codecs;
-                }
-            } else if let Some(codecs) = &self.inner.config.audio_codecs {
-                let mut allow_codecs = Vec::new();
-                for codec_name in codecs {
-                    if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
-                        allow_codecs.push(codec);
-                    }
-                }
-                if !allow_codecs.is_empty() {
-                    dialplan.allow_codecs = allow_codecs;
-                }
+            apply_allowed_codecs(
+                &mut dialplan,
+                hints.allow_codecs.as_deref(),
+                fallback_codecs,
+            );
+            if let Some(ringback) = hints.ringback.take() {
+                dialplan.audio_profile = Some(ringback);
             }
             dialplan.extensions = std::mem::take(&mut hints.extensions);
-        } else if let Some(codecs) = &self.inner.config.audio_codecs {
-            let mut allow_codecs = Vec::new();
-            for codec_name in codecs {
-                if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
-                    allow_codecs.push(codec);
-                }
-            }
-            if !allow_codecs.is_empty() {
-                dialplan.allow_codecs = allow_codecs;
-            }
+        } else {
+            apply_allowed_codecs(&mut dialplan, None, fallback_codecs);
         }
 
         if callee_is_same_realm && internal_lookup_empty {
@@ -795,8 +877,13 @@ impl CallModule {
         Ok(dialplan)
     }
 
-    fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
-        let policy = match self.inner.config.recording.as_ref() {
+    fn apply_recording_policy(
+        &self,
+        mut dialplan: Dialplan,
+        caller: &SipUser,
+        recording_policy_override: Option<&RecordingPolicy>,
+    ) -> Dialplan {
+        let policy = match recording_policy_override.or(self.inner.config.recording.as_ref()) {
             Some(policy) if policy.enabled => policy,
             _ => return dialplan,
         };
@@ -839,37 +926,58 @@ impl CallModule {
         let caller_identity = Self::caller_identity(caller);
         let callee_identity = Self::callee_identity(&dialplan).unwrap_or_default();
 
-        let recorder_option =
-            match self.build_recorder_option(&dialplan, policy, &caller_identity, &callee_identity)
-            {
+        // When sipflow backend is available, skip local recorder file and use
+        // sipflow for media capture and upload instead — unless force_file is
+        // set, in which case the legacy WAV file recorder is used and sipflow
+        // captures SIP signalling only.
+        let use_sipflow = self
+            .inner
+            .server
+            .sip_flow
+            .as_ref()
+            .and_then(|sf| sf.backend())
+            .is_some();
+
+        let force_file = policy.force_file.unwrap_or(false);
+
+        if !use_sipflow || force_file {
+            let recorder_option = match self.build_recorder_option(
+                &dialplan,
+                policy,
+                &caller_identity,
+                &callee_identity,
+            ) {
                 Some(option) => option,
                 None => return dialplan,
             };
+
+            if let Some(existing) = dialplan.recording.option.as_mut() {
+                if existing.recorder_file.is_empty() {
+                    existing.recorder_file = recorder_option.recorder_file.clone();
+                }
+                if let Some(rate) = policy.samplerate {
+                    existing.samplerate = rate;
+                }
+                if let Some(ptime) = policy.ptime {
+                    existing.ptime = ptime;
+                }
+            } else {
+                dialplan.recording.option = Some(recorder_option);
+            }
+        }
 
         debug!(
             session_id = dialplan.session_id.as_deref(),
             caller = %caller_identity,
             callee = %callee_identity,
+            use_sipflow,
+            force_file,
             "recording policy enabled for dialplan"
         );
 
         dialplan.recording.enabled = true;
         dialplan.recording.auto_start = policy.auto_start.unwrap_or(true);
-
-        if let Some(existing) = dialplan.recording.option.as_mut() {
-            if existing.recorder_file.is_empty() {
-                existing.recorder_file = recorder_option.recorder_file.clone();
-            }
-            if let Some(rate) = policy.samplerate {
-                existing.samplerate = rate;
-            }
-            if let Some(ptime) = policy.ptime {
-                existing.ptime = ptime;
-            }
-        } else {
-            dialplan.recording.option = Some(recorder_option);
-        }
-
+        dialplan.recording.force_file = force_file;
         dialplan
     }
 
@@ -1025,6 +1133,73 @@ impl CallModule {
         }
     }
 
+    async fn reply_route_error(
+        &self,
+        tx: &mut Transaction,
+        cookie: &TransactionCookie,
+        route_err: RouteError,
+    ) -> Result<()> {
+        if cookie.is_spam() {
+            return Ok(());
+        }
+        let code = route_err
+            .status
+            .unwrap_or(rsipstack::sip::StatusCode::ServerInternalError);
+        let reason_text = route_err.error.to_string();
+        let reason_value = if reason_text.contains(";cause=") {
+            reason_text.clone()
+        } else {
+            q850_reason_value(&code, Some(reason_text.as_str()))
+        };
+        self.report_failure(
+            tx,
+            cookie,
+            code.clone(),
+            Some(reason_text),
+            route_err.extensions,
+        );
+        tx.reply_with(
+            code,
+            vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
+            None,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+        Err(route_err.error)
+    }
+
+    fn extract_max_forwards(tx: &Transaction) -> u32 {
+        tx.original
+            .max_forwards_header()
+            .ok()
+            .and_then(|h| h.value().parse::<u32>().ok())
+            .unwrap_or(70)
+    }
+
+    async fn build_and_serve_dialplan(
+        &self,
+        tx: &mut Transaction,
+        cookie: TransactionCookie,
+        dialplan: Dialplan,
+    ) -> Result<()> {
+        let max_forwards = Self::extract_max_forwards(tx);
+        if max_forwards == 0 {
+            self.report_failure(
+                tx,
+                &cookie,
+                rsipstack::sip::StatusCode::TooManyHops,
+                None,
+                None,
+            );
+            tx.reply(rsipstack::sip::StatusCode::TooManyHops).await?;
+            return Ok(());
+        }
+        let builder = CallSessionBuilder::new(cookie, dialplan, max_forwards - 1)
+            .with_call_record_sender(self.inner.server.callrecord_sender.clone())
+            .with_cancel_token(self.inner.server.cancel_token.child_token());
+        builder.build_and_serve(self.inner.server.clone(), tx).await
+    }
+
     async fn build_dialplan(
         &self,
         tx: &mut Transaction,
@@ -1079,9 +1254,48 @@ impl CallModule {
             dialplan = dialplan.with_caller_contact(contact);
         }
         for inspector in &self.inner.server.dialplan_inspectors {
-            dialplan = inspector
+            match inspector
                 .inspect_dialplan(dialplan, &cookie, &tx.original)
-                .await?
+                .await
+            {
+                DialplanVerdict::Continue(dp) => dialplan = dp,
+                DialplanVerdict::Final(dp) => {
+                    dialplan = dp;
+                    break;
+                }
+                DialplanVerdict::Reject(err) => return Err(err),
+            }
+        }
+
+        // Standard step for all dialplans: resolve target destinations through
+        // the locator for same-realm targets.  After the router has set target
+        // AoRs and inspectors have rewritten them, each target's AoR is resolved
+        // to the user's actual registered contact.  Without this step, targets
+        // with bare AoRs (e.g. from HttpCallRouter or JSON-RPC inspector) would
+        // cause INVITEs to hairpin back to the PBX's own IP.
+        if let DialplanFlow::Targets(ref mut strategy) = dialplan.flow {
+            let targets = match strategy {
+                DialStrategy::Parallel(t) | DialStrategy::Sequential(t) => t,
+            };
+            for target in targets.iter_mut() {
+                if target.destination.is_none() {
+                    let realm = target.aor.host().to_string();
+                    if self.inner.server.is_same_realm(&realm).await {
+                        if let Ok(locs) = self.inner.server.locator.lookup(&target.aor).await {
+                            if let Some(loc) = locs.first() {
+                                if let Some(dest) = loc.destination.clone() {
+                                    debug!(
+                                        aor = %target.aor,
+                                        destination = %dest,
+                                        "resolved target destination via locator"
+                                    );
+                                    target.destination = Some(dest);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // After dialplan inspectors have had a chance to fill in routes,
@@ -1095,12 +1309,12 @@ impl CallModule {
         }
 
         // Optimization: skip callee lookup for wholesale (trunk-originated) calls.
-        let is_wholesale = cookie
+        let has_tenant_id = cookie
             .get_extension::<TrunkContext>()
             .map(|ctx| ctx.tenant_id.is_some())
             .unwrap_or(false);
 
-        if !is_wholesale {
+        if !has_tenant_id {
             match self.resolve_callee_user(&tx.original).await {
                 Ok(Some(callee)) => {
                     // Apply call-forwarding only when no custom resolver already set it.
@@ -1121,7 +1335,9 @@ impl CallModule {
             }
         }
 
-        let dialplan = self.apply_recording_policy(dialplan, caller);
+        let recording_policy_override = dialplan.recording_policy.clone();
+        let dialplan =
+            self.apply_recording_policy(dialplan, caller, recording_policy_override.as_ref());
         Ok(dialplan)
     }
 
@@ -1199,57 +1415,24 @@ impl CallModule {
 
                 if conf_id.is_some() {
                     info!(%old_session_id, "Replaces target is in a conference; proceeding with seat replacement");
-                    // Proceed with normal call creation, then spawn background task to do seat replacement
-                    let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
+                    let dialplan = self.build_dialplan(tx, cookie.clone(), &caller).await;
+                    let dialplan = match dialplan {
                         Ok(d) => d,
                         Err(route_err) => {
-                            if cookie.is_spam() {
-                                return Ok(());
-                            }
-                            let code = route_err
-                                .status
-                                .unwrap_or(rsipstack::sip::StatusCode::ServerInternalError);
-                            let reason_text = route_err.error.to_string();
-                            let reason_value = if reason_text.contains(";cause=") {
-                                reason_text.clone()
-                            } else {
-                                q850_reason_value(&code, Some(reason_text.as_str()))
-                            };
-                            self.report_failure(
-                                tx,
-                                &cookie,
-                                code.clone(),
-                                Some(reason_text),
-                                route_err.extensions,
-                            );
-                            tx.reply_with(
-                                code.clone(),
-                                vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
-                                None,
-                            )
-                            .await
-                            .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
-                            return Err(route_err.error);
+                            return self.reply_route_error(tx, &cookie, route_err).await;
                         }
                     };
 
-                    let max_forwards = if let Ok(header) = tx.original.max_forwards_header() {
-                        header.value().parse::<u32>().unwrap_or(70)
-                    } else {
-                        70
-                    };
-
+                    let server = self.inner.server.clone();
+                    let max_forwards = Self::extract_max_forwards(tx);
                     if max_forwards == 0 {
                         tx.reply(rsipstack::sip::StatusCode::TooManyHops).await?;
                         return Ok(());
                     }
-
                     let builder =
                         CallSessionBuilder::new(cookie.clone(), dialplan, max_forwards - 1)
                             .with_call_record_sender(self.inner.server.callrecord_sender.clone())
                             .with_cancel_token(self.inner.server.cancel_token.child_token());
-
-                    let server = self.inner.server.clone();
                     let result = builder.build_and_serve(server.clone(), tx).await;
 
                     // Spawn background task to perform seat replacement once new call answers
@@ -1259,42 +1442,47 @@ impl CallModule {
                         .map(|h| h.value().to_string())
                         .unwrap_or_default();
                     if !new_session_id.is_empty() {
-                        tokio::spawn(async move {
-                            // Poll registry until new call is answered (Talking)
-                            for _ in 0..300 {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if let Some(entry) = registry.get(&new_session_id)
-                                    && matches!(entry.status, crate::proxy::active_call_registry::ActiveProxyCallStatus::Talking) {
-                                        info!(%new_session_id, "New Replaces call answered; executing conference seat replacement");
+                        let reg = registry.clone();
+                        let sid = new_session_id.clone();
+                        crate::utils::spawn(async move {
+                            if reg
+                                .wait_for_status(
+                                    &sid,
+                                    ActiveProxyCallStatus::Talking,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .await
+                            {
+                                info!(session_id = %sid, "New Replaces call answered; executing conference seat replacement");
 
-                                        if let Some(ref conf) = conf_id {
-                                            let _ = conference_manager.remove_participant(conf, &old_leg).await;
-                                            let new_leg = crate::call::domain::LegId::new(&new_session_id);
-                                            let _ = conference_manager.add_participant(conf, new_leg).await;
-                                            info!(%old_session_id, %new_session_id, "Conference seat replacement completed for Replaces");
-                                        }
+                                if let Some(ref conf) = conf_id {
+                                    let _ =
+                                        conference_manager.remove_participant(conf, &old_leg).await;
+                                    let new_leg = crate::call::domain::LegId::new(&sid);
+                                    let _ = conference_manager.add_participant(conf, new_leg).await;
+                                    info!(%old_session_id, %sid, "Conference seat replacement completed for Replaces");
+                                }
 
-                                        // Hang up old session
-                                        let _ = old_handle_clone.send_command(crate::call::domain::CallCommand::Hangup(
-                                            crate::call::domain::HangupCommand::local(
-                                                "replaced_by_replaces",
-                                                Some(crate::callrecord::CallRecordHangupReason::BySystem),
-                                                Some(200),
+                                let _ = old_handle_clone
+                                    .send_command_async(crate::call::domain::CallCommand::Hangup(
+                                        crate::call::domain::HangupCommand::local(
+                                            "replaced_by_replaces",
+                                            Some(
+                                                crate::callrecord::CallRecordHangupReason::BySystem,
                                             ),
-                                        ));
+                                            Some(200),
+                                        ),
+                                    ))
+                                    .await;
 
-                                        // Send RWI events if gateway is available
-                                        if let Some(ref gw) = server.rwi_gateway {
-                                            let event = crate::rwi::proto::RwiEvent::ConferenceSeatReplaceSucceeded {
-                                                conf_id: conf_id.map(|c| c.0).unwrap_or_default(),
-                                                old_call_id: old_session_id.clone(),
-                                                new_call_id: new_session_id.clone(),
-                                            };
-                                            let g = gw.read().await;
-                                            g.broadcast_event(&event);
-                                        }
-                                        break;
-                                    }
+                                if let Some(ref gw) = server.rwi_gateway {
+                                    let g = gw.read();
+                                    g.broadcast(&crate::rwi::ConferenceSeatReplaceSucceeded {
+                                        conf_id: conf_id.map(|c| c.0).unwrap_or_default(),
+                                        old_call_id: old_session_id.clone(),
+                                        new_call_id: sid.clone(),
+                                    });
+                                }
                             }
                         });
                     }
@@ -1302,58 +1490,24 @@ impl CallModule {
                     return result;
                 } else {
                     info!(%old_session_id, "Replaces target is not in a conference; creating conference for attended transfer");
-                    // Standard attended transfer: C sends INVITE with Replaces to replace B
-                    // We create a conference on the fly and merge both sessions
-                    let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
+                    let dialplan = self.build_dialplan(tx, cookie.clone(), &caller).await;
+                    let dialplan = match dialplan {
                         Ok(d) => d,
                         Err(route_err) => {
-                            if cookie.is_spam() {
-                                return Ok(());
-                            }
-                            let code = route_err
-                                .status
-                                .unwrap_or(rsipstack::sip::StatusCode::ServerInternalError);
-                            let reason_text = route_err.error.to_string();
-                            let reason_value = if reason_text.contains(";cause=") {
-                                reason_text.clone()
-                            } else {
-                                q850_reason_value(&code, Some(reason_text.as_str()))
-                            };
-                            self.report_failure(
-                                tx,
-                                &cookie,
-                                code.clone(),
-                                Some(reason_text),
-                                route_err.extensions,
-                            );
-                            tx.reply_with(
-                                code.clone(),
-                                vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
-                                None,
-                            )
-                            .await
-                            .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
-                            return Err(route_err.error);
+                            return self.reply_route_error(tx, &cookie, route_err).await;
                         }
                     };
 
-                    let max_forwards = if let Ok(header) = tx.original.max_forwards_header() {
-                        header.value().parse::<u32>().unwrap_or(70)
-                    } else {
-                        70
-                    };
-
+                    let server = self.inner.server.clone();
+                    let max_forwards = Self::extract_max_forwards(tx);
                     if max_forwards == 0 {
                         tx.reply(rsipstack::sip::StatusCode::TooManyHops).await?;
                         return Ok(());
                     }
-
                     let builder =
                         CallSessionBuilder::new(cookie.clone(), dialplan, max_forwards - 1)
                             .with_call_record_sender(self.inner.server.callrecord_sender.clone())
                             .with_cancel_token(self.inner.server.cancel_token.child_token());
-
-                    let server = self.inner.server.clone();
                     let result = builder.build_and_serve(server.clone(), tx).await;
 
                     // Spawn background task to perform conference merge once new call answers
@@ -1363,50 +1517,61 @@ impl CallModule {
                         .map(|h| h.value().to_string())
                         .unwrap_or_default();
                     if !new_session_id.is_empty() {
-                        tokio::spawn(async move {
-                            // Poll registry until new call is answered (Talking)
-                            for _ in 0..300 {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if let Some(entry) = registry.get(&new_session_id)
-                                    && matches!(entry.status, crate::proxy::active_call_registry::ActiveProxyCallStatus::Talking) {
-                                        info!(%new_session_id, "New Replaces call answered; creating conference for attended transfer");
+                        let reg = registry.clone();
+                        let sid = new_session_id.clone();
+                        crate::utils::spawn(async move {
+                            if reg
+                                .wait_for_status(
+                                    &sid,
+                                    ActiveProxyCallStatus::Talking,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .await
+                            {
+                                info!(session_id = %sid, "New Replaces call answered; creating conference for attended transfer");
 
-                                        // Create a new conference for this transfer
-                                        let conf_id = crate::call::runtime::ConferenceId::from(format!("conf-replaces-{}", new_session_id).as_str());
-                                        let _ = conference_manager.create_conference(conf_id.clone(), None).await;
+                                let conf_id = crate::call::runtime::ConferenceId::from(
+                                    format!("conf-replaces-{}", sid).as_str(),
+                                );
+                                let _ = conference_manager
+                                    .create_conference(conf_id.clone(), None)
+                                    .await;
 
-                                        // Add old session (A-B) to conference
-                                        let old_leg = crate::call::domain::LegId::new(&old_session_id);
-                                        let _ = conference_manager.add_participant(&conf_id, old_leg.clone()).await;
+                                let old_leg = crate::call::domain::LegId::new(&old_session_id);
+                                let _ = conference_manager
+                                    .add_participant(&conf_id, old_leg.clone())
+                                    .await;
 
-                                        // Add new session (C) to conference
-                                        let new_leg = crate::call::domain::LegId::new(&new_session_id);
-                                        let _ = conference_manager.add_participant(&conf_id, new_leg.clone()).await;
+                                let new_leg = crate::call::domain::LegId::new(&sid);
+                                let _ = conference_manager
+                                    .add_participant(&conf_id, new_leg.clone())
+                                    .await;
 
-                                        info!(%old_session_id, %new_session_id, "Conference created for attended transfer");
+                                info!(%old_session_id, %sid, "Conference created for attended transfer");
 
-                                        // Hang up old session's callee side (B) only
-                                        // Use AllExcept caller to keep A connected
-                                        let _ = old_handle_clone.send_command(crate::call::domain::CallCommand::Hangup(
-                                            crate::call::domain::HangupCommand::local(
-                                                "replaced_by_replaces",
-                                                Some(crate::callrecord::CallRecordHangupReason::BySystem),
-                                                Some(200),
-                                            ).with_cascade(crate::call::domain::HangupCascade::AllExcept(vec![
-                                                crate::call::domain::LegId::from("caller")
-                                            ])),
-                                        ));
+                                let _ = old_handle_clone
+                                    .send_command_async(crate::call::domain::CallCommand::Hangup(
+                                        crate::call::domain::HangupCommand::local(
+                                            "replaced_by_replaces",
+                                            Some(
+                                                crate::callrecord::CallRecordHangupReason::BySystem,
+                                            ),
+                                            Some(200),
+                                        )
+                                        .with_cascade(
+                                            crate::call::domain::HangupCascade::AllExcept(vec![
+                                                crate::call::domain::LegId::from("caller"),
+                                            ]),
+                                        ),
+                                    ))
+                                    .await;
 
-                                        // Send RWI events if gateway is available
-                                        if let Some(ref gw) = server.rwi_gateway {
-                                            let event = crate::rwi::proto::RwiEvent::CallTransferred {
-                                                call_id: old_session_id.clone(),
-                                            };
-                                            let g = gw.read().await;
-                                            g.broadcast_event(&event);
-                                        }
-                                        break;
-                                    }
+                                if let Some(ref gw) = server.rwi_gateway {
+                                    let g = gw.read();
+                                    g.broadcast(&crate::rwi::CallTransferred {
+                                        call_id: old_session_id.clone(),
+                                    });
+                                }
                             }
                         });
                     }
@@ -1421,67 +1586,16 @@ impl CallModule {
             }
         }
 
-        let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
+        let dialplan = self.build_dialplan(tx, cookie.clone(), &caller).await;
+        let dialplan = match dialplan {
             Ok(d) => d,
             Err(route_err) => {
-                if cookie.is_spam() {
-                    return Ok(());
-                }
-                let code = route_err
-                    .status
-                    .unwrap_or(rsipstack::sip::StatusCode::ServerInternalError);
-                let reason_text = route_err.error.to_string();
-                // If error already contains ;cause= (e.g. "invite;cause=1234;text=\"xxx\""),
-                // treat it as pre-formatted Q850 and use directly.
-                let reason_value = if reason_text.contains(";cause=") {
-                    reason_text.clone()
-                } else {
-                    q850_reason_value(&code, Some(reason_text.as_str()))
-                };
-                warn!(%code, key = %tx.key, reason = %reason_value, "failed to build dialplan");
-                self.report_failure(
-                    tx,
-                    &cookie,
-                    code.clone(),
-                    Some(reason_text),
-                    route_err.extensions,
-                );
-                tx.reply_with(
-                    code.clone(),
-                    vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
-                    None,
-                )
-                .await
-                .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
-                return Err(route_err.error);
+                warn!(key = %tx.key, "failed to build dialplan");
+                return self.reply_route_error(tx, &cookie, route_err).await;
             }
         };
 
-        // Create event sender for media stream events
-        let max_forwards = if let Ok(header) = tx.original.max_forwards_header() {
-            header.value().parse::<u32>().unwrap_or(70)
-        } else {
-            70
-        };
-
-        if max_forwards == 0 {
-            info!(key = %tx.key, "Max-Forwards exceeded");
-            self.report_failure(
-                tx,
-                &cookie,
-                rsipstack::sip::StatusCode::TooManyHops,
-                None,
-                None,
-            );
-            tx.reply(rsipstack::sip::StatusCode::TooManyHops).await?;
-            return Ok(());
-        }
-
-        let builder = CallSessionBuilder::new(cookie.clone(), dialplan, max_forwards - 1)
-            .with_call_record_sender(self.inner.server.callrecord_sender.clone())
-            .with_cancel_token(self.inner.server.cancel_token.child_token());
-
-        builder.build_and_serve(self.inner.server.clone(), tx).await
+        self.build_and_serve_dialplan(tx, cookie, dialplan).await
     }
 
     async fn process_message(&self, tx: &mut Transaction) -> Result<()> {
@@ -1602,7 +1716,7 @@ impl CallModule {
         let transfer_id = format!("refer-{}", dialog_id.call_id);
         let _transfer_id_clone = transfer_id.clone();
 
-        tokio::spawn(async move {
+        crate::utils::spawn(async move {
             info!("Spawned inbound REFER background task");
 
             // Small delay to ensure 202 response is sent
@@ -1660,11 +1774,10 @@ impl CallModule {
             if let Some(_user) = user
                 && let Some(ref gw) = server.rwi_gateway
             {
-                let event = crate::rwi::proto::RwiEvent::CallTransferred {
+                let g = gw.read();
+                g.send_to_owner(&crate::rwi::CallTransferred {
                     call_id: original_session_id.clone(),
-                };
-                let g = gw.read().await;
-                g.send_event_to_call_owner(&original_session_id, &event);
+                });
             }
         });
 
@@ -1773,7 +1886,8 @@ impl CallModule {
         let media_track =
             crate::media::RtpTrackBuilder::new(format!("inbound-refer-{}", new_call_id))
                 .with_cancel_token(tokio_util::sync::CancellationToken::new())
-                .with_external_ip(external_ip);
+                .with_external_ip(external_ip)
+                .with_cname(server.rtc_cname.clone());
         let media_track = if let Some(bind_ip) = server.rtp_config.bind_ip.clone() {
             media_track.with_bind_ip(bind_ip)
         } else {
@@ -2198,7 +2312,7 @@ mod tests {
     use crate::call::Location;
     use crate::call::{DialDirection, RouteInvite, SipUser, TransactionCookie};
     use crate::config::RouteResult;
-    use crate::proxy::tests::common::create_test_server;
+    use crate::proxy::tests::common::{create_test_server, create_test_server_with_config};
     use async_trait::async_trait;
     use rsipstack::dialog::invitation::InviteOption;
 
@@ -2233,6 +2347,30 @@ mod tests {
             _cookie: &TransactionCookie,
         ) -> Result<RouteResult> {
             Ok(RouteResult::NotHandled(option, None))
+        }
+    }
+
+    struct ApplicationRouteInvite {
+        headers: Option<Vec<rsipstack::sip::Header>>,
+    }
+
+    #[async_trait]
+    impl RouteInvite for ApplicationRouteInvite {
+        async fn route_invite(
+            &self,
+            option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            let mut opt = option;
+            opt.headers = self.headers.clone();
+            Ok(RouteResult::Application {
+                option: opt,
+                app_name: "ivr".to_string(),
+                app_params: None,
+                auto_answer: true,
+            })
         }
     }
 
@@ -2528,6 +2666,58 @@ mod tests {
             dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
             "offline marker should be set for same-realm locator-empty"
         );
+    }
+
+    #[tokio::test]
+    async fn default_resolve_applies_source_trunk_codecs_from_trunk_context() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.audio_codecs = Some(vec!["pcmu".to_string()]);
+        proxy_config.trunks.insert(
+            "inbound_192_168_3_7".to_string(),
+            TrunkConfig {
+                dest: "sip:192.168.3.7:5060".to_string(),
+                codec: vec!["pcma".to_string()],
+                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
+                inbound_hosts: vec!["192.168.3.7".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let (server, config) = create_test_server_with_config(proxy_config).await;
+        let module = CallModule::new(config, server.clone());
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "charlie",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "charlie".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+        let cookie = TransactionCookie::default();
+        cookie.insert_extension(TrunkContext {
+            id: None,
+            name: "inbound_192_168_3_7".to_string(),
+            tenant_id: None,
+            did_numbers: vec![],
+        });
+
+        let dialplan = module
+            .default_resolve(&request, Box::new(NotHandledRouteInvite), &caller, &cookie)
+            .await
+            .expect("same-realm trunk-originated call should resolve");
+
+        assert_eq!(dialplan.allow_codecs, vec![CodecType::PCMA]);
     }
 
     #[test]
@@ -2830,5 +3020,254 @@ mod tests {
 
         let resolved = resolve_callee_uri(&request).expect("expected callee uri");
         assert_eq!(resolved, to_uri);
+    }
+
+    #[tokio::test]
+    async fn default_resolve_application_carries_routed_headers() {
+        let (server, config) = create_test_server().await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "bp",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:ivrapp@rustpbx.com").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:ivrapp@rustpbx.com").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "bp".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+
+        let expected_headers = Some(vec![
+            rsipstack::sip::Header::Other("X-Custom".to_string(), "custom-value".to_string()),
+            rsipstack::sip::Header::Other(
+                "P-Asserted-Identity".to_string(),
+                "<sip:routing@pbx.com>".to_string(),
+            ),
+        ]);
+
+        let dialplan = module
+            .default_resolve(
+                &request,
+                Box::new(ApplicationRouteInvite {
+                    headers: expected_headers.clone(),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("application route should resolve");
+
+        assert!(
+            matches!(dialplan.flow, crate::call::DialplanFlow::Application { .. }),
+            "expected Application flow"
+        );
+        assert_eq!(
+            dialplan.routed_headers, expected_headers,
+            "routed headers should be preserved in Dialplan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_dialplan_resolves_same_realm_target_destination() {
+        use rsipstack::sip::HostWithPort;
+        use rsipstack::transport::SipAddr;
+
+        let (server, _config) = create_test_server().await;
+
+        let aor: rsipstack::sip::Uri = "sip:alice@rustpbx.com".try_into().expect("valid URI");
+
+        let expected_destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: HostWithPort::try_from("192.168.1.100:5060").expect("valid address"),
+        };
+
+        // Register alice in the memory locator
+        server
+            .locator
+            .register(
+                "alice",
+                Some("rustpbx.com"),
+                Location {
+                    aor: aor.clone(),
+                    expires: 3600,
+                    destination: Some(expected_destination.clone()),
+                    last_modified: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("register should succeed");
+
+        // Build a minimal dialplan with a same-realm target (destination: None)
+        let request = rsipstack::sip::Request {
+            method: rsipstack::sip::Method::Invite,
+            uri: "sip:target@rustpbx.com".try_into().unwrap(),
+            headers: vec![
+                rsipstack::sip::Header::From("sip:caller@rustpbx.com".into()),
+                rsipstack::sip::Header::To("sip:target@rustpbx.com".into()),
+                rsipstack::sip::Header::CallId("test-call".into()),
+            ]
+            .into(),
+            version: rsipstack::sip::Version::V2,
+            body: vec![],
+        };
+        let mut dialplan =
+            Dialplan::new("test-session".to_string(), request, DialDirection::Internal)
+                .with_targets(DialStrategy::Parallel(vec![Location {
+                    aor: aor.clone(),
+                    destination: None,
+                    ..Default::default()
+                }]));
+
+        // Run the same resolution logic from build_dialplan
+        if let DialplanFlow::Targets(ref mut strategy) = dialplan.flow {
+            let targets = match strategy {
+                DialStrategy::Parallel(t) | DialStrategy::Sequential(t) => t,
+            };
+            for target in targets.iter_mut() {
+                if target.destination.is_none() {
+                    let realm = target.aor.host().to_string();
+                    if server.is_same_realm(&realm).await {
+                        if let Ok(locs) = server.locator.lookup(&target.aor).await {
+                            if let Some(loc) = locs.first() {
+                                if let Some(dest) = loc.destination.clone() {
+                                    target.destination = Some(dest);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify destination was resolved via locator
+        let targets = match &dialplan.flow {
+            DialplanFlow::Targets(strategy) => match strategy {
+                DialStrategy::Parallel(t) | DialStrategy::Sequential(t) => t,
+            },
+            _ => panic!("Expected Targets flow"),
+        };
+        assert_eq!(targets.len(), 1);
+        let resolved = targets[0]
+            .destination
+            .as_ref()
+            .expect("destination should be resolved via locator");
+        assert_eq!(resolved.addr.to_string(), "192.168.1.100:5060");
+        assert_eq!(resolved.r#type, Some(rsipstack::sip::Transport::Udp));
+    }
+
+    #[tokio::test]
+    async fn test_build_dialplan_skips_external_realm_targets() {
+        use rsipstack::sip::HostWithPort;
+        use rsipstack::transport::SipAddr;
+
+        let (server, _config) = create_test_server().await;
+
+        // Register alice (same-realm) in locator
+        let alice_aor: rsipstack::sip::Uri = "sip:alice@rustpbx.com".try_into().expect("valid URI");
+        let alice_dest = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: HostWithPort::try_from("192.168.1.100:5060").expect("valid address"),
+        };
+        server
+            .locator
+            .register(
+                "alice",
+                Some("rustpbx.com"),
+                Location {
+                    aor: alice_aor.clone(),
+                    expires: 3600,
+                    destination: Some(alice_dest.clone()),
+                    last_modified: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("register should succeed");
+
+        // Build dialplan with two targets: one same-realm, one external
+        let external_aor: rsipstack::sip::Uri =
+            "sip:bob@external.com".try_into().expect("valid URI");
+
+        let request = rsipstack::sip::Request {
+            method: rsipstack::sip::Method::Invite,
+            uri: "sip:target@rustpbx.com".try_into().unwrap(),
+            headers: vec![
+                rsipstack::sip::Header::From("sip:caller@rustpbx.com".into()),
+                rsipstack::sip::Header::To("sip:target@rustpbx.com".into()),
+                rsipstack::sip::Header::CallId("test-call-ext".into()),
+            ]
+            .into(),
+            version: rsipstack::sip::Version::V2,
+            body: vec![],
+        };
+        let mut dialplan = Dialplan::new(
+            "test-session-ext".to_string(),
+            request,
+            DialDirection::Internal,
+        )
+        .with_targets(DialStrategy::Parallel(vec![
+            Location {
+                aor: alice_aor.clone(),
+                destination: None,
+                ..Default::default()
+            },
+            Location {
+                aor: external_aor.clone(),
+                destination: None,
+                ..Default::default()
+            },
+        ]));
+
+        // Run the same resolution logic
+        if let DialplanFlow::Targets(ref mut strategy) = dialplan.flow {
+            let targets = match strategy {
+                DialStrategy::Parallel(t) | DialStrategy::Sequential(t) => t,
+            };
+            for target in targets.iter_mut() {
+                if target.destination.is_none() {
+                    let realm = target.aor.host().to_string();
+                    if server.is_same_realm(&realm).await {
+                        if let Ok(locs) = server.locator.lookup(&target.aor).await {
+                            if let Some(loc) = locs.first() {
+                                if let Some(dest) = loc.destination.clone() {
+                                    target.destination = Some(dest);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify same-realm target got resolved, external target stays None
+        let targets = match &dialplan.flow {
+            DialplanFlow::Targets(strategy) => match strategy {
+                DialStrategy::Parallel(t) | DialStrategy::Sequential(t) => t,
+            },
+            _ => panic!("Expected Targets flow"),
+        };
+        assert_eq!(targets.len(), 2);
+
+        // alice (same-realm) should have destination resolved
+        assert!(
+            targets[0].destination.is_some(),
+            "same-realm target should have destination resolved"
+        );
+
+        // bob (external) should NOT have destination set
+        assert!(
+            targets[1].destination.is_none(),
+            "external-realm target should NOT have destination resolved"
+        );
     }
 }

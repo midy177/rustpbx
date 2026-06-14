@@ -1,3 +1,5 @@
+pub mod engine;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::CodecType;
@@ -12,7 +14,7 @@ use std::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
 pub use transcoder::Transcoder;
 
 use crate::media::recorder::RecorderOption;
@@ -27,16 +29,14 @@ pub mod forwarding_track;
 pub mod mixer;
 #[cfg(test)]
 mod mixer_e2e_tests;
-pub mod mixer_input;
-pub mod mixer_output;
 pub mod mixer_registry;
 pub mod negotiate;
-pub mod sdp_bridge;
 pub mod telephone_event;
 pub mod transcoder;
 pub mod transcoding_pipeline;
 #[cfg(test)]
 mod unified_pc_tests;
+pub mod wav_reader;
 pub mod wav_writer;
 
 pub trait StreamWriter: Send + Sync {
@@ -52,20 +52,34 @@ pub fn get_timestamp() -> u64 {
         .as_millis() as u64
 }
 
-fn codec_info_rtpmap(info: &negotiate::CodecInfo) -> String {
-    let codec_name = match info.codec {
-        CodecType::PCMU => "PCMU",
-        CodecType::PCMA => "PCMA",
-        CodecType::G722 => "G722",
-        CodecType::G729 => "G729",
-        #[cfg(feature = "opus")]
-        CodecType::Opus => "opus",
-        CodecType::TelephoneEvent => "telephone-event",
-    };
+#[derive(Debug, Clone)]
+pub struct ReceiveTimestampClock {
+    base_instant: std::time::Instant,
+    base_epoch_micros: u64,
+}
 
-    match info.channels {
-        0 | 1 => format!("{}/{}", codec_name, info.clock_rate),
-        channels => format!("{}/{}/{}", codec_name, info.clock_rate, channels),
+impl ReceiveTimestampClock {
+    pub fn new() -> Self {
+        let base_epoch_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as u64)
+            .unwrap_or_default();
+
+        Self {
+            base_instant: std::time::Instant::now(),
+            base_epoch_micros,
+        }
+    }
+
+    pub fn now_micros(&self) -> u64 {
+        self.base_epoch_micros
+            .saturating_add(self.base_instant.elapsed().as_micros() as u64)
+    }
+}
+
+impl Default for ReceiveTimestampClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -345,39 +359,7 @@ impl RtcTrack {
         self
     }
 
-    async fn set_local(&self, pc: &PeerConnection, mut desc: SessionDescription) -> Result<String> {
-        if !self.rtp_map.is_empty()
-            && let Some(section) = desc
-                .media_sections
-                .iter_mut()
-                .find(|m| m.kind == MediaKind::Audio)
-        {
-            section.formats.clear();
-            section
-                .attributes
-                .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
-
-            // Build RTP map from codec preference list
-            let mut seen_pts = HashSet::new();
-            for info in self.rtp_map.iter() {
-                let pt = info.payload_type;
-                if !seen_pts.insert(pt) {
-                    continue;
-                }
-                section.formats.push(pt.to_string());
-
-                section.attributes.push(Attribute {
-                    key: "rtpmap".to_string(),
-                    value: Some(format!("{} {}", pt, codec_info_rtpmap(info))),
-                });
-                if let Some(fmtp) = info.codec.fmtp() {
-                    section.attributes.push(Attribute {
-                        key: "fmtp".to_string(),
-                        value: Some(format!("{} {}", pt, fmtp)),
-                    });
-                }
-            }
-        }
+    async fn set_local(&self, pc: &PeerConnection, desc: SessionDescription) -> Result<String> {
         pc.set_local_description(desc)?;
         let desc = pc
             .local_description()
@@ -388,16 +370,9 @@ impl RtcTrack {
     async fn set_remote(&self, pc: &PeerConnection, sdp: &str, ty: SdpType) -> Result<()> {
         let desc = SessionDescription::parse(ty, sdp)
             .map_err(|e| anyhow!("failed to parse sdp: {:?}", e))?;
-        match pc.set_remote_description(desc).await {
-            Ok(_) => (),
-            Err(e) => {
-                warn!(
-                    track_id = self.track_id,
-                    error = %e,
-                    "failed to set remote description"
-                );
-            }
-        }
+        pc.set_remote_description(desc)
+            .await
+            .map_err(|e| anyhow!("failed to set remote description: {}", e))?;
         Ok(())
     }
 }
@@ -495,6 +470,7 @@ pub struct RtpTrackBuilder {
     enable_latching: bool,
     probation_max_packets: Option<u8>,
     ice_servers: Vec<IceServer>,
+    cname: Option<String>,
 }
 
 impl RtpTrackBuilder {
@@ -523,6 +499,7 @@ impl RtpTrackBuilder {
             .map(negotiate::MediaNegotiator::codec_info_for_type)
             .collect(),
             video_capabilities: Vec::new(),
+            cname: None,
         }
     }
 
@@ -586,6 +563,11 @@ impl RtpTrackBuilder {
         self
     }
 
+    pub fn with_cname(mut self, cname: String) -> Self {
+        self.cname = Some(cname);
+        self
+    }
+
     pub fn build(self) -> RtcTrack {
         // Choose SDP compatibility mode based on transport mode:
         // - WebRTC mode: use Standard (includes rtcp-mux, a=mid)
@@ -603,17 +585,24 @@ impl RtpTrackBuilder {
                 u.starts_with("turn:") || u.starts_with("turns:")
             })
         });
-        let audio_capabilities = match self.mode {
-            TransportMode::WebRtc => negotiate::MediaNegotiator::default_webrtc_codecs(),
-            TransportMode::Rtp | TransportMode::Srtp => {
-                negotiate::MediaNegotiator::default_rtp_codecs()
+        let audio_capabilities: Vec<_> = if self.rtp_map.is_empty() {
+            match self.mode {
+                TransportMode::WebRtc => negotiate::MediaNegotiator::default_webrtc_codecs(),
+                TransportMode::Rtp | TransportMode::Srtp => {
+                    negotiate::MediaNegotiator::default_rtp_codecs()
+                }
             }
-        }
-        .into_iter()
-        .filter_map(|codec| {
-            negotiate::MediaNegotiator::codec_info_for_type(codec).to_audio_capability()
-        })
-        .collect();
+            .into_iter()
+            .filter_map(|codec| {
+                negotiate::MediaNegotiator::codec_info_for_type(codec).to_audio_capability()
+            })
+            .collect()
+        } else {
+            self.rtp_map
+                .iter()
+                .filter_map(|codec| codec.to_audio_capability())
+                .collect()
+        };
 
         let bind_ip = if matches!(self.mode, TransportMode::Rtp | TransportMode::Srtp) {
             self.bind_ip
@@ -639,9 +628,11 @@ impl RtpTrackBuilder {
                 audio: audio_capabilities,
                 video: self.video_capabilities.clone(),
                 application: None,
+                image: vec![],
             }),
             ssrc_start: rand::random::<u32>(),
             sdp_compatibility,
+            cname: self.cname,
             ..Default::default()
         };
 
@@ -673,6 +664,7 @@ pub struct FileTrack {
     audio_source_manager: Option<Arc<audio_source::AudioSourceManager>>,
     muted: std::sync::atomic::AtomicBool,
     lifetime_guard: Arc<()>,
+    cname: Option<String>,
 }
 
 impl Clone for FileTrack {
@@ -696,6 +688,7 @@ impl Clone for FileTrack {
                 self.muted.load(std::sync::atomic::Ordering::Relaxed),
             ),
             lifetime_guard: self.lifetime_guard.clone(),
+            cname: self.cname.clone(),
         }
     }
 }
@@ -792,6 +785,7 @@ impl FileTrack {
             audio_source_manager: None,
             muted: std::sync::atomic::AtomicBool::new(false),
             lifetime_guard: Arc::new(()),
+            cname: None,
         }
     }
 
@@ -850,6 +844,11 @@ impl FileTrack {
         self
     }
 
+    pub fn with_cname(mut self, cname: String) -> Self {
+        self.cname = Some(cname);
+        self
+    }
+
     fn recreate_pc(&mut self) {
         let bind_ip = if matches!(self.mode, TransportMode::Rtp | TransportMode::Srtp) {
             self.bind_ip.clone()
@@ -864,6 +863,7 @@ impl FileTrack {
             external_ip: self.external_ip.clone(),
             bind_ip,
             ssrc_start: rand::random::<u32>(),
+            cname: self.cname.clone(),
             ..Default::default()
         };
 
@@ -872,11 +872,7 @@ impl FileTrack {
             .add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly);
     }
 
-    pub fn with_ssrc(self, _ssrc: u32) -> Self {
-        self
-    }
-
-    fn init_audio_source(&mut self) -> Result<()> {
+    async fn init_audio_source(&mut self) -> Result<()> {
         if self.audio_source_manager.is_some() {
             return Ok(());
         }
@@ -895,7 +891,9 @@ impl FileTrack {
         let manager = Arc::new(audio_source::AudioSourceManager::new(target_sample_rate));
 
         if let Some(ref path) = self.file_path {
-            manager.switch_to_file(path.clone(), self.loop_playback)?;
+            manager
+                .switch_to_file(path.clone(), self.loop_playback)
+                .await?;
         } else {
             manager.switch_to_silence();
         }
@@ -908,7 +906,7 @@ impl FileTrack {
         self.start_playback_on(None).await
     }
 
-    pub(crate) fn create_playback_source(&self) -> Result<FileTrackPlaybackSource> {
+    pub(crate) async fn create_playback_source(&self) -> Result<FileTrackPlaybackSource> {
         let file_path = self.file_path.as_deref();
 
         if let Some(file_path) = file_path {
@@ -935,7 +933,8 @@ impl FileTrack {
                     frame_timing.pcm_sample_rate,
                 ));
                 if let Some(file_path) = file_path {
-                    mgr.switch_to_file(file_path.to_string(), self.loop_playback)?;
+                    mgr.switch_to_file(file_path.to_string(), self.loop_playback)
+                        .await?;
                 } else {
                     mgr.switch_to_silence();
                 }
@@ -1022,7 +1021,8 @@ impl FileTrack {
                 let mgr = Arc::new(audio_source::AudioSourceManager::new(
                     frame_timing.pcm_sample_rate,
                 ));
-                mgr.switch_to_file(file_path.clone(), self.loop_playback)?;
+                mgr.switch_to_file(file_path.clone(), self.loop_playback)
+                    .await?;
                 mgr
             }
         };
@@ -1046,9 +1046,11 @@ impl FileTrack {
 
         if let Some(transceiver) = existing {
             let track_arc: Arc<dyn rustrtc::media::MediaStreamTrack> = track_target;
-            let new_sender = rustrtc::RtpSender::builder(track_arc, ssrc)
-                .params(params)
-                .build();
+            let mut builder = rustrtc::RtpSender::builder(track_arc, ssrc).params(params);
+            if let Some(ref cname) = self.cname {
+                builder = builder.cname(cname.clone());
+            }
+            let new_sender = builder.build();
             transceiver.set_sender(Some(new_sender));
         } else {
             let _ = pc.add_track(track_target, params);
@@ -1083,9 +1085,14 @@ impl FileTrack {
 
                         if read == 0 {
                             if !loop_playback {
+                                let reason = if cancel_token.is_cancelled() {
+                                    PlaybackEndReason::Interrupted
+                                } else {
+                                    PlaybackEndReason::Completed
+                                };
                                 debug!("FileTrack playback completed (file exhausted)");
                                 if let Some(on_end) = on_end.take() {
-                                    on_end(PlaybackEndReason::Completed);
+                                    on_end(reason);
                                 }
                                 break;
                             }
@@ -1127,13 +1134,17 @@ impl FileTrack {
         Ok(())
     }
 
-    pub fn switch_audio_source(&mut self, file_path: String, loop_playback: bool) -> Result<()> {
+    pub async fn switch_audio_source(
+        &mut self,
+        file_path: String,
+        loop_playback: bool,
+    ) -> Result<()> {
         if self.audio_source_manager.is_none() {
-            self.init_audio_source()?;
+            self.init_audio_source().await?;
         }
 
         if let Some(ref manager) = self.audio_source_manager {
-            manager.switch_to_file(file_path, loop_playback)?;
+            manager.switch_to_file(file_path, loop_playback).await?;
         }
 
         Ok(())

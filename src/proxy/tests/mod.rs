@@ -15,12 +15,15 @@ pub mod test_ua;
 mod user_db_test;
 mod user_http_test;
 
+pub mod test_helpers;
+
 // E2E testing infrastructure
 pub mod cdr_capture;
 pub mod e2e_test_server;
 pub mod rtp_utils;
 mod test_183_early_media_regression;
 mod test_call_e2e;
+mod test_caller_gate_regression;
 mod test_inbound_refer;
 mod test_ivr_queue_e2e;
 mod test_media_e2e;
@@ -28,5 +31,8 @@ mod test_rtp_e2e;
 mod test_session_hook_e2e;
 mod test_sip_info_dtmf_e2e;
 mod test_sip_session_regressions;
+mod test_trunk_b2bua_e2e;
 mod test_trunk_e2e;
-mod test_wholesale_e2e;
+mod test_trunk_options;
+mod test_voip_bridge_e2e;
+mod test_dn_events_e2e;

@@ -116,6 +116,7 @@ mod audio_feature_tests {
         assert!(
             manager
                 .switch_to_file(audio1_path.to_string_lossy().to_string(), false)
+                .await
                 .is_ok(),
             "Must be able to switch to first audio file (no loop)"
         );
@@ -123,6 +124,7 @@ mod audio_feature_tests {
         assert!(
             manager
                 .switch_to_file(audio2_path.to_string_lossy().to_string(), true)
+                .await
                 .is_ok(),
             "Must be able to switch to second audio file (with loop)"
         );
@@ -132,14 +134,16 @@ mod audio_feature_tests {
     }
 
     fn create_dummy_wav(path: &std::path::Path) -> anyhow::Result<()> {
-        let spec = hound::WavSpec {
+        use rustpbx::media::wav_reader::{SampleFormat, WavSpec, WavWriter};
+
+        let spec = WavSpec {
             channels: 1,
             sample_rate: 8000,
             bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
+            sample_format: SampleFormat::Int,
         };
 
-        let mut writer = hound::WavWriter::create(path, spec)?;
+        let mut writer = WavWriter::create(path, spec)?;
 
         for _ in 0..1600 {
             writer.write_sample(0i16)?;

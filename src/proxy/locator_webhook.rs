@@ -2,7 +2,7 @@ use crate::call::Location;
 use crate::config::LocatorWebhookConfig;
 use crate::proxy::locator::{LocatorEvent, LocatorEventReceiver};
 use serde::Serialize;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 #[derive(Serialize)]
 pub struct LocationDto {
@@ -45,7 +45,8 @@ pub async fn handle_locator_webhook(config: LocatorWebhookConfig, mut rx: Locato
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    debug!("locator webhook handler started for {}", config.url);
+    let url = config.url.trim().to_string();
+    debug!("locator webhook handler started for {}", url);
 
     loop {
         let event = match rx.recv().await {
@@ -102,26 +103,10 @@ pub async fn handle_locator_webhook(config: LocatorWebhookConfig, mut rx: Locato
             continue;
         }
 
-        let mut request = client.post(&config.url);
-        if let Some(headers) = &config.headers {
-            for (k, v) in headers {
-                request = request.header(k, v);
-            }
-        }
-
-        match request.json(&dto).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    warn!(
-                        "locator webhook returned error status: {} for {}",
-                        resp.status(),
-                        config.url
-                    );
-                }
-            }
-            Err(e) => {
-                error!("failed to send locator webhook to {}: {}", config.url, e);
-            }
+        let header_map = config.headers.clone().unwrap_or_default();
+        let req = client.post(&url).json(&dto);
+        if let Err(e) = crate::http_util::execute_request(req, &header_map, None).await {
+            warn!("locator webhook send failed for {}: {}", url, e);
         }
     }
 }

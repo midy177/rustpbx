@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::proxy::proxy_call::sip_session::SipSessionHandle;
 use chrono::Utc;
 use sea_orm::DatabaseConnection;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -36,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 /// Type alias for mock call stack command sender.
 pub type MockCmdTx = tokio::sync::mpsc::UnboundedSender<CallCommand>;
 /// Type alias for mock call stack command receiver.
-pub type MockCmdRx = tokio::sync::mpsc::UnboundedReceiver<CallCommand>;
+pub type MockCmdRx = tokio::sync::mpsc::Receiver<CallCommand>;
 
 /// Fully assembled, in-memory [`CallApp`] harness — no SIP stack required.
 ///
@@ -72,6 +73,8 @@ impl MockCallStack {
                 callee: callee.into(),
                 direction: "inbound".into(),
                 started_at: Utc::now(),
+                sip_headers: HashMap::new(),
+                route_name: None,
             },
             Arc::new(Config::default()),
         );
@@ -81,7 +84,7 @@ impl MockCallStack {
 
     pub fn run_with_context(app: Box<dyn CallApp>, ctx: ApplicationContext) -> Self {
         // Real SipSessionHandle — backed only by channels, no SIP socket.
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let handle = SipSessionHandle::new_for_test("test-session", cmd_tx);
 
         // Synthetic event channel: test → controller.
@@ -93,7 +96,7 @@ impl MockCallStack {
         let cancel = CancellationToken::new();
         let event_loop = AppEventLoop::new(app, controller, ctx, cancel.child_token(), timer_rx);
 
-        let join_handle = tokio::spawn(event_loop.run());
+        let join_handle = crate::utils::spawn(event_loop.run());
 
         Self {
             event_tx,
