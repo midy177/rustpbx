@@ -1,0 +1,53 @@
+[package]
+name = "rustpbx-worker"
+version = "0.1.0"
+edition = "2024"
+description = "RustPBX Media Worker — B2BUA, RTP relay, recording, AI integration"
+license = "MIT"
+
+[[bin]]
+name = "rustpbx-worker"
+path = "src/main.rs"
+
+[dependencies]
+rustpbx-core = { path = "../rustpbx-core" }
+
+# Main rustpbx crate — Worker reuses SipServer + full media stack
+rustpbx = { path = "../.." }
+
+# SIP stack (same version as rustpbx)
+rsipstack = "0.5.11"
+
+# gRPC client (Control Plane registration + CDR upload)
+tonic = { version = "0.13", features = ["transport", "tls-ring"] }
+prost = "0.13"
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Config & serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+dotenvy = "0.15"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# Utilities
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hostname = "0.4"
+ipnetwork = "0.21"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"

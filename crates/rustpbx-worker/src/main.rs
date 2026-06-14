@@ -7,6 +7,7 @@ mod headers;
 mod internal_peer;
 mod metrics;
 mod proto;
+mod rtp_gateway;
 mod session_hook;
 
 use crate::{
