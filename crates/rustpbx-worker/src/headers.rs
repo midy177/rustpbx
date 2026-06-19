@@ -1,12 +1,11 @@
 //! Thin adapter between `InternalCallContext` and `rsipstack::sip::Header`.
 //!
-//! The Worker decodes X-* headers from the internal INVITE received from Edge.
-//! Encoding is unused on this side but provided for symmetry and testing.
+//! The Worker decodes X-* headers from inbound internal INVITEs (from Edge),
+//! and encodes them when originating outbound calls toward the Edge.
 
 use rustpbx_core::internal::InternalCallContext;
 
 /// Encode an `InternalCallContext` as a vector of SIP headers.
-#[allow(dead_code)]
 pub fn encode_headers(ctx: &InternalCallContext) -> Vec<rsipstack::sip::Header> {
     ctx.to_header_pairs()
         .into_iter()

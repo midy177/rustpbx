@@ -110,17 +110,25 @@ impl EdgeCallRouter {
             )));
         }
 
-        let callee_uri = resolve_callee_uri(original)
-            .map_err(|e| RouteError::from((e, None)))?;
-        let caller_uri = caller
-            .from
-            .clone()
-            .or_else(|| {
-                original
-                    .from_header()
-                    .ok()
-                    .and_then(|h| h.uri().ok())
-            })
+        // The dialed number (callee) is carried in the internal context — the
+        // INVITE's Request-URI points at the Edge, not the PSTN number. Prefer
+        // the encoded targets, then original_to, then fall back to the message.
+        let callee_uri = ctx
+            .targets
+            .first()
+            .and_then(|t| Uri::try_from(t.as_str()).ok())
+            .or_else(|| Uri::try_from(ctx.original_to.as_str()).ok())
+            .or_else(|| resolve_callee_uri(original).ok())
+            .ok_or_else(|| {
+                RouteError::from((
+                    anyhow!("outbound: cannot resolve dialed callee"),
+                    Some(rsipstack::sip::StatusCode::BadRequest),
+                ))
+            })?;
+        let caller_uri = Uri::try_from(ctx.original_from.as_str())
+            .ok()
+            .or_else(|| caller.from.clone())
+            .or_else(|| original.from_header().ok().and_then(|h| h.uri().ok()))
             .unwrap_or_else(|| callee_uri.clone());
 
         let session_id = original
@@ -140,8 +148,13 @@ impl EdgeCallRouter {
             _ => None,
         };
 
+        // Carrier Request-URI = dialed number's user part @ trunk dest host.
+        // Mirrors the monolith's `apply_trunk_config` host-port rewrite so the
+        // carrier sees `sip:<number>@<carrier-host>`.
+        let carrier_aor = build_carrier_aor(&callee_uri, &dest_uri);
+
         let mut dest_location = Location {
-            aor: dest_uri,
+            aor: carrier_aor,
             credential,
             ..Default::default()
         };
@@ -348,4 +361,30 @@ fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<Uri> {
         .map_err(anyhow::Error::from)?
         .uri()
         .map_err(anyhow::Error::from)
+}
+
+/// Build the carrier-facing Request-URI: keep the dialed number (callee user
+/// part) and swap the host/port to the trunk's destination. Mirrors the
+/// `rewrite_hostport` behaviour of the monolith's `apply_trunk_config`.
+fn build_carrier_aor(callee: &Uri, trunk_dest: &Uri) -> Uri {
+    let mut aor = callee.clone();
+    aor.host_with_port = trunk_dest.host_with_port.clone();
+    aor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carrier_aor_keeps_dialed_number_and_swaps_host() {
+        let callee = Uri::try_from("sip:+8613800138000@worker.local:5070").unwrap();
+        let trunk_dest = Uri::try_from("sip:carrier.example.com:5060").unwrap();
+        let aor = build_carrier_aor(&callee, &trunk_dest);
+
+        // dialed number preserved
+        assert_eq!(aor.user().unwrap(), "+8613800138000");
+        // host/port routed to the carrier
+        assert_eq!(aor.host_with_port.to_string(), "carrier.example.com:5060");
+    }
 }

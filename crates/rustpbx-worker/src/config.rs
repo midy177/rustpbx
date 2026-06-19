@@ -58,6 +58,13 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub trusted_edges: Vec<String>,
 
+    /// SIP address of the Edge to which outbound calls are forwarded
+    /// (`host:port`, e.g. "10.0.0.3:5060"). When unset, the Worker rejects
+    /// outbound origination from local extensions (worker-only inbound mode).
+    /// The Worker's source IP must appear in the target Edge's `trusted_workers`.
+    #[serde(default)]
+    pub edge_sip_addr: Option<String>,
+
     #[serde(default = "default_log")]
     pub log: String,
 }
@@ -79,6 +86,7 @@ impl Default for WorkerConfig {
             heartbeat_secs: default_heartbeat_secs(),
             metrics_addr: None,
             trusted_edges: Vec::new(),
+            edge_sip_addr: None,
             log: default_log(),
         }
     }

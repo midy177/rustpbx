@@ -355,4 +355,32 @@ mod tests {
         }
         assert!(RouteAction::from_str("unknown").is_none());
     }
+
+    #[test]
+    fn roundtrip_outbound() {
+        // Worker → Edge outbound origination: direction + selected trunk +
+        // dialed number (targets) must survive the wire.
+        let ctx = InternalCallContext {
+            trunk_name: "carrier-a".into(),
+            direction: InternalDirection::Outbound,
+            action: RouteAction::Forward,
+            original_from: "sip:1001@pbx".into(),
+            original_to: "sip:+8613800138000@pbx".into(),
+            targets: vec!["sip:+8613800138000@pbx".into()],
+            dial_strategy: DialStrategyKind::Sequential,
+            ..Default::default()
+        };
+        let pairs: Vec<(String, String)> = ctx
+            .to_header_pairs()
+            .into_iter()
+            .map(|(n, v)| (n.to_string(), v))
+            .collect();
+        let ref_pairs: Vec<(&str, &str)> =
+            pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let decoded = InternalCallContext::from_header_pairs(ref_pairs).expect("decode");
+        assert_eq!(decoded.direction, InternalDirection::Outbound);
+        assert_eq!(decoded.trunk_name, "carrier-a");
+        assert_eq!(decoded.action, RouteAction::Forward);
+        assert_eq!(decoded.targets, vec!["sip:+8613800138000@pbx".to_string()]);
+    }
 }

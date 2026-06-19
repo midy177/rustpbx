@@ -171,6 +171,7 @@ async fn main() -> Result<()> {
         routing_state: Arc::clone(&routing_state),
         active_calls: Arc::clone(&active_calls),
         metrics: Arc::clone(&worker_metrics),
+        edge_sip_addr: cfg.edge_sip_addr.clone(),
     };
 
     // ── SIP Server ────────────────────────────────────────────────────────────
