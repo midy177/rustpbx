@@ -39,12 +39,17 @@
 //!                                          └─────────────────────────┘
 //! ```
 
+#[allow(dead_code)]
 pub mod bridge;
+#[allow(dead_code)]
 pub mod command;
+#[allow(dead_code)]
 pub mod handle;
 pub mod logging_sink;
 
+#[allow(dead_code)]
 pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge};
+#[allow(dead_code)]
 pub use command::{
     MediaCommand, MediaEvent, MediaSourceSpec, QualityReport, RecordingFormat, RecordingResult,
     TrackSelector,

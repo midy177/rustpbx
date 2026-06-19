@@ -9,6 +9,7 @@ mod metrics;
 mod proto;
 mod rtp_gateway;
 mod session_hook;
+#[allow(dead_code)]
 mod worker_call_module;
 
 use crate::{
@@ -40,6 +41,7 @@ use rustpbx::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use tokio::{signal, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -159,33 +161,36 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("failed to init data context: {e}"))?,
     );
-    #[allow(unused_variables)]
     let routing_state = Arc::new(RoutingState::new());
 
-    // WorkerCallRouter is kept for future integration (when WorkerCallModule
-    // needs route decisions for IVR/queue). Not injected in Phase 1 skeleton
-    // because WorkerCallModule handles signaling directly without CallModule.
-    #[allow(unused_mut)]
-    let mut _worker_router_unused: Option<Box<dyn rustpbx::proxy::call::CallRouter>> = None;
+    // WorkerCallRouter: shares active_calls counter with ControlClient (for
+    // heartbeat reporting) and ActiveCallTrackerHook (for decrement on CDR).
+    let worker_router = WorkerCallRouter {
+        data_context: Arc::clone(&data_context),
+        rtp_config: rtp_config.clone(),
+        routing_state: Arc::clone(&routing_state),
+        active_calls: Arc::clone(&active_calls),
+        metrics: Arc::clone(&worker_metrics),
+    };
 
     // ── SIP Server ────────────────────────────────────────────────────────────
-    // Module chain: internal-peer → acl → auth → registrar → presence → worker-call
+    // Module chain: internal-peer → acl → auth → registrar → presence → call
     //
-    // WorkerCallModule replaces the main crate's CallModule. It owns the SIP
-    // dialog lifecycle and creates an rtp_gateway per call (the sole media
-    // I/O boundary). Phase 1 skeleton uses LoggingSink; Phase 2 replaces it
-    // with a dedicated media thread.
+    // Uses the main crate's CallModule (full B2BUA/IVR/Queue) with WorkerCallRouter
+    // that decodes Edge-encoded routing decisions into Dialplan objects.
+    // Media mode is Anchored (MediaProxyMode::All).
     let _sip_server = SipServerBuilder::new(proxy_config)
         .with_cancel_token(cancel.clone())
         .with_rtp_config(rtp_config)
         .with_callrecord_sender(Some(cdr_sender))
         .with_data_context(Arc::clone(&data_context))
+        .with_call_router(Box::new(worker_router))
         .register_module("internal-peer", InternalPeerModule::create)
         .register_module("acl", AclModule::create)
         .register_module("auth", AuthModule::create)
         .register_module("registrar", RegistrarModule::create)
         .register_module("presence", PresenceModule::create)
-        .register_module("worker-call", worker_call_module::create)
+        .register_module("call", CallModule::create)
         .build()
         .await?;
 
@@ -218,12 +223,12 @@ fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
         "auth".into(),
         "registrar".into(),
         "presence".into(),
-        "worker-call".into(),
+        "call".into(),
     ]);
     config
 }
 
-async fn wait_for_drain(active: &std::sync::atomic::AtomicU32) {
+async fn wait_for_drain(active: &AtomicU32) {
     use std::sync::atomic::Ordering;
     loop {
         if active.load(Ordering::Relaxed) == 0 {

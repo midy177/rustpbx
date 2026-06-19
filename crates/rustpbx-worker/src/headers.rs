@@ -6,6 +6,7 @@
 use rustpbx_core::internal::InternalCallContext;
 
 /// Encode an `InternalCallContext` as a vector of SIP headers.
+#[allow(dead_code)]
 pub fn encode_headers(ctx: &InternalCallContext) -> Vec<rsipstack::sip::Header> {
     ctx.to_header_pairs()
         .into_iter()

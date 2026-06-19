@@ -1,15 +1,12 @@
-//! `WorkerCallModule` — the Worker's own SIP call handler at the signaling layer.
+//! `WorkerCallModule` — DEPRECATED. Superseded by the main crate's `CallModule`
+//! + `WorkerCallRouter` injection (see `main.rs` and `call_router.rs`).
 //!
-//! Replaces the main crate's `CallModule` for internal calls (from Edge).
-//! For each call:
-//! 1. Creates a `ServerInviteDialog` via the main crate's `DialogLayer`
-//! 2. Creates an `rtp_gateway` instance (the SOLE media I/O owner)
-//! 3. Answers with passthrough SDP (Phase 1 skeleton — no media manipulation)
-//! 4. Tracks the call lifecycle; tears down `rtp_gateway` on BYE
-//!
-//! Phase 1 skeleton: `rtp_gateway` commands are logged by `LoggingSink`,
-//! not yet connected to a real media pipeline. Phase 2 replaces the sink
-//! with a dedicated media thread.
+//! This module is kept for reference only. It implemented a passthrough SIP
+//! signaling path that bypassed CallModule's full B2BUA/IVR/Queue pipeline.
+//! The new architecture routes internal calls through `CallModule` with a
+//! custom `WorkerCallRouter` that builds the appropriate `Dialplan`, giving
+//! the Worker access to the complete feature set (queue, IVR, recording, etc.)
+//! while still using `MediaProxyMode::All` for anchored media.
 
 use crate::rtp_gateway::{LoggingSink, RtpGatewayHandle, spawn_bridge};
 use anyhow::Result;
@@ -240,8 +237,6 @@ mod tests {
     // 1. cargo build (struct/trait conformance)
     // 2. Manual SIP flow testing once the Worker is deployed
     // 3. The LoggingSink unit tests in rtp_gateway/logging_sink.rs
-
-    use super::*;
 
     #[test]
     fn module_factory_returns_boxed_module() {

@@ -24,16 +24,18 @@ use rustpbx::call::user::SipUser;
 use rustpbx::config::{MediaProxyMode, RouteResult};
 use rustpbx::proxy::call::{CallRouter, RouteError};
 use rustpbx::proxy::data::ProxyDataContext;
+use rsipstack::dialog::authenticate::Credential;
 use rustpbx_core::internal::{InternalCallContext, InternalDirection, RouteAction};
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Uri;
-use rsipstack::sip::prelude::{HeadersExt, ToTypedHeader};
+use rsipstack::sip::prelude::HeadersExt;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 pub struct EdgeCallRouter {
     pub worker_selector: Arc<WorkerSelector>,
     pub data_context: Arc<ProxyDataContext>,
+    #[allow(dead_code)]
     pub routing_state: Arc<RoutingState>,
     pub edge_id: String,
 }
@@ -58,13 +60,18 @@ impl CallRouter for EdgeCallRouter {
         caller: &SipUser,
         cookie: &TransactionCookie,
     ) -> std::result::Result<Dialplan, RouteError> {
-        let trunk_ctx = cookie.get_extension::<TrunkContext>();
+        if let Some(internal_ctx) = cookie.get_extension::<InternalCallContext>() {
+            if matches!(internal_ctx.direction, InternalDirection::Outbound) {
+                return self.resolve_outbound(original, &internal_ctx, caller, cookie).await;
+            }
+        }
 
+        let trunk_ctx = cookie.get_extension::<TrunkContext>();
         if trunk_ctx.is_some() {
             self.resolve_inbound(original, route_invite, caller, cookie).await
         } else {
             Err(RouteError::from((
-                anyhow!("edge: no trunk context on INVITE — only trunk-sourced calls are accepted"),
+                anyhow!("edge: no trunk context on INVITE — only trunk-sourced or worker-outbound calls accepted"),
                 Some(rsipstack::sip::StatusCode::Forbidden),
             )))
         }
@@ -72,6 +79,91 @@ impl CallRouter for EdgeCallRouter {
 }
 
 impl EdgeCallRouter {
+    async fn resolve_outbound(
+        &self,
+        original: &rsipstack::sip::Request,
+        ctx: &InternalCallContext,
+        caller: &SipUser,
+        _cookie: &TransactionCookie,
+    ) -> std::result::Result<Dialplan, RouteError> {
+        info!(
+            trunk = %ctx.trunk_name,
+            tenant_id = ?ctx.tenant_id,
+            caller = %caller.username,
+            "edge processing outbound call from worker"
+        );
+
+        let trunk = self
+            .data_context
+            .get_trunk(&ctx.trunk_name)
+            .ok_or_else(|| {
+                RouteError::from((
+                    anyhow!("outbound trunk '{}' not found", ctx.trunk_name),
+                    Some(rsipstack::sip::StatusCode::NotFound),
+                ))
+            })?;
+
+        if trunk.disabled.unwrap_or(false) {
+            return Err(RouteError::from((
+                anyhow!("outbound trunk '{}' is disabled", ctx.trunk_name),
+                Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+            )));
+        }
+
+        let callee_uri = resolve_callee_uri(original)
+            .map_err(|e| RouteError::from((e, None)))?;
+        let caller_uri = caller
+            .from
+            .clone()
+            .or_else(|| {
+                original
+                    .from_header()
+                    .ok()
+                    .and_then(|h| h.uri().ok())
+            })
+            .unwrap_or_else(|| callee_uri.clone());
+
+        let session_id = original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_else(|_| format!("edge-{}", std::process::id()));
+
+        let dest_uri = Uri::try_from(trunk.dest.as_str())
+            .map_err(|e| RouteError::from((anyhow!("invalid trunk dest '{}': {}", trunk.dest, e), None)))?;
+
+        let credential = match (&trunk.username, &trunk.password) {
+            (Some(user), Some(pass)) => Some(Credential {
+                username: user.clone(),
+                password: pass.clone(),
+                realm: dest_uri.host().to_string().into(),
+            }),
+            _ => None,
+        };
+
+        let mut dest_location = Location {
+            aor: dest_uri,
+            credential,
+            ..Default::default()
+        };
+
+        if trunk.username.is_some() {
+            let pai = rsipstack::sip::Header::Other(
+                "P-Asserted-Identity".to_string(),
+                format!("<{}>", caller_uri),
+            );
+            dest_location.headers = Some(vec![pai]);
+        }
+
+        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Outbound)
+            .with_caller(caller_uri)
+            .with_targets(DialStrategy::Sequential(vec![dest_location]));
+
+        dialplan.media.proxy_mode = MediaProxyMode::None;
+        dialplan = dialplan.with_passthrough_failure(true);
+
+        Ok(dialplan)
+    }
+
     async fn resolve_inbound(
         &self,
         original: &rsipstack::sip::Request,

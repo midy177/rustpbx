@@ -13,6 +13,7 @@ use std::sync::{
 pub struct WorkerMetrics {
     pub active_calls: Arc<AtomicU32>,
     pub total_calls: Arc<AtomicU64>,
+    #[allow(dead_code)]
     pub rtp_ports_used: Arc<AtomicU32>,
 }
 
@@ -37,6 +38,7 @@ impl WorkerMetrics {
         gauge!("worker_active_calls").decrement(1.0);
     }
 
+    #[allow(dead_code)]
     pub fn active(&self) -> u32 {
         self.active_calls.load(Ordering::Relaxed)
     }

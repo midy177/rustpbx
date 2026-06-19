@@ -1,14 +1,12 @@
-//! `InternalPeerModule` — Worker-side module that recognises internal INVITEs
-//! from trusted Edge instances and pre-populates the `TransactionCookie` with
-//! `TrunkContext` so downstream ACL/Auth modules skip their checks.
+//! `InternalPeerModule` — Edge-side module that recognises internal INVITEs
+//! from trusted Worker instances and pre-populates the `TransactionCookie`
+//! with `TrunkContext` + `InternalCallContext` so downstream modules (ACL,
+//! Auth) skip their normal checks.
 //!
 //! Runs first in the module chain (before AclModule).
 //!
-//! Trusted Edge IP/CIDR list is stored in a process-global `OnceLock` because
-//! the module factory (`FnCreateProxyModule`) only accepts
-//! `(SipServerRef, Arc<ProxyConfig>)` — no way to pass extra state.
-//! `init_trusted_edges()` must be called once at startup, before the SIP
-//! server is built.
+//! Trusted Worker IP/CIDR list is stored in a process-global `OnceLock`
+//! because the module factory only accepts `(SipServerRef, Arc<ProxyConfig>)`.
 
 use crate::headers::decode_headers;
 use anyhow::Result;
@@ -27,15 +25,11 @@ use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// Process-global trusted Edge IP/CIDR list.
-/// Set once at startup via `init_trusted_edges()`.
-static TRUSTED_EDGES: OnceLock<Vec<IpNetwork>> = OnceLock::new();
+static TRUSTED_WORKERS: OnceLock<Vec<IpNetwork>> = OnceLock::new();
 
-/// Initialise the trusted Edge list. Must be called before SipServer build.
-/// Subsequent calls are ignored (OnceLock semantics).
-pub fn init_trusted_edges(edges: Vec<IpNetwork>) {
-    if let Err(existing) = TRUSTED_EDGES.set(edges) {
-        warn!(count = existing.len(), "trusted_edges already initialised — ignoring re-init");
+pub fn init_trusted_workers(workers: Vec<IpNetwork>) {
+    if let Err(existing) = TRUSTED_WORKERS.set(workers) {
+        warn!(count = existing.len(), "trusted_workers already initialised — ignoring re-init");
     }
 }
 
@@ -48,13 +42,11 @@ impl InternalPeerModule {
         Self { trusted_networks: trusted }
     }
 
-    /// Module factory matching `FnCreateProxyModule` signature.
-    /// Reads the trusted-peer list from the global `TRUSTED_EDGES` OnceLock.
     pub fn create(
         _server: SipServerRef,
         _config: Arc<ProxyConfig>,
     ) -> Result<Box<dyn ProxyModule>> {
-        let trusted = TRUSTED_EDGES
+        let trusted = TRUSTED_WORKERS
             .get()
             .cloned()
             .unwrap_or_default();
@@ -73,7 +65,7 @@ impl ProxyModule for InternalPeerModule {
     }
 
     async fn on_start(&mut self) -> Result<()> {
-        debug!(count = self.trusted_networks.len(), "internal-peer module started");
+        debug!(count = self.trusted_networks.len(), "edge internal-peer module started");
         Ok(())
     }
 
@@ -87,12 +79,10 @@ impl ProxyModule for InternalPeerModule {
         tx: &mut Transaction,
         cookie: TransactionCookie,
     ) -> Result<ProxyAction> {
-        // Only inspect INVITE requests.
         if tx.original.method != Method::Invite {
             return Ok(ProxyAction::Continue);
         }
 
-        // Check if the source IP is from a trusted Edge.
         let source_ip = match extract_source_ip(tx) {
             Some(ip) => ip,
             None => return Ok(ProxyAction::Continue),
@@ -107,19 +97,17 @@ impl ProxyModule for InternalPeerModule {
             return Ok(ProxyAction::Continue);
         }
 
-        // Decode X-* headers from the internal INVITE.
         let internal_ctx = match decode_headers(&tx.original.headers) {
             Some(ctx) => ctx,
             None => {
                 debug!(
                     %source_ip,
-                    "trusted source but no X-Route-Action header — treating as normal call"
+                    "trusted worker source but no X-Route-Action header — treating as normal call"
                 );
                 return Ok(ProxyAction::Continue);
             }
         };
 
-        // Inject TrunkContext so AclModule/AuthModule skip their checks.
         let trunk_ctx = TrunkContext {
             id: internal_ctx.trunk_id,
             name: internal_ctx.trunk_name.clone(),
@@ -127,17 +115,13 @@ impl ProxyModule for InternalPeerModule {
             did_numbers: Vec::new(),
         };
         cookie.insert_extension(trunk_ctx);
-
-        // Also inject the full InternalCallContext for WorkerCallRouter to read.
         cookie.insert_extension(internal_ctx);
 
-        debug!("internal INVITE from trusted edge — context injected");
+        debug!("internal INVITE from trusted worker — context injected");
         Ok(ProxyAction::Continue)
     }
 }
 
-/// Extract the source IP from the transaction's Via header.
-/// Mirrors the approach used by `AclModule::extract_ip`.
 fn extract_source_ip(tx: &Transaction) -> Option<IpAddr> {
     let via = tx.original.via_header().ok()?;
     let (_, target) = SipConnection::parse_target_from_via(via).ok()?;

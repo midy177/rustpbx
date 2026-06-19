@@ -14,11 +14,10 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Uri;
-use rsipstack::sip::prelude::{HeadersExt, ToTypedHeader};
+use rsipstack::sip::prelude::HeadersExt;
 use rustpbx::call::{
-    CallRecordingConfig, DialDirection, DialStrategy, Dialplan, Location, RouteInvite,
+    DialDirection, DialStrategy, Dialplan, Location, RouteInvite,
     RoutingState, TransactionCookie, user::SipUser,
 };
 use rustpbx::call::cookie::{TenantId, TrunkContext};
@@ -33,6 +32,7 @@ use tracing::{debug, info, warn};
 pub struct WorkerCallRouter {
     pub data_context: Arc<ProxyDataContext>,
     pub rtp_config: RtpConfig,
+    #[allow(dead_code)]
     pub routing_state: Arc<RoutingState>,
     /// Active call counter — incremented when a Worker-internal dialplan is
     /// built, decremented by `ActiveCallTrackerHook::on_record_completed`.
@@ -72,7 +72,7 @@ impl WorkerCallRouter {
         original: &rsipstack::sip::Request,
         ctx: InternalCallContext,
         caller: &SipUser,
-        cookie: &TransactionCookie,
+        _cookie: &TransactionCookie,
     ) -> std::result::Result<Dialplan, RouteError> {
         info!(
             edge_id = %ctx.edge_id,
@@ -250,6 +250,3 @@ fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<Uri> {
         .map_err(anyhow::Error::from)
 }
 
-// Suppress unused import warning for InviteOption — kept for future use
-#[allow(unused_imports)]
-use rsipstack::dialog::invitation::InviteOption as _InviteOptionImport;

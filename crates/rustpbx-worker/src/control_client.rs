@@ -12,7 +12,6 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use chrono::Utc;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -106,11 +105,13 @@ impl ControlClient {
     }
 
     /// Increment the active call counter (call when INVITE is answered).
+    #[allow(dead_code)]
     pub fn inc_active(&self) {
         self.active_calls.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the active call counter (call when BYE is processed).
+    #[allow(dead_code)]
     pub fn dec_active(&self) {
         self.active_calls.fetch_sub(1, Ordering::Relaxed);
     }
@@ -139,6 +140,10 @@ pub async fn run_heartbeat(
 }
 
 fn cpu_usage_approx() -> f32 {
-    // Lightweight approximation — real implementation would read /proc/stat or use sysinfo crate.
-    0.0
+    use sysinfo::System;
+    use std::sync::Mutex;
+    static SYS: std::sync::OnceLock<Mutex<System>> = std::sync::OnceLock::new();
+    let mut guard = SYS.get_or_init(|| Mutex::new(System::new())).lock().unwrap();
+    guard.refresh_cpu_usage();
+    guard.global_cpu_usage()
 }

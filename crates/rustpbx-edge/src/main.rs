@@ -4,6 +4,7 @@ mod config_source;
 mod config_watcher;
 mod grpc_client;
 mod headers;
+mod internal_peer;
 mod proto;
 mod worker_selector;
 
@@ -13,9 +14,12 @@ use crate::{
     config_source::{ConfigSource, GrpcConfigSource},
     config_watcher::run_config_watcher,
     grpc_client::GrpcControlClient,
+    internal_peer::InternalPeerModule,
+    internal_peer::init_trusted_workers,
     worker_selector::WorkerSelector,
 };
 use anyhow::Result;
+use ipnetwork::IpNetwork;
 use rustpbx::{
     call::RoutingState,
     config::ProxyConfig,
@@ -27,6 +31,7 @@ use rustpbx::{
         server::SipServerBuilder,
     },
 };
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -57,8 +62,23 @@ async fn main() -> Result<()> {
         edge_id = %cfg.edge_id,
         sip = format!("{}:{}", cfg.sip_addr, cfg.udp_port),
         control_plane = %cfg.control_plane_addr,
+        trusted_workers = cfg.trusted_workers.len(),
         "rustpbx-edge starting"
     );
+
+    // ── Initialise trusted Worker list (OnceLock — must be before SipServer build) ─
+    let trusted_networks: Vec<IpNetwork> = cfg
+        .trusted_workers
+        .iter()
+        .filter_map(|s| match IpNetwork::from_str(s) {
+            Ok(net) => Some(net),
+            Err(e) => {
+                warn!(entry = %s, error = %e, "invalid trusted_workers entry, skipping");
+                None
+            }
+        })
+        .collect();
+    init_trusted_workers(trusted_networks);
 
     // ── Connect to Control Plane ──────────────────────────────────────────────
     let grpc_client = GrpcControlClient::connect(
@@ -116,6 +136,7 @@ async fn main() -> Result<()> {
         .with_skip_migrate(true)
         .with_data_context(Arc::clone(&data_context))
         .with_call_router(edge_router)
+        .register_module("internal-peer", InternalPeerModule::create)
         .register_module("acl", AclModule::create)
         .register_module("auth", AuthModule::create)
         .register_module("call", CallModule::create)
@@ -136,7 +157,7 @@ fn build_proxy_config(cfg: &EdgeConfig) -> ProxyConfig {
         udp_port: Some(cfg.udp_port),
         tcp_port: if cfg.tcp_port > 0 { Some(cfg.tcp_port) } else { None },
         tls_port: if cfg.tls_port > 0 { Some(cfg.tls_port) } else { None },
-        modules: Some(vec!["acl".into(), "auth".into(), "call".into()]),
+        modules: Some(vec!["internal-peer".into(), "acl".into(), "auth".into(), "call".into()]),
         ..Default::default()
     }
 }

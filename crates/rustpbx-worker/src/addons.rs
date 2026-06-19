@@ -39,6 +39,7 @@ pub fn collect_addon_cdr_hooks() -> Vec<Box<dyn CallRecordHook>> {
 /// because the Worker installs its own Prometheus recorder in
 /// `start_metrics_server` (which `MetricsCallRecordHook` writes to via the
 /// `metrics` crate's global handle).
+#[allow(dead_code)]
 pub fn init_addon_globals() {
     // Reserved for future addons that need global initialization
     // (e.g., OpenTelemetry SDK if `addon-telemetry` is enabled).

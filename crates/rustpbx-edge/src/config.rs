@@ -45,6 +45,10 @@ pub struct EdgeConfig {
     /// Log filter
     #[serde(default = "default_log")]
     pub log: String,
+
+    /// Trusted Worker IP/CIDR list (internal INVITEs from these sources skip ACL/Auth)
+    #[serde(default)]
+    pub trusted_workers: Vec<String>,
 }
 
 impl Default for EdgeConfig {
@@ -61,6 +65,7 @@ impl Default for EdgeConfig {
             edge_id: default_edge_id(),
             config_poll_secs: default_config_poll_secs(),
             log: default_log(),
+            trusted_workers: Vec::new(),
         }
     }
 }
