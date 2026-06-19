@@ -1,0 +1,225 @@
+# RustPBX 分布式组件 — 本地开发调试指南
+
+本目录下的 4 个 crate 组成 RustPBX 的云原生分布式形态。单体 `rustpbx`
+（仓库根 `src/`）仍保留为 all-in-one 部署选项；本文只讲分布式三组件的本地
+联调。
+
+| Crate | 角色 | 监听端口（默认） | 说明 |
+|-------|------|------------------|------|
+| `rustpbx-core` | 共享纯数据类型库 | — | 无 IO，被其它 crate 依赖，不单独运行 |
+| `rustpbx-control` | 管控面（Control Plane） | gRPC `9090` / HTTP `9080` | 配置下发、CDR、Worker 注册、租户管理、**管理控制台 Web UI** |
+| `rustpbx-worker` | 媒体处理面（Media Worker） | SIP `5070` / RTP `12000-42000` | 完整 B2BUA / IVR / 队列 / 录音 / RTP |
+| `rustpbx-edge` | 信令网关（SIP Edge） | SIP `5060` | 面向 Carrier 的 ACL/Auth/路由，分发到 Worker |
+
+数据流：`Carrier → Edge(5060) → Worker(5070) → 被叫`；配置 `Control → Edge/Worker (gRPC)`；CDR `Worker → Control (gRPC)`。
+
+---
+
+## 1. 环境准备
+
+### Rust 工具链
+```bash
+rustup toolchain install stable   # Edition 2024，需较新的 stable
+```
+
+### 平台依赖
+- **macOS**: `brew install cmake openssl pkg-config opus`
+- **Linux**: `apt install cmake pkg-config libasound2-dev libssl-dev libopus-dev protobuf-compiler`
+
+> gRPC 的 `protoc` 由 `protoc-bin-vendored` 自带，通常无需手动安装。
+
+### 前端工具链（仅开发管理控制台时需要）
+[Bun](https://bun.sh)：`curl -fsSL https://bun.sh/install | bash`
+
+---
+
+## 2. 构建
+
+```bash
+# 整个 workspace（含单体 + 4 个 crate）
+cargo build --workspace
+
+# 只构建分布式三组件
+cargo build -p rustpbx-control -p rustpbx-worker -p rustpbx-edge
+
+# 跑测试
+cargo test -p rustpbx-core -p rustpbx-edge -p rustpbx-worker
+```
+
+---
+
+## 3. 数据库初始化（重要）
+
+Control Plane **与单体共用同一套数据库**。它的迁移只负责新增多租户相关表
+（`rustpbx_tenants` / `rustpbx_did_numbers`）和给现有表加 `tenant_id` 列——
+它假设 `rustpbx_sip_trunks` / `rustpbx_routing` / `rustpbx_call_records` 等
+**基表已由单体创建**。
+
+直接对空库启动 `rustpbx-control` 会报 `no such table: rustpbx_sip_trunks`。
+
+本地两种解决方式：
+
+**方式 A（推荐）**：先用单体跑一次迁移建基表，再让 control 指向同一个库：
+```bash
+cargo run --bin rustpbx -- --conf config.toml.example   # 启动后建好基表，可 Ctrl-C
+# 然后让 rustpbx-control.toml 的 database_url 指向同一个 sqlite/库
+```
+
+**方式 B（仅快速联调 control HTTP/租户功能）**：手工建占位基表：
+```bash
+sqlite3 rustpbx-control.sqlite3 <<'SQL'
+CREATE TABLE rustpbx_sip_trunks (id INTEGER PRIMARY KEY);
+CREATE TABLE rustpbx_routing (id INTEGER PRIMARY KEY);
+CREATE TABLE rustpbx_call_records (id INTEGER PRIMARY KEY);
+SQL
+```
+
+---
+
+## 4. 启动顺序与配置
+
+启动顺序：**Control → Worker → Edge**（Edge/Worker 启动即连 Control 拉配置/注册）。
+每个二进制接受一个配置文件路径参数；缺省读取同名 `rustpbx-<组件>.toml`，文件
+不存在则用内置默认值。
+
+### 4.1 Control Plane
+`crates/rustpbx-control/rustpbx-control.toml`（参考 `rustpbx-control.toml.example`）：
+```toml
+grpc_addr      = "127.0.0.1:9090"
+http_addr      = "127.0.0.1:9080"
+database_url   = "sqlite://rustpbx-control.sqlite3?mode=rwc"
+admin_username = "admin"
+admin_password = "admin"          # 生产务必修改
+web_dir        = "crates/rustpbx-control/web/dist"
+log            = "info"
+```
+```bash
+cargo run --bin rustpbx-control -- crates/rustpbx-control/rustpbx-control.toml
+```
+
+### 4.2 Media Worker
+`rustpbx-worker.toml`：
+```toml
+control_plane_addr = "http://127.0.0.1:9090"
+sip_addr           = "0.0.0.0"
+sip_port           = 5070
+rtp_external_ip    = "127.0.0.1"   # 本地联调用回环；真实环境用公网 IP
+rtp_start_port     = 12000
+rtp_end_port       = 12100
+trusted_edges      = ["127.0.0.1"] # 信任来自 Edge 的内部 INVITE
+edge_sip_addr      = "127.0.0.1:5060"  # 出站起呼转发目标（Edge）
+heartbeat_secs     = 10
+log                = "info"
+```
+```bash
+cargo run --bin rustpbx-worker -- rustpbx-worker.toml
+```
+
+### 4.3 SIP Edge
+`rustpbx-edge.toml`：
+```toml
+control_plane_addr = "http://127.0.0.1:9090"
+sip_addr           = "0.0.0.0"
+udp_port           = 5060
+edge_id            = "edge-local"
+trusted_workers    = ["127.0.0.1"]  # 信任来自 Worker 的出站内部 INVITE
+config_poll_secs   = 30
+log                = "info"
+```
+```bash
+cargo run --bin rustpbx-edge -- rustpbx-edge.toml
+```
+
+### 端口速查
+| 组件 | 协议/端口 |
+|------|-----------|
+| Control gRPC | 9090 |
+| Control HTTP（API + 控制台 UI） | 9080 |
+| Edge SIP | UDP 5060 |
+| Worker SIP | UDP 5070 |
+| Worker RTP | 12000+ |
+
+---
+
+## 5. 管理控制台前端（rustpbx-control/web）
+
+```bash
+cd crates/rustpbx-control/web
+bun install
+
+# 开发模式：热重载，:5173，自动把 /api 代理到 127.0.0.1:9080
+bun run dev
+
+# 生产构建：vue-tsc 类型检查 + rolldown-vite 打包 → dist/
+bun run build
+```
+
+- **开发调试**：`bun run dev` 起前端 :5173，同时另开终端跑 `rustpbx-control`
+  （提供 :9080 的 API）。浏览器开 `http://localhost:5173`。
+- **集成验证**：`bun run build` 后直接访问 `http://127.0.0.1:9080/`，由
+  control 二进制托管 `dist/`。
+- 默认登录：`admin` / `admin`（见 control 配置）。
+- 技术栈：Vue3 + rolldown-vite + shadcn-vue + Tailwind v4 + vue-i18n(中/英) +
+  hash route。详见 `web/README.md`。
+
+---
+
+## 6. 日志与调试
+
+所有组件用 `tracing` + `EnvFilter`。`RUST_LOG` 优先于配置里的 `log` 字段：
+
+```bash
+# 全局 debug
+RUST_LOG=debug cargo run --bin rustpbx-worker -- rustpbx-worker.toml
+
+# 按模块精细控制（只看路由 + 通话路由器）
+RUST_LOG=info,rustpbx::proxy::routing=debug,rustpbx_worker::call_router=trace \
+  cargo run --bin rustpbx-worker -- rustpbx-worker.toml
+
+# Edge 出站/内部对等模块
+RUST_LOG=info,rustpbx_edge=debug cargo run --bin rustpbx-edge -- rustpbx-edge.toml
+```
+
+### 直接打 Control HTTP API（无需前端）
+```bash
+B=http://127.0.0.1:9080
+TOKEN=$(curl -s -X POST $B/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | jq -r .token)
+
+curl -s $B/api/tenants -H "Authorization: Bearer $TOKEN" | jq
+curl -s $B/api/stats   -H "Authorization: Bearer $TOKEN" | jq
+curl -s $B/api/workers -H "Authorization: Bearer $TOKEN" | jq   # Worker 注册后才有数据
+curl -s -X POST $B/api/tenants -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"acme","max_trunks":5}' | jq
+```
+
+### SIP 联调
+- 用 `sipbot`（集成测试所用库）或 `sipp` / 软电话向 Edge `5060` 灌呼叫。
+- 抓包：`sudo tcpdump -i lo0 -n udp port 5060 or udp port 5070`（Linux 用 `-i lo`）。
+
+### 调试器
+VS Code + `CodeLLDB`，或命令行：
+```bash
+rust-lldb target/debug/rustpbx-worker -- rustpbx-worker.toml
+```
+
+---
+
+## 7. 常见问题
+
+| 现象 | 原因 / 处理 |
+|------|-------------|
+| control 启动报 `no such table: rustpbx_sip_trunks` | 基表未建，见 §3 |
+| Edge/Worker 起不来或连不上 | Control 未先启动 / `control_plane_addr` 端口不对 |
+| `/api/workers` 为空 | Worker 尚未注册成功（看 Worker 日志的心跳/注册行） |
+| 出站呼叫 501 | Worker 未配 `edge_sip_addr`，或呼叫未命中 trunk 路由 |
+| 前端 `bun run dev` 调 API 401/CORS | 确认 control 在 9080 已起；dev 代理见 `vite.config.ts` |
+| 前端构建报 `node:url` 类型错误 | 确认装了 `@types/node`（`bun install`）|
+
+---
+
+## 8. 相关文档
+
+- `docs/edge-call-dispatch-architecture.md` — Edge/Worker 通话分发架构（本地，未入库）
+- `crates/rustpbx-control/web/README.md` — 前端控制台详解
+- 仓库根 `CLAUDE.md` — 项目总览与模块说明
