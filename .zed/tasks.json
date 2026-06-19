@@ -1,0 +1,69 @@
+// Zed tasks for RustPBX distributed development.
+// Open the command palette → "task: spawn" (or bind a key) to run these.
+// Long-running servers use a new terminal each run so you can run
+// Control + Worker + Edge side by side.
+[
+  {
+    "label": "cargo: build distributed",
+    "command": "cargo",
+    "args": ["build", "-p", "rustpbx-control", "-p", "rustpbx-worker", "-p", "rustpbx-edge"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always"
+  },
+  {
+    "label": "cargo: test distributed",
+    "command": "cargo",
+    "args": ["test", "-p", "rustpbx-core", "-p", "rustpbx-edge", "-p", "rustpbx-worker"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always"
+  },
+  {
+    "label": "control: run",
+    "command": "cargo",
+    "args": ["run", "--bin", "rustpbx-control", "--", "crates/rustpbx-control/rustpbx-control.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_control=debug" },
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true
+  },
+  {
+    "label": "worker: run",
+    "command": "cargo",
+    "args": ["run", "--bin", "rustpbx-worker", "--", "rustpbx-worker.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_worker=debug" },
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true
+  },
+  {
+    "label": "edge: run",
+    "command": "cargo",
+    "args": ["run", "--bin", "rustpbx-edge", "--", "rustpbx-edge.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_edge=debug" },
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true
+  },
+  {
+    "label": "web: dev (vite :5173)",
+    "command": "bun",
+    "args": ["run", "dev"],
+    "cwd": "$ZED_WORKTREE_ROOT/crates/rustpbx-control/web",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true
+  },
+  {
+    "label": "web: build",
+    "command": "bun",
+    "args": ["run", "build"],
+    "cwd": "$ZED_WORKTREE_ROOT/crates/rustpbx-control/web",
+    "reveal": "always"
+  },
+  {
+    "label": "web: install deps",
+    "command": "bun",
+    "args": ["install"],
+    "cwd": "$ZED_WORKTREE_ROOT/crates/rustpbx-control/web",
+    "reveal": "always"
+  }
+]

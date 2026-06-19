@@ -1,0 +1,23 @@
+// Project-level Zed settings for RustPBX.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // Lint with clippy on save/check.
+        "check": { "command": "clippy" },
+        "cargo": { "buildScripts": { "enable": true } },
+        // The workspace is large; skip noisy proc-macro errors if any.
+        "procMacro": { "enable": true }
+      }
+    }
+  },
+  // Keep the frontend's generated/vendored output out of search & the tree.
+  "file_scan_exclusions": [
+    "**/target",
+    "**/node_modules",
+    "**/crates/rustpbx-control/web/dist"
+  ],
+  "languages": {
+    "Vue.js": { "language_servers": ["vue-language-server", "..."] }
+  }
+}

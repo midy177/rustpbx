@@ -1,0 +1,45 @@
+// Zed debug scenarios for the RustPBX distributed binaries.
+// Uses the CodeLLDB adapter — Zed will prompt to install it on first run.
+// Each scenario builds the crate first, then launches the binary with its
+// config file. Open the debug panel and pick a scenario.
+[
+  {
+    "label": "Debug rustpbx-control",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/rustpbx-control",
+    "args": ["crates/rustpbx-control/rustpbx-control.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_control=debug" },
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "rustpbx-control"]
+    }
+  },
+  {
+    "label": "Debug rustpbx-worker",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/rustpbx-worker",
+    "args": ["rustpbx-worker.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_worker=debug" },
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "rustpbx-worker"]
+    }
+  },
+  {
+    "label": "Debug rustpbx-edge",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/rustpbx-edge",
+    "args": ["rustpbx-edge.toml"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "RUST_LOG": "info,rustpbx_edge=debug" },
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "rustpbx-edge"]
+    }
+  }
+]

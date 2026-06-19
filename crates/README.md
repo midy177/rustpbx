@@ -197,8 +197,23 @@ curl -s -X POST $B/api/tenants -H "Authorization: Bearer $TOKEN" \
 - 用 `sipbot`（集成测试所用库）或 `sipp` / 软电话向 Edge `5060` 灌呼叫。
 - 抓包：`sudo tcpdump -i lo0 -n udp port 5060 or udp port 5070`（Linux 用 `-i lo`）。
 
-### 调试器
-VS Code + `CodeLLDB`，或命令行：
+### Zed IDE
+仓库已带 `.zed/` 工程配置，开箱即用：
+
+- **`.zed/tasks.json`** — 命令面板 `task: spawn` 选择：`control: run` / `worker: run` /
+  `edge: run`（各自新终端、可并行，已注入 `RUST_LOG`）、`cargo: build distributed` /
+  `cargo: test distributed`、`web: dev (vite :5173)` / `web: build` / `web: install deps`。
+- **`.zed/debug.json`** — 打开调试面板选 `Debug rustpbx-control/worker/edge`，
+  会先 `cargo build` 再用 **CodeLLDB** 启动（首次运行 Zed 会提示安装该 adapter）。
+  在源码行号槽点击即设断点。
+- **`.zed/settings.json`** — rust-analyzer 用 clippy 检查；已把 `target/`、
+  `node_modules/`、`web/dist` 排除出搜索与文件树。
+
+rust-analyzer 是 Zed 内置的，打开仓库即自动索引 workspace；编辑器内有
+inlay hints、跳转、`cargo check` 诊断。前端 `.vue` 需在 Zed 安装 Vue 扩展
+（`vue-language-server`，settings.json 已声明）。
+
+命令行调试备选：
 ```bash
 rust-lldb target/debug/rustpbx-worker -- rustpbx-worker.toml
 ```
