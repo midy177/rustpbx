@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
     // ── HTTP admin API + SPA ────────────────────────────────────────────────
     let http_state = HttpState {
         db,
+        store: Arc::clone(&store),
         workers: Arc::clone(&workers),
         sessions: Arc::new(DashMap::new()),
         admin_username: cfg.admin_username.clone(),

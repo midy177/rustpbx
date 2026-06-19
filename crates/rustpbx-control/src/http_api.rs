@@ -8,11 +8,12 @@
 //! in-memory session map. Tenant-scoped accounts are a future enhancement —
 //! for now the super-admin can scope views to a tenant from the UI.
 
+use crate::store::Store;
 use crate::tenant_service::{CreateTenantRequest, TenantService, UpdateTenantRequest};
 use crate::worker_registry::WorkerRegistry;
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -36,6 +37,7 @@ const SESSION_TTL_HOURS: i64 = 12;
 #[derive(Clone)]
 pub struct HttpState {
     pub db: DatabaseConnection,
+    pub store: Arc<Store>,
     pub workers: Arc<WorkerRegistry>,
     pub sessions: Arc<DashMap<String, Session>>,
     pub admin_username: String,
@@ -96,6 +98,8 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
             get(get_tenant).put(update_tenant).delete(delete_tenant),
         )
         .route("/workers", get(list_workers))
+        .route("/trunks", get(list_trunks))
+        .route("/routes", get(list_routes))
         .layer(middleware::from_fn_with_state(state.clone(), auth_guard))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -293,6 +297,37 @@ struct WorkerView {
     last_heartbeat_secs_ago: u64,
     healthy: bool,
     draining: bool,
+}
+
+// ── Trunks & Routes (read-only, secret-safe) ─────────────────────────────────
+
+#[derive(Deserialize)]
+struct TenantQuery {
+    tenant_id: Option<i64>,
+}
+
+async fn list_trunks(
+    State(state): State<HttpState>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    let rows = state
+        .store
+        .list_trunks(q.tenant_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn list_routes(
+    State(state): State<HttpState>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    let rows = state
+        .store
+        .list_routes(q.tenant_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
 }
 
 async fn list_workers(State(state): State<HttpState>) -> Json<Vec<WorkerView>> {

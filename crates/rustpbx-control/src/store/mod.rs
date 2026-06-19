@@ -17,44 +17,39 @@ impl Store {
     }
 }
 
-// ── Trunk queries ─────────────────────────────────────────────────────────────
+// ── Admin views (HTTP API) ──────────────────────────────────────────────────
+// Secret-safe projections of the shared rustpbx_* tables for the admin console.
+// Passwords are never serialized — only `has_auth` indicates credentials exist.
 
-/// Minimal trunk view returned to Edge instances.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TrunkRow {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrunkView {
     pub id: i64,
     pub name: String,
-    pub sip_server: Option<String>,
-    pub outbound_proxy: Option<String>,
-    pub sip_transport: String,
-    pub auth_username: Option<String>,
-    pub auth_password: Option<String>,
+    /// Resolved destination (sip_server, else outbound_proxy).
+    pub dest: Option<String>,
+    pub transport: String,
     pub direction: String,
+    pub has_auth: bool,
     pub register_enabled: bool,
-    pub register_expires: Option<i32>,
-    pub rewrite_hostport: bool,
-    pub allowed_ips: Option<serde_json::Value>,
-    pub did_numbers: Option<serde_json::Value>,
-    pub incoming_from_user_prefix: Option<String>,
-    pub incoming_to_user_prefix: Option<String>,
+    pub is_active: bool,
+    pub did_numbers: Vec<String>,
+    pub allowed_ips: Vec<String>,
+    pub max_concurrent: Option<i32>,
     pub tenant_id: Option<i64>,
-    pub metadata: Option<serde_json::Value>,
 }
 
-/// Minimal route view.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RouteRow {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RouteView {
     pub id: i64,
     pub name: String,
+    pub description: Option<String>,
     pub priority: i32,
-    pub direction: Option<String>,
+    pub direction: String,
     pub source_pattern: Option<String>,
     pub destination_pattern: Option<String>,
-    pub target_trunks: Option<serde_json::Value>,
-    pub source_trunk_ids: Option<serde_json::Value>,
-    pub rewrite_rules: Option<serde_json::Value>,
-    pub header_filters: Option<serde_json::Value>,
-    pub metadata: Option<serde_json::Value>,
+    pub target_trunks: Vec<String>,
+    pub is_active: bool,
+    pub tenant_id: Option<i64>,
 }
 
 /// CDR record to persist.

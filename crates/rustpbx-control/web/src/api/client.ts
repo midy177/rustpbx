@@ -95,6 +95,34 @@ export interface Stats {
   active_calls: number;
 }
 
+export interface Trunk {
+  id: number;
+  name: string;
+  dest: string | null;
+  transport: string;
+  direction: string;
+  has_auth: boolean;
+  register_enabled: boolean;
+  is_active: boolean;
+  did_numbers: string[];
+  allowed_ips: string[];
+  max_concurrent: number | null;
+  tenant_id: number | null;
+}
+
+export interface Route {
+  id: number;
+  name: string;
+  description: string | null;
+  priority: number;
+  direction: string;
+  source_pattern: string | null;
+  destination_pattern: string | null;
+  target_trunks: string[];
+  is_active: boolean;
+  tenant_id: number | null;
+}
+
 export interface Worker {
   worker_id: string;
   sip_addr: string;

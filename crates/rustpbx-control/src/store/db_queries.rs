@@ -161,6 +161,135 @@ impl Store {
         }
         Ok(routes)
     }
+
+    // ── Admin console listings (include inactive; secret-safe) ────────────────
+
+    /// List trunks for the admin console, optionally scoped to a tenant
+    /// (matches the tenant plus global/NULL-tenant rows).
+    pub async fn list_trunks(
+        &self,
+        tenant_id: Option<i64>,
+    ) -> Result<Vec<crate::store::TrunkView>> {
+        use sea_orm::Statement;
+
+        let cols = "id, name, sip_server, outbound_proxy, sip_transport, \
+            auth_username, direction, register_enabled, is_active, \
+            allowed_ips, did_numbers, max_concurrent, tenant_id";
+        let (sql, values) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_sip_trunks \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY name"
+                ),
+                vec![sea_orm::Value::BigInt(Some(tid))],
+            ),
+            None => (
+                format!("SELECT {cols} FROM rustpbx_sip_trunks ORDER BY name"),
+                vec![],
+            ),
+        };
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                values,
+            ))
+            .await?;
+        rows.iter().map(row_to_trunk_view).collect()
+    }
+
+    /// List routing rules for the admin console, optionally scoped to a tenant.
+    pub async fn list_routes(
+        &self,
+        tenant_id: Option<i64>,
+    ) -> Result<Vec<crate::store::RouteView>> {
+        use sea_orm::Statement;
+
+        let cols = "id, name, description, priority, direction, \
+            source_pattern, destination_pattern, target_trunks, \
+            is_active, tenant_id";
+        let (sql, values) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_routing \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY priority ASC"
+                ),
+                vec![sea_orm::Value::BigInt(Some(tid))],
+            ),
+            None => (
+                format!("SELECT {cols} FROM rustpbx_routing ORDER BY priority ASC"),
+                vec![],
+            ),
+        };
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                values,
+            ))
+            .await?;
+        rows.iter().map(row_to_route_view).collect()
+    }
+}
+
+fn row_to_trunk_view(row: &sea_orm::QueryResult) -> Result<crate::store::TrunkView> {
+    use sea_orm::TryGetable;
+    let sip_server: Option<String> = row.try_get("", "sip_server").ok();
+    let outbound_proxy: Option<String> = row.try_get("", "outbound_proxy").ok();
+    let allowed_ips_json: Option<serde_json::Value> =
+        row.try_get::<Option<serde_json::Value>>("", "allowed_ips").ok().flatten();
+    let did_json: Option<serde_json::Value> =
+        row.try_get::<Option<serde_json::Value>>("", "did_numbers").ok().flatten();
+    let auth_username: Option<String> = row.try_get("", "auth_username").ok();
+
+    Ok(crate::store::TrunkView {
+        id: row.try_get("", "id")?,
+        name: row.try_get("", "name")?,
+        dest: sip_server.or(outbound_proxy),
+        transport: row.try_get("", "sip_transport").unwrap_or_else(|_| "udp".into()),
+        direction: row.try_get("", "direction").unwrap_or_else(|_| "bidirectional".into()),
+        has_auth: auth_username.as_deref().is_some_and(|u| !u.is_empty()),
+        register_enabled: row.try_get("", "register_enabled").unwrap_or(false),
+        is_active: row.try_get("", "is_active").unwrap_or(true),
+        did_numbers: json_string_array(did_json),
+        allowed_ips: json_string_array(allowed_ips_json),
+        max_concurrent: row.try_get("", "max_concurrent").ok(),
+        tenant_id: row.try_get("", "tenant_id").ok(),
+    })
+}
+
+fn row_to_route_view(row: &sea_orm::QueryResult) -> Result<crate::store::RouteView> {
+    use sea_orm::TryGetable;
+    let target_trunks_json: Option<serde_json::Value> =
+        row.try_get::<Option<serde_json::Value>>("", "target_trunks").ok().flatten();
+    let target_trunks = target_trunks_json
+        .as_ref()
+        .and_then(|v| {
+            #[derive(serde::Deserialize)]
+            struct TrunkRef {
+                name: String,
+            }
+            serde_json::from_value::<Vec<TrunkRef>>(v.clone()).ok()
+        })
+        .map(|refs| refs.into_iter().map(|r| r.name).collect())
+        .unwrap_or_default();
+
+    Ok(crate::store::RouteView {
+        id: row.try_get("", "id")?,
+        name: row.try_get("", "name")?,
+        description: row.try_get("", "description").ok(),
+        priority: row.try_get("", "priority").unwrap_or(0),
+        direction: row.try_get("", "direction").unwrap_or_else(|_| "any".into()),
+        source_pattern: row.try_get("", "source_pattern").ok(),
+        destination_pattern: row.try_get("", "destination_pattern").ok(),
+        target_trunks,
+        is_active: row.try_get("", "is_active").unwrap_or(true),
+        tenant_id: row.try_get("", "tenant_id").ok(),
+    })
 }
 
 // ── Row converters ────────────────────────────────────────────────────────────
