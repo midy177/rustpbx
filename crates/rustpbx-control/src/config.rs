@@ -14,6 +14,18 @@ pub struct ControlConfig {
     #[serde(default = "default_database_url")]
     pub database_url: String,
 
+    /// Super-admin username for the HTTP admin console.
+    #[serde(default = "default_admin_username")]
+    pub admin_username: String,
+
+    /// Super-admin password for the HTTP admin console (CHANGE IN PRODUCTION).
+    #[serde(default = "default_admin_password")]
+    pub admin_password: String,
+
+    /// Directory containing the built SPA (`web/dist`).
+    #[serde(default = "default_web_dir")]
+    pub web_dir: String,
+
     /// Log level / filter
     #[serde(default = "default_log")]
     pub log: String,
@@ -25,6 +37,9 @@ impl Default for ControlConfig {
             grpc_addr: default_grpc_addr(),
             http_addr: default_http_addr(),
             database_url: default_database_url(),
+            admin_username: default_admin_username(),
+            admin_password: default_admin_password(),
+            web_dir: default_web_dir(),
             log: default_log(),
         }
     }
@@ -48,6 +63,18 @@ fn default_http_addr() -> String {
 
 fn default_database_url() -> String {
     "sqlite://rustpbx-control.sqlite3".to_string()
+}
+
+fn default_admin_username() -> String {
+    "admin".to_string()
+}
+
+fn default_admin_password() -> String {
+    "admin".to_string()
+}
+
+fn default_web_dir() -> String {
+    "crates/rustpbx-control/web/dist".to_string()
 }
 
 fn default_log() -> String {

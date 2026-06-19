@@ -1,5 +1,6 @@
 mod config;
 mod grpc;
+mod http_api;
 mod migration;
 mod models;
 mod store;
@@ -11,11 +12,13 @@ use crate::{
         control_plane::ControlPlaneService,
         proto::control::control_plane_server::ControlPlaneServer,
     },
+    http_api::HttpState,
     migration::ControlMigrator,
     store::Store,
     worker_registry::WorkerRegistry,
 };
 use anyhow::Result;
+use dashmap::DashMap;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
@@ -53,20 +56,45 @@ async fn main() -> Result<()> {
     info!("control plane migrations applied");
 
     // ── Services ──────────────────────────────────────────────────────────────
-    let store = Arc::new(Store::new(db));
+    // `DatabaseConnection` is cheaply clonable (Arc inside) — keep a handle for
+    // the HTTP API while `Store` owns its own clone.
+    let store = Arc::new(Store::new(db.clone()));
     let workers = Arc::new(WorkerRegistry::new(Duration::from_secs(30)));
 
     let svc = ControlPlaneService::new(Arc::clone(&store), Arc::clone(&workers));
     let grpc_svc = ControlPlaneServer::new(svc);
 
+    // ── HTTP admin API + SPA ────────────────────────────────────────────────
+    let http_state = HttpState {
+        db,
+        workers: Arc::clone(&workers),
+        sessions: Arc::new(DashMap::new()),
+        admin_username: cfg.admin_username.clone(),
+        admin_password: cfg.admin_password.clone(),
+    };
+    let http_router = http_api::build_router(http_state, &cfg.web_dir);
+    let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;
+
     // ── gRPC Server ───────────────────────────────────────────────────────────
     let grpc_addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
-    info!(%grpc_addr, "gRPC server listening");
 
-    tonic::transport::Server::builder()
+    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, "control plane listening");
+
+    let grpc_server = tonic::transport::Server::builder()
         .add_service(grpc_svc)
-        .serve(grpc_addr)
-        .await?;
+        .serve(grpc_addr);
+
+    let http_server = async move {
+        let listener = tokio::net::TcpListener::bind(http_addr).await?;
+        axum::serve(listener, http_router).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    // Run both; if either exits/errors, shut down.
+    tokio::select! {
+        r = grpc_server => { r?; }
+        r = http_server => { r?; }
+    }
 
     Ok(())
 }

@@ -102,6 +102,16 @@ impl WorkerRegistry {
         self.workers.remove(worker_id);
         info!(worker_id, "worker removed");
     }
+
+    /// Return all registered workers (healthy or not) — used by the admin HTTP API.
+    pub fn all(&self) -> Vec<WorkerEntry> {
+        self.workers.iter().map(|e| e.clone()).collect()
+    }
+
+    /// Heartbeat-timeout threshold used to compute worker health.
+    pub fn heartbeat_timeout(&self) -> Duration {
+        self.heartbeat_timeout
+    }
 }
 
 impl Default for WorkerRegistry {
