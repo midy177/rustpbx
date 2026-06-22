@@ -1,11 +1,5 @@
-// Include tonic-build generated code.
-// The file is named "rustpbx.control.rs" in OUT_DIR;
-// tonic::include_proto!("rustpbx.control") brings its contents into scope directly.
-
-pub mod control {
-    tonic::include_proto!("rustpbx.control");
-}
-
-pub mod edge {
-    tonic::include_proto!("rustpbx.edge");
-}
+// Shared generated protobuf code lives in `rustpbx-proto`. Re-export it so
+// existing `crate::proto::{control,edge}` paths keep resolving unchanged.
+// `edge` is re-exported for completeness even if not all of it is used here.
+#[allow(unused_imports)]
+pub use rustpbx_proto::{control, edge};

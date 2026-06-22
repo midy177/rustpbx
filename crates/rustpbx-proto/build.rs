@@ -3,6 +3,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: build script runs single-threaded before any spawned tasks.
     unsafe { std::env::set_var("PROTOC", protoc) };
 
+    // Generate both server and client for every service. Client-only consumers
+    // (edge/worker) simply don't reference the generated server types — the
+    // extra code is harmless and keeps a single shared generation.
     tonic_build::configure()
         .build_server(true)
         .build_client(true)

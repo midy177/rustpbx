@@ -1,0 +1,20 @@
+[package]
+name = "rustpbx-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Shared gRPC/protobuf definitions for RustPBX distributed components"
+license = "MIT"
+
+[lib]
+name = "rustpbx_proto"
+path = "src/lib.rs"
+
+[dependencies]
+# tonic generates code that references both at runtime. `transport` is needed
+# for the generated Server/Client connect helpers; consumers re-use these.
+tonic = { version = "0.13", features = ["transport", "tls-ring"] }
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"

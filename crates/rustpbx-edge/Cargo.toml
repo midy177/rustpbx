@@ -1,26 +1,27 @@
 [package]
-name = "rustpbx-worker"
+name = "rustpbx-edge"
 version = "0.1.0"
 edition = "2024"
-description = "RustPBX Media Worker — B2BUA, RTP relay, recording, AI integration"
+description = "RustPBX SIP Edge Gateway — fixed-IP SIP trunk registration and call dispatch"
 license = "MIT"
 
 [[bin]]
-name = "rustpbx-worker"
+name = "rustpbx-edge"
 path = "src/main.rs"
 
 [dependencies]
+# Shared types
 rustpbx-core = { path = "../rustpbx-core" }
 # Shared protobuf/gRPC definitions (compiled once in rustpbx-proto).
 rustpbx-proto = { path = "../rustpbx-proto" }
 
-# Main rustpbx crate — Worker reuses SipServer + full media stack
+# Main rustpbx crate — Edge reuses SipServer, ProxyDataContext, TrunkRegistrar
 rustpbx = { path = "../.." }
 
 # SIP stack (same version as rustpbx)
 rsipstack = "0.5.11"
 
-# gRPC client (Control Plane registration + CDR upload)
+# gRPC client for Control Plane
 tonic = { version = "0.13", features = ["transport", "tls-ring"] }
 prost = "0.13"
 
@@ -38,15 +39,9 @@ dotenvy = "0.15"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-metrics = "0.24"
-metrics-exporter-prometheus = "0.18"
 
 # Utilities
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-hostname = "0.4"
-ipnetwork = "0.21"
-sysinfo = "0.35"
-uuid = { version = "1", features = ["v4"] }
-thiserror = "2"
+ipnetwork = "0.20"

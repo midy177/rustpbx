@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 rustpbx-core = { path = "../rustpbx-core" }
+# Shared protobuf/gRPC definitions (compiled once in rustpbx-proto).
+rustpbx-proto = { path = "../rustpbx-proto" }
 
 # gRPC
 tonic = { version = "0.13", features = ["transport", "tls-ring"] }
@@ -62,7 +64,3 @@ futures = "0.3"
 # `storage-v2` unseals the split RaftLogStorage / RaftStateMachine traits so we
 # can implement them in this crate.
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
-
-[build-dependencies]
-tonic-build = "0.13"
-protoc-bin-vendored = "3"
