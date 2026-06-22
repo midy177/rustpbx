@@ -12,18 +12,17 @@ impl Store {
         use sea_orm::{Statement, Value};
 
         let start = Utc.timestamp_millis_opt(rec.start_time_unix_ms).single();
-        let answer = if rec.answer_time_unix_ms > 0 {
-            Utc.timestamp_millis_opt(rec.answer_time_unix_ms).single()
-        } else {
-            None
-        };
         let end = Utc.timestamp_millis_opt(rec.end_time_unix_ms).single();
 
+        // Column names must match the canonical schema owned by the main binary
+        // (`src/models/call_record.rs`): `started_at` / `ended_at`, no
+        // `answer_time` / `sip_trunk_name` columns. The Worker reports a trunk
+        // *name* (not the main schema's `sip_trunk_id`) and an answer time that
+        // the base schema doesn't model, so both are folded into `metadata`.
         let sql = "INSERT INTO rustpbx_call_records \
             (call_id, from_number, to_number, direction, status, \
-             start_time, answer_time, end_time, duration_secs, \
-             sip_trunk_name, metadata) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             started_at, ended_at, duration_secs, metadata) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
             ON CONFLICT (call_id) DO NOTHING";
 
         let meta = serde_json::json!({
@@ -32,6 +31,8 @@ impl Store {
             "recording_path": rec.recording_path,
             "hangup_cause": rec.hangup_cause,
             "tenant_id": rec.tenant_id,
+            "sip_trunk_name": rec.trunk_name,
+            "answer_time_unix_ms": (rec.answer_time_unix_ms > 0).then_some(rec.answer_time_unix_ms),
         });
 
         self.db
@@ -45,10 +46,8 @@ impl Store {
                     Value::String(Some(Box::new(rec.direction.clone()))),
                     Value::String(Some(Box::new(rec.status.clone()))),
                     Value::ChronoDateTimeUtc(start.map(Box::new)),
-                    Value::ChronoDateTimeUtc(answer.map(Box::new)),
                     Value::ChronoDateTimeUtc(end.map(Box::new)),
                     Value::Int(Some(rec.duration_secs)),
-                    Value::String(rec.trunk_name.clone().map(Box::new)),
                     Value::Json(Some(Box::new(meta))),
                 ],
             ))
