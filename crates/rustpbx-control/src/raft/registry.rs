@@ -44,12 +44,19 @@ pub struct RaftRegistry {
     raft: Raft<TypeConfig>,
     sm: StateMachineStore,
     heartbeat_timeout: Duration,
+    /// Client TLS used when forwarding writes to the leader's business gRPC.
+    tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 impl RaftRegistry {
     /// Build the Raft node without initializing any cluster membership. Used by
-    /// both single-node and cluster startup paths.
-    async fn build(node_id: NodeId, heartbeat_timeout: Duration) -> Result<Self> {
+    /// both single-node and cluster startup paths. `tls` is applied to both the
+    /// Raft transport client and the leader-forwarding client.
+    async fn build(
+        node_id: NodeId,
+        heartbeat_timeout: Duration,
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> Result<Self> {
         let config = Config {
             cluster_name: "rustpbx-control".to_string(),
             // Snapshot fairly often: the registry is small and this keeps the
@@ -61,7 +68,7 @@ impl RaftRegistry {
 
         let log_store = LogStore::new();
         let sm = StateMachineStore::new();
-        let network = NetworkFactory;
+        let network = NetworkFactory::new(tls.clone());
 
         let raft = Raft::new(node_id, config, network, log_store, sm.clone()).await?;
 
@@ -69,13 +76,14 @@ impl RaftRegistry {
             raft,
             sm,
             heartbeat_timeout,
+            tls,
         })
     }
 
     /// Start a single-node Raft and initialize this node as the sole voter.
     /// Backward-compatible default when no Raft address is configured.
     pub async fn start(node_id: NodeId, heartbeat_timeout: Duration) -> Result<Self> {
-        let this = Self::build(node_id, heartbeat_timeout).await?;
+        let this = Self::build(node_id, heartbeat_timeout, None).await?;
 
         // Initialize a single-voter cluster (this node only).
         let mut members = BTreeMap::new();
@@ -100,8 +108,9 @@ impl RaftRegistry {
         grpc_addr: &str,
         bootstrap: bool,
         heartbeat_timeout: Duration,
+        tls: Option<tonic::transport::ClientTlsConfig>,
     ) -> Result<Self> {
-        let this = Self::build(node_id, heartbeat_timeout).await?;
+        let this = Self::build(node_id, heartbeat_timeout, tls).await?;
 
         if bootstrap && !this.raft.is_initialized().await? {
             let mut members = BTreeMap::new();
@@ -196,15 +205,20 @@ impl RaftRegistry {
             .and_then(|n| node_addr::grpc_addr(&n.addr).map(|s| s.to_string()))
             .ok_or_else(|| anyhow::anyhow!("no known leader to forward write to"))?;
 
-        let endpoint = if leader.starts_with("http") {
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        let endpoint_url = if leader.starts_with("http") {
             leader
         } else {
-            format!("http://{leader}")
+            format!("{scheme}://{leader}")
         };
+        let mut endpoint = tonic::transport::Endpoint::from_shared(endpoint_url)?;
+        if let Some(tls) = &self.tls {
+            endpoint = endpoint.tls_config(tls.clone())?;
+        }
+        let channel = endpoint.connect().await?;
         let command = serde_json::to_vec(&cmd)?;
         let mut client =
-            crate::grpc::proto::control::control_plane_client::ControlPlaneClient::connect(endpoint)
-                .await?;
+            crate::grpc::proto::control::control_plane_client::ControlPlaneClient::new(channel);
         let resp = client
             .propose_write(crate::grpc::proto::control::ProposeWriteRequest { command })
             .await?
@@ -413,11 +427,11 @@ mod tests {
 
         // Node 1 bootstraps a single-voter cluster advertising its real addr.
         // (grpc_addr unused here — this test writes only on the leader.)
-        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), &addr1.to_string(), true, hb)
+        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), &addr1.to_string(), true, hb, None)
             .await
             .unwrap();
         // Node 2 starts uninitialized, waiting to be added.
-        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), &addr2.to_string(), false, hb)
+        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), &addr2.to_string(), false, hb, None)
             .await
             .unwrap();
 
@@ -487,10 +501,10 @@ mod tests {
         let hb = Duration::from_secs(30);
 
         // Each node advertises its raft addr + its business grpc addr.
-        let n1 = RaftRegistry::start_cluster(1, &raft1.to_string(), &grpc1.to_string(), true, hb)
+        let n1 = RaftRegistry::start_cluster(1, &raft1.to_string(), &grpc1.to_string(), true, hb, None)
             .await
             .unwrap();
-        let n2 = RaftRegistry::start_cluster(2, &raft2.to_string(), &grpc2.to_string(), false, hb)
+        let n2 = RaftRegistry::start_cluster(2, &raft2.to_string(), &grpc2.to_string(), false, hb, None)
             .await
             .unwrap();
 
@@ -520,5 +534,81 @@ mod tests {
             n2.all().await.iter().any(|w| w.worker_id == "forwarded-worker"),
             "and replicate back to the follower"
         );
+    }
+
+    /// Start a Raft transport server with TLS.
+    fn spawn_raft_server_tls(
+        reg: &RaftRegistry,
+        addr: std::net::SocketAddr,
+        server_tls: tonic::transport::ServerTlsConfig,
+    ) {
+        use crate::grpc::proto::raft::raft_service_server::RaftServiceServer;
+        let server = crate::raft::server::RaftServer::new(reg.raft().clone());
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(server_tls)
+                .unwrap()
+                .add_service(RaftServiceServer::new(server))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Two-node cluster over **TLS**: generate a self-signed cert for
+    /// "localhost", run both Raft transports with server TLS, dial peers with
+    /// client TLS (CA = the self-signed cert), and verify replication. Proves
+    /// the TLS plumbing (server identity + client CA verification + https
+    /// scheme) actually works, not just compiles.
+    #[tokio::test]
+    async fn two_node_cluster_over_tls_replicates() {
+        // Self-signed cert valid for "localhost" (the SocketAddrs use 127.0.0.1,
+        // but we set the client domain_name to "localhost" to match the SAN).
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = ck.cert.pem();
+        let key_pem = ck.signing_key.serialize_pem();
+
+        let server_tls = || {
+            tonic::transport::ServerTlsConfig::new().identity(
+                tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone()),
+            )
+        };
+        let client_tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(cert_pem.clone()))
+            .domain_name("localhost");
+
+        let addr1: std::net::SocketAddr = "127.0.0.1:24121".parse().unwrap();
+        let addr2: std::net::SocketAddr = "127.0.0.1:24122".parse().unwrap();
+        // Peers must be reached by the cert's SAN name → advertise "localhost:port".
+        let adv1 = format!("localhost:{}", addr1.port());
+        let adv2 = format!("localhost:{}", addr2.port());
+        let hb = Duration::from_secs(30);
+
+        let n1 = RaftRegistry::start_cluster(1, &adv1, &adv1, true, hb, Some(client_tls.clone()))
+            .await
+            .unwrap();
+        let n2 = RaftRegistry::start_cluster(2, &adv2, &adv2, false, hb, Some(client_tls.clone()))
+            .await
+            .unwrap();
+
+        spawn_raft_server_tls(&n1, addr1, server_tls());
+        spawn_raft_server_tls(&n2, addr2, server_tls());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        n1.add_learner(2, &adv2, &adv2).await.unwrap();
+        n1.change_membership([1, 2].into_iter().collect()).await.unwrap();
+
+        n1.register(rec("tls-worker")).await.unwrap();
+
+        let mut found = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if n2.all().await.iter().any(|w| w.worker_id == "tls-worker") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "write must replicate to the follower over TLS");
+        assert_eq!(n2.metrics_summary().current_leader, Some(1));
     }
 }

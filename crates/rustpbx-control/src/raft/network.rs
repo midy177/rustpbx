@@ -41,10 +41,19 @@ pub enum WireResult<T, E> {
     Err(E),
 }
 
-/// Factory that dials peers on demand. Stateless: the target address is carried
-/// in the `BasicNode` openraft passes to `new_client`.
+/// Factory that dials peers on demand. Carries the optional client TLS config
+/// used to verify peer Raft servers; the target address comes from the
+/// `BasicNode` openraft passes to `new_client`.
 #[derive(Clone, Debug, Default)]
-pub struct NetworkFactory;
+pub struct NetworkFactory {
+    tls: Option<tonic::transport::ClientTlsConfig>,
+}
+
+impl NetworkFactory {
+    pub fn new(tls: Option<tonic::transport::ClientTlsConfig>) -> Self {
+        Self { tls }
+    }
+}
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
@@ -54,6 +63,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             target,
             // node.addr packs "raft_addr|grpc_addr"; dial the Raft transport.
             addr: super::types::node_addr::raft_addr(&node.addr).to_string(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -65,13 +75,16 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 pub struct NetworkConnection {
     target: NodeId,
     addr: String,
+    tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 impl NetworkConnection {
     fn endpoint(&self) -> String {
-        // BasicNode.addr is a host:port; prefix the scheme tonic expects.
+        // Prefix the scheme tonic expects; TLS → https.
         if self.addr.starts_with("http://") || self.addr.starts_with("https://") {
             self.addr.clone()
+        } else if self.tls.is_some() {
+            format!("https://{}", self.addr)
         } else {
             format!("http://{}", self.addr)
         }
@@ -80,9 +93,15 @@ impl NetworkConnection {
     async fn connect(
         &self,
     ) -> Result<RaftServiceClient<tonic::transport::Channel>, NetworkError> {
-        RaftServiceClient::connect(self.endpoint())
-            .await
-            .map_err(|e| NetworkError::new(&e))
+        let mut endpoint = tonic::transport::Endpoint::from_shared(self.endpoint())
+            .map_err(|e| NetworkError::new(&e))?;
+        if let Some(tls) = &self.tls {
+            endpoint = endpoint
+                .tls_config(tls.clone())
+                .map_err(|e| NetworkError::new(&e))?;
+        }
+        let channel = endpoint.connect().await.map_err(|e| NetworkError::new(&e))?;
+        Ok(RaftServiceClient::new(channel))
     }
 }
 

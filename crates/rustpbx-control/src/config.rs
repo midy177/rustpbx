@@ -40,6 +40,63 @@ pub struct ControlConfig {
     /// Raft cluster settings for control-plane replication.
     #[serde(default)]
     pub raft: RaftConfig,
+
+    /// Optional TLS for all gRPC (business ControlPlane + Raft transport).
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// TLS material for the control plane's gRPC endpoints. When `cert_path` and
+/// `key_path` are both set, the business gRPC server and the Raft transport
+/// server enable TLS, and the Raft/forwarding clients connect over TLS using
+/// `ca_path` to verify peers. Empty (default) → plaintext (backward compatible).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TlsConfig {
+    /// Server certificate chain (PEM).
+    #[serde(default)]
+    pub cert_path: String,
+    /// Server private key (PEM).
+    #[serde(default)]
+    pub key_path: String,
+    /// CA certificate (PEM) the clients use to verify peer servers. Defaults to
+    /// `cert_path` when empty (self-signed / shared cert setups).
+    #[serde(default)]
+    pub ca_path: String,
+    /// Domain name to verify in peer certificates. Defaults to the connection
+    /// host when empty.
+    #[serde(default)]
+    pub domain: String,
+}
+
+impl TlsConfig {
+    /// Whether TLS is configured (both cert and key present).
+    pub fn is_enabled(&self) -> bool {
+        !self.cert_path.trim().is_empty() && !self.key_path.trim().is_empty()
+    }
+
+    /// Build the server-side TLS config (identity from cert+key).
+    pub fn server_tls(&self) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
+        let cert = std::fs::read(&self.cert_path)?;
+        let key = std::fs::read(&self.key_path)?;
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        Ok(tonic::transport::ServerTlsConfig::new().identity(identity))
+    }
+
+    /// Build the client-side TLS config (CA to verify peers, optional domain).
+    pub fn client_tls(&self) -> anyhow::Result<tonic::transport::ClientTlsConfig> {
+        let ca_path = if self.ca_path.trim().is_empty() {
+            &self.cert_path
+        } else {
+            &self.ca_path
+        };
+        let ca = std::fs::read(ca_path)?;
+        let mut cfg = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca));
+        if !self.domain.trim().is_empty() {
+            cfg = cfg.domain_name(self.domain.clone());
+        }
+        Ok(cfg)
+    }
 }
 
 /// Raft replication config for the worker registry.
@@ -105,6 +162,7 @@ impl Default for ControlConfig {
             log: default_log(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
             raft: RaftConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }

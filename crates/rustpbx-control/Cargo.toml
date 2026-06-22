@@ -64,3 +64,8 @@ futures = "0.3"
 # `storage-v2` unseals the split RaftLogStorage / RaftStateMachine traits so we
 # can implement them in this crate.
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
+[dev-dependencies]
+# Self-signed certs for the TLS cluster integration test.
+rcgen = "0.14.7"
+tempfile = "3"

@@ -88,8 +88,16 @@ async fn main() -> Result<()> {
         let bootstrap = node_id == 1;
         // The business gRPC addr is advertised alongside the Raft addr so a
         // follower can forward writes to the leader's ControlPlane service.
-        RaftRegistry::start_cluster(node_id, &advertise, &cfg.grpc_addr, bootstrap, hb_timeout)
-            .await?
+        let client_tls = cfg.tls.is_enabled().then(|| cfg.tls.client_tls()).transpose()?;
+        RaftRegistry::start_cluster(
+            node_id,
+            &advertise,
+            &cfg.grpc_addr,
+            bootstrap,
+            hb_timeout,
+            client_tls,
+        )
+        .await?
     } else {
         RaftRegistry::start(cfg.raft.node_id, hb_timeout).await?
     };
@@ -98,14 +106,21 @@ async fn main() -> Result<()> {
     if cfg.raft.is_cluster_mode() {
         let raft_addr: std::net::SocketAddr = cfg.raft.addr.parse()?;
         let raft_server = raft::server::RaftServer::new(workers.raft().clone());
-        info!(%raft_addr, node_id = cfg.raft.node_id, "raft transport listening");
+        let tls = cfg.tls.is_enabled().then(|| cfg.tls.server_tls()).transpose()?;
+        info!(%raft_addr, node_id = cfg.raft.node_id, tls = tls.is_some(), "raft transport listening");
         tokio::spawn(async move {
             let svc = grpc::proto::raft::raft_service_server::RaftServiceServer::new(raft_server);
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(svc)
-                .serve(raft_addr)
-                .await
-            {
+            let mut builder = tonic::transport::Server::builder();
+            if let Some(tls) = tls {
+                builder = match builder.tls_config(tls) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft TLS config invalid");
+                        return;
+                    }
+                };
+            }
+            if let Err(e) = builder.add_service(svc).serve(raft_addr).await {
                 tracing::error!(error = %e, "raft transport server exited");
             }
         });
@@ -145,11 +160,13 @@ async fn main() -> Result<()> {
     // ── gRPC Server ───────────────────────────────────────────────────────────
     let grpc_addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
 
-    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, "control plane listening");
+    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, tls = cfg.tls.is_enabled(), "control plane listening");
 
-    let grpc_server = tonic::transport::Server::builder()
-        .add_service(grpc_svc)
-        .serve(grpc_addr);
+    let mut grpc_builder = tonic::transport::Server::builder();
+    if cfg.tls.is_enabled() {
+        grpc_builder = grpc_builder.tls_config(cfg.tls.server_tls()?)?;
+    }
+    let grpc_server = grpc_builder.add_service(grpc_svc).serve(grpc_addr);
 
     let http_server = async move {
         let listener = tokio::net::TcpListener::bind(http_addr).await?;
