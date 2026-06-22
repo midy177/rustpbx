@@ -54,6 +54,7 @@ pub struct RouteView {
 
 /// CDR record to persist.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct CdrInsert {
     pub call_id: String,
     pub tenant_id: Option<i64>,

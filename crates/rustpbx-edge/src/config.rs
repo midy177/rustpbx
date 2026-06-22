@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct EdgeConfig {
     /// Control Plane gRPC address to connect to
     #[serde(default = "default_control_plane_addr")]

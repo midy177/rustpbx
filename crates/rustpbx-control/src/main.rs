@@ -20,7 +20,7 @@ use crate::{
 use anyhow::Result;
 use dashmap::DashMap;
 use sea_orm::Database;
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigratorTrait, SchemaManager};
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::info;
@@ -52,8 +52,22 @@ async fn main() -> Result<()> {
     let db = Database::connect(&cfg.database_url).await?;
     info!(database_url = %cfg.database_url, "database connected");
 
-    ControlMigrator::up(&db, None).await?;
-    info!("control plane migrations applied");
+    // Initialize schema directly, bypassing SeaORM's migration version tracking.
+    //
+    // The shared DB is normally created by the main `rustpbx` binary (22 base
+    // migrations); the Control Plane only adds its tenant tables/columns on top.
+    // SeaORM's `Migrator::up` requires *every* applied migration to be in the
+    // current migrator's list, so running `ControlMigrator::up` against a DB
+    // already migrated by main fails with "applied migration file missing".
+    //
+    // Each Control migration is idempotent (`if_not_exists` / `has_column`
+    // guards), so we just run their `up()` DDL through a SchemaManager — no
+    // `seaql_migrations` bookkeeping, no cross-migrator conflict.
+    let manager = SchemaManager::new(&db);
+    for m in ControlMigrator::migrations() {
+        m.up(&manager).await?;
+    }
+    info!("control plane schema initialized");
 
     // ── Services ──────────────────────────────────────────────────────────────
     // `DatabaseConnection` is cheaply clonable (Arc inside) — keep a handle for

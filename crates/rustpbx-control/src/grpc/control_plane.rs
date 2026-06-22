@@ -30,6 +30,10 @@ impl ControlPlaneService {
         Self { store, workers, change_tx }
     }
 
+    /// Broadcast a config-change event to all streaming watchers.
+    /// Unused for now (events are pushed from the mutating handlers directly);
+    /// retained for future administrative triggers.
+    #[allow(dead_code)]
     pub fn broadcast(&self, event: ConfigChangeEvent) {
         let _ = self.change_tx.send(event);
     }

@@ -274,8 +274,10 @@ async fn test_full_rwi_event_chain_with_recording() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Scenario 2: Agent State Changed event via real RWI gateway broadcast
+// Gated: depends on the unimplemented `addon-cc` module (addons::cc::cc_events).
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "addon-cc")]
 #[tokio::test]
 async fn test_agent_state_change_rwi_event() {
     let _ = tracing_subscriber::fmt::try_init();

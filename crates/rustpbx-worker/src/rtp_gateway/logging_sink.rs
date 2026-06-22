@@ -28,6 +28,7 @@ impl LoggingSink {
     }
 
     /// Snapshot of all commands received so far (for testing / introspection).
+    #[allow(dead_code)]
     pub fn commands(&self) -> Vec<String> {
         self.log
             .lock()
@@ -37,6 +38,7 @@ impl LoggingSink {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.log.lock().unwrap().len()
     }

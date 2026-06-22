@@ -38,10 +38,12 @@ pub struct WorkerConfig {
     /// Database URL — Worker uses it for IVR / queue state if needed.
     /// Can be empty if Worker operates in stateless mode.
     #[serde(default = "default_database_url")]
+    #[allow(dead_code)]
     pub database_url: String,
 
     /// Recording root directory
     #[serde(default = "default_recording_path")]
+    #[allow(dead_code)]
     pub recording_path: String,
 
     /// Heartbeat interval in seconds

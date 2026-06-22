@@ -9,6 +9,19 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Check the actual table name used by the main crate
         let table = "rustpbx_call_records";
+
+        // The base table is created by the main `rustpbx` binary; if this DB
+        // hasn't been provisioned yet (control-only / fresh SQLite), skip the
+        // ALTER instead of crashing. Re-running control after main provisions
+        // the schema will add the column.
+        if !manager.has_table(table).await? {
+            tracing::warn!(
+                table,
+                "base table missing — skipping tenant_id column (run the main rustpbx binary to provision the shared schema)"
+            );
+            return Ok(());
+        }
+
         if !manager.has_column(table, "tenant_id").await? {
             manager
                 .alter_table(

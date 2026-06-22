@@ -47,9 +47,9 @@ pub mod command;
 pub mod handle;
 pub mod logging_sink;
 
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge};
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 pub use command::{
     MediaCommand, MediaEvent, MediaSourceSpec, QualityReport, RecordingFormat, RecordingResult,
     TrackSelector,

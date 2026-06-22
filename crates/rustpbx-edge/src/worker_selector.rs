@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WorkerEndpoint {
     pub worker_id: String,
     /// Internal SIP contact: sip:<ip>:<port>

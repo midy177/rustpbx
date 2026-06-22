@@ -19,7 +19,6 @@ mod helpers;
 
 use futures::{SinkExt, StreamExt};
 use futures::stream::SplitSink;
-use helpers::sipbot_helper::TestUa;
 use helpers::test_server::{TEST_TOKEN, TestPbx};
 use rustpbx::config::{MediaProxyMode, ProxyConfig, RecordingPolicy};
 use std::sync::Arc;
@@ -47,25 +46,11 @@ impl EventLog {
     async fn snapshot(&self) -> Vec<serde_json::Value> {
         self.events.lock().await.clone()
     }
-    async fn has(&self, event_type: &str) -> bool {
-        self.events.lock().await.iter().any(|v| {
-            v.get("event_type").and_then(|s| s.as_str()) == Some(event_type)
-        })
-    }
-    async fn count(&self, event_type: &str) -> usize {
-        self.events.lock().await.iter().filter(|v| {
-            v.get("event_type").and_then(|s| s.as_str()) == Some(event_type)
-        }).count()
-    }
     async fn has_action_id(&self, action_id: &str) -> bool {
         self.events.lock().await.iter().any(|v| {
             v.get("action_id").and_then(|s| s.as_str()) == Some(action_id)
         })
     }
-}
-
-async fn event_type_name(v: &serde_json::Value) -> Option<String> {
-    v.get("event_type").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
 fn start_bg_reader(mut ws_rx: WsRx, log: Arc<EventLog>) -> tokio::sync::oneshot::Sender<()> {
@@ -99,32 +84,12 @@ fn start_bg_reader(mut ws_rx: WsRx, log: Arc<EventLog>) -> tokio::sync::oneshot:
     stop_tx
 }
 
-async fn send_action(ws_tx: &WsTx, log: &EventLog, action: &str, params: serde_json::Value) -> String {
-    let id = Uuid::new_v4().to_string();
-    let json = serde_json::to_string(&serde_json::json!({
-        "rwi": "1.0", "action_id": id, "action": action, "params": params,
-    })).unwrap();
-    ws_tx.lock().await.send(Message::Text(json.into())).await.unwrap();
-    id
-}
-
-async fn wait_action_response(log: &EventLog, action_id: &str, timeout_secs: u64) {
-    let dl = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if log.has_action_id(action_id).await {
-            return;
-        }
-        if dl.elapsed() > Duration::from_secs(timeout_secs) {
-            panic!("timeout waiting for action response: {action_id}");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 struct TestCtx {
     pbx: TestPbx,
     _stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    ws_tx: WsTx,
+    /// Held (not read) to keep the WebSocket sink alive so the background
+    /// reader can keep receiving events.
+    _ws_tx: WsTx,
     log: Arc<EventLog>,
 }
 
@@ -181,44 +146,13 @@ impl TestCtx {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        Self { pbx, _stop_tx: Some(stop_tx), ws_tx, log }
+        Self { pbx, _stop_tx: Some(stop_tx), _ws_tx: ws_tx, log }
     }
 
-    fn sip_host(&self) -> String { self.pbx.sip_host() }
-
-    fn gw(&self) -> parking_lot::RwLockReadGuard<rustpbx::rwi::RwiGateway> {
-        if count > 0 {
-            println!("  ✅ {et: <30} x{count: <3}  ({desc})");
-            total_received += 1;
-        } else {
-            println!("  ❌ {et: <30} x0    ({desc})");
-        }
+    /// Borrow the RWI gateway for injecting events directly in tests.
+    fn gw(&self) -> parking_lot::RwLockReadGuard<'_, rustpbx::rwi::RwiGateway> {
+        self.pbx.gateway.read()
     }
-
-    // Print all events as JSON
-    println!("\n═══ All Received Events (Full JSON) ═══");
-    for (i, ev) in events.iter().enumerate() {
-        let et = ev.get("event_type").and_then(|s| s.as_str()).unwrap_or("?");
-        println!(
-            "\n[{i}] event_type={et}\n{}",
-            serde_json::to_string_pretty(ev).unwrap_or_default()
-        );
-    }
-
-    println!("\n╔══════════════════════════════════════════════════════════╗");
-    println!("║  Results: {total_received}/{LEN_CHECKS} event types received                         ║");
-    println!("╚══════════════════════════════════════════════════════════╝\n");
-
-    if total_received < checks.len() {
-        println!("Note: Some events not received. Check individual results above.");
-        println!("Known gaps:");
-        println!("  — DTMF: event type exists but never emitted by SIP→RWI bridge");
-        println!("  — Auto-record_started: only emitted via explicit RWI command");
-        println!("  — Events sent via send_event_to_call_owner require WS to own the call");
-    }
-
-    callee.stop();
-    ctx.pbx.stop();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -234,7 +168,7 @@ async fn test_new_api_event_structs() {
     println!("║   Uses CallRinging / CallHangup structs + gw.broadcast()   ║");
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
-    let mut ctx = TestCtx::new().await;
+    let ctx = TestCtx::new().await;
     println!("PBX: RWI={}", ctx.pbx.rwi_url);
 
     let call_id = "new-api-demo-001";
@@ -310,8 +244,11 @@ async fn test_new_api_event_structs() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CC addon event structs (new API)
+// Gated: the `addon-cc` module (`addons::cc::cc_events`) is not yet implemented
+// (empty feature + empty dir). This test will compile once the module lands.
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "addon-cc")]
 #[tokio::test]
 async fn test_new_cc_event_structs() {
     let _ = tracing_subscriber::fmt::try_init();

@@ -17,10 +17,11 @@ struct DnEventCapture {
 impl DnEventCapture {
     fn collect(&mut self) {
         while let Ok(entry) = self._rx.try_recv() {
-            if let crate::rwi::proto::RwiEvent::Custom(flat) = &entry.event {
-                if flat.event_type.contains("dn") || flat.event_type.contains("state") {
-                    self.events.push(flat.event_type.to_string());
-                }
+            // RwiEvent currently has a single `Custom` variant (enum→struct migration),
+            // so this binding is irrefutable.
+            let crate::rwi::proto::RwiEvent::Custom(flat) = &entry.event;
+            if flat.event_type.contains("dn") || flat.event_type.contains("state") {
+                self.events.push(flat.event_type.to_string());
             }
         }
     }

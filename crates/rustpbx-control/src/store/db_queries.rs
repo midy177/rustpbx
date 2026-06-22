@@ -8,7 +8,7 @@ impl Store {
         &self,
         rec: &crate::grpc::proto::control::CallRecordReport,
     ) -> Result<()> {
-        use chrono::{DateTime, TimeZone, Utc};
+        use chrono::{TimeZone, Utc};
         use sea_orm::{Statement, Value};
 
         let start = Utc.timestamp_millis_opt(rec.start_time_unix_ms).single();
@@ -58,15 +58,12 @@ impl Store {
     }
 
     /// Load all active trunks from DB, optionally filtered by tenant_id.
-    pub async fn load_trunks(
-        &self,
-        tenant_id: Option<i64>,
-    ) -> Result<Vec<TrunkConfigProto>> {
+    pub async fn load_trunks(&self, tenant_id: Option<i64>) -> Result<Vec<TrunkConfigProto>> {
         // We read directly from the shared rustpbx sip_trunk table.
         // The table name is rustpbx_sip_trunks — we use a raw query
         // so we don't need to re-declare the full sea-orm entity here.
-        use sea_orm::Statement;
         use sea_orm::ConnectionTrait;
+        use sea_orm::Statement;
 
         let (sql, values) = if let Some(tid) = tenant_id {
             (
@@ -237,21 +234,28 @@ impl Store {
 }
 
 fn row_to_trunk_view(row: &sea_orm::QueryResult) -> Result<crate::store::TrunkView> {
-    use sea_orm::TryGetable;
     let sip_server: Option<String> = row.try_get("", "sip_server").ok();
     let outbound_proxy: Option<String> = row.try_get("", "outbound_proxy").ok();
-    let allowed_ips_json: Option<serde_json::Value> =
-        row.try_get::<Option<serde_json::Value>>("", "allowed_ips").ok().flatten();
-    let did_json: Option<serde_json::Value> =
-        row.try_get::<Option<serde_json::Value>>("", "did_numbers").ok().flatten();
+    let allowed_ips_json: Option<serde_json::Value> = row
+        .try_get::<Option<serde_json::Value>>("", "allowed_ips")
+        .ok()
+        .flatten();
+    let did_json: Option<serde_json::Value> = row
+        .try_get::<Option<serde_json::Value>>("", "did_numbers")
+        .ok()
+        .flatten();
     let auth_username: Option<String> = row.try_get("", "auth_username").ok();
 
     Ok(crate::store::TrunkView {
         id: row.try_get("", "id")?,
         name: row.try_get("", "name")?,
         dest: sip_server.or(outbound_proxy),
-        transport: row.try_get("", "sip_transport").unwrap_or_else(|_| "udp".into()),
-        direction: row.try_get("", "direction").unwrap_or_else(|_| "bidirectional".into()),
+        transport: row
+            .try_get("", "sip_transport")
+            .unwrap_or_else(|_| "udp".into()),
+        direction: row
+            .try_get("", "direction")
+            .unwrap_or_else(|_| "bidirectional".into()),
         has_auth: auth_username.as_deref().is_some_and(|u| !u.is_empty()),
         register_enabled: row.try_get("", "register_enabled").unwrap_or(false),
         is_active: row.try_get("", "is_active").unwrap_or(true),
@@ -263,9 +267,10 @@ fn row_to_trunk_view(row: &sea_orm::QueryResult) -> Result<crate::store::TrunkVi
 }
 
 fn row_to_route_view(row: &sea_orm::QueryResult) -> Result<crate::store::RouteView> {
-    use sea_orm::TryGetable;
-    let target_trunks_json: Option<serde_json::Value> =
-        row.try_get::<Option<serde_json::Value>>("", "target_trunks").ok().flatten();
+    let target_trunks_json: Option<serde_json::Value> = row
+        .try_get::<Option<serde_json::Value>>("", "target_trunks")
+        .ok()
+        .flatten();
     let target_trunks = target_trunks_json
         .as_ref()
         .and_then(|v| {
@@ -283,7 +288,9 @@ fn row_to_route_view(row: &sea_orm::QueryResult) -> Result<crate::store::RouteVi
         name: row.try_get("", "name")?,
         description: row.try_get("", "description").ok(),
         priority: row.try_get("", "priority").unwrap_or(0),
-        direction: row.try_get("", "direction").unwrap_or_else(|_| "any".into()),
+        direction: row
+            .try_get("", "direction")
+            .unwrap_or_else(|_| "any".into()),
         source_pattern: row.try_get("", "source_pattern").ok(),
         destination_pattern: row.try_get("", "destination_pattern").ok(),
         target_trunks,
@@ -294,19 +301,19 @@ fn row_to_route_view(row: &sea_orm::QueryResult) -> Result<crate::store::RouteVi
 
 // ── Row converters ────────────────────────────────────────────────────────────
 
-fn row_to_trunk_proto(
-    row: &sea_orm::QueryResult,
-) -> Result<TrunkConfigProto> {
-    use sea_orm::TryGetable;
-
+fn row_to_trunk_proto(row: &sea_orm::QueryResult) -> Result<TrunkConfigProto> {
     let id: i64 = row.try_get("", "id")?;
     let name: String = row.try_get("", "name")?;
     let sip_server: Option<String> = row.try_get("", "sip_server").ok();
     let outbound_proxy: Option<String> = row.try_get("", "outbound_proxy").ok();
-    let sip_transport: String = row.try_get("", "sip_transport").unwrap_or_else(|_| "udp".into());
+    let sip_transport: String = row
+        .try_get("", "sip_transport")
+        .unwrap_or_else(|_| "udp".into());
     let auth_username: Option<String> = row.try_get("", "auth_username").ok();
     let auth_password: Option<String> = row.try_get("", "auth_password").ok();
-    let direction: String = row.try_get("", "direction").unwrap_or_else(|_| "bidirectional".into());
+    let direction: String = row
+        .try_get("", "direction")
+        .unwrap_or_else(|_| "bidirectional".into());
     let register_enabled: bool = row.try_get("", "register_enabled").unwrap_or(false);
     let register_expires: Option<i32> = row.try_get("", "register_expires").ok();
     let rewrite_hostport: bool = row.try_get("", "rewrite_hostport").unwrap_or(true);
@@ -315,7 +322,10 @@ fn row_to_trunk_proto(
     let max_cps: Option<i32> = row.try_get("", "max_cps").ok();
     let max_concurrent: Option<i32> = row.try_get("", "max_concurrent").ok();
 
-    let dest = sip_server.clone().or(outbound_proxy.clone()).unwrap_or_default();
+    let dest = sip_server
+        .clone()
+        .or(outbound_proxy.clone())
+        .unwrap_or_default();
     let backup_dest = outbound_proxy.filter(|p| p != &dest);
 
     let allowed_ips_json: Option<serde_json::Value> = row
@@ -336,7 +346,9 @@ fn row_to_trunk_proto(
         .flatten();
     let register_extra_headers = reg_headers_json
         .as_ref()
-        .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok())
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
         .unwrap_or_default();
 
     let metadata_json: Option<serde_json::Value> = row
@@ -379,16 +391,21 @@ fn row_to_trunk_proto(
 fn row_to_route_proto(
     row: &sea_orm::QueryResult,
 ) -> Result<Option<crate::grpc::proto::control::RouteRuleProto>> {
-    use crate::grpc::proto::control::{MatchConditionsProto, RewriteRulesProto, RouteActionProto, RouteRuleProto};
-    use sea_orm::TryGetable;
+    use crate::grpc::proto::control::{
+        MatchConditionsProto, RewriteRulesProto, RouteActionProto, RouteRuleProto,
+    };
 
     let name: String = row.try_get("", "name")?;
     let description: Option<String> = row.try_get("", "description").ok();
     let priority: i32 = row.try_get("", "priority").unwrap_or(0);
-    let direction: String = row.try_get("", "direction").unwrap_or_else(|_| "any".into());
+    let direction: String = row
+        .try_get("", "direction")
+        .unwrap_or_else(|_| "any".into());
     let source_pattern: Option<String> = row.try_get("", "source_pattern").ok();
     let dest_pattern: Option<String> = row.try_get("", "destination_pattern").ok();
-    let selection_strategy: String = row.try_get("", "selection_strategy").unwrap_or_else(|_| "rr".into());
+    let selection_strategy: String = row
+        .try_get("", "selection_strategy")
+        .unwrap_or_else(|_| "rr".into());
     let hash_key: Option<String> = row.try_get("", "hash_key").ok();
 
     let match_conditions = MatchConditionsProto {
@@ -405,7 +422,9 @@ fn row_to_route_proto(
         .as_ref()
         .and_then(|v| {
             #[derive(serde::Deserialize)]
-            struct TrunkRef { name: String }
+            struct TrunkRef {
+                name: String,
+            }
             serde_json::from_value::<Vec<TrunkRef>>(v.clone()).ok()
         })
         .map(|refs| refs.into_iter().map(|r| r.name).collect())
@@ -416,19 +435,17 @@ fn row_to_route_proto(
         .ok()
         .flatten();
     let rewrite = rewrite_json.as_ref().map(|v| {
-        let s = |k: &str| -> Option<String> {
-            v.get(k).and_then(|x| x.as_str()).map(String::from)
-        };
+        let s = |k: &str| -> Option<String> { v.get(k).and_then(|x| x.as_str()).map(String::from) };
         let headers: std::collections::HashMap<String, String> = v
             .get("headers")
             .and_then(|h| serde_json::from_value(h.clone()).ok())
             .unwrap_or_default();
         RewriteRulesProto {
-            from_user:        s("from.user").or_else(|| s("from_user")),
-            from_host:        s("from.host").or_else(|| s("from_host")),
-            to_user:          s("to.user").or_else(|| s("to_user")),
-            to_host:          s("to.host").or_else(|| s("to_host")),
-            to_port:          s("to.port").or_else(|| s("to_port")),
+            from_user: s("from.user").or_else(|| s("from_user")),
+            from_host: s("from.host").or_else(|| s("from_host")),
+            to_user: s("to.user").or_else(|| s("to_user")),
+            to_host: s("to.host").or_else(|| s("to_host")),
+            to_port: s("to.port").or_else(|| s("to_port")),
             request_uri_user: s("request_uri.user").or_else(|| s("request_uri_user")),
             request_uri_host: s("request_uri.host").or_else(|| s("request_uri_host")),
             request_uri_port: s("request_uri.port").or_else(|| s("request_uri_port")),

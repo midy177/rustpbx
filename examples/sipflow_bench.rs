@@ -102,9 +102,13 @@ struct BenchResult {
     disk_bytes: u64,
     query_flow_ms: f64,
     query_media_ms: f64,
+    #[allow(dead_code)]
     flow_count: usize,
+    #[allow(dead_code)]
     stats_count: usize,
+    #[allow(dead_code)]
     stats_packets: usize,
+    #[allow(dead_code)]
     isolation_ok: bool,
 }
 

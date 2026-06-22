@@ -74,6 +74,9 @@ impl WorkerRegistry {
         }
     }
 
+    /// Mark a worker as draining (stop routing new calls to it).
+    /// Unused until the Edge dispatch path is wired (see cloud-native TODO).
+    #[allow(dead_code)]
     pub fn drain(&self, worker_id: &str) {
         if let Some(mut entry) = self.workers.get_mut(worker_id) {
             entry.draining = true;
@@ -94,10 +97,15 @@ impl WorkerRegistry {
     }
 
     /// Select the least-loaded healthy worker for a new call.
+    /// Unused until the Edge dispatch path is wired (see cloud-native TODO).
+    #[allow(dead_code)]
     pub fn select_for_call(&self) -> Option<WorkerEntry> {
         self.available().into_iter().next()
     }
 
+    /// Explicitly remove a worker entry.
+    /// Unused until the Edge dispatch path is wired (see cloud-native TODO).
+    #[allow(dead_code)]
     pub fn remove(&self, worker_id: &str) {
         self.workers.remove(worker_id);
         info!(worker_id, "worker removed");
