@@ -38,6 +38,7 @@ impl MigrationTrait for Migration {
             manager
                 .create_index(
                     Index::create()
+                        .if_not_exists()
                         .table(Alias::new("rustpbx_routing"))
                         .name("idx_routing_tenant_id")
                         .col(Alias::new("tenant_id"))

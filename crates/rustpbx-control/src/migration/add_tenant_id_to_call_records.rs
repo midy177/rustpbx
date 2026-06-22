@@ -39,6 +39,7 @@ impl MigrationTrait for Migration {
             manager
                 .create_index(
                     Index::create()
+                        .if_not_exists()
                         .table(Alias::new(table))
                         .name("idx_call_records_tenant_id")
                         .col(Alias::new("tenant_id"))

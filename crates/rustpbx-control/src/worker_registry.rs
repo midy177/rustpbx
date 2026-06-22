@@ -116,6 +116,27 @@ impl WorkerRegistry {
         self.workers.iter().map(|e| e.clone()).collect()
     }
 
+    /// Remove workers whose heartbeat has been stale for more than twice the
+    /// health timeout (e.g. 30s timeout → reaped at 60s). Called periodically
+    /// by a background task in `main` so dead workers don't accumulate in the
+    /// registry or the admin API. Returns the number of workers removed.
+    pub fn reap_stale(&self) -> usize {
+        let threshold = self.heartbeat_timeout.saturating_mul(2);
+        let before = self.workers.len();
+        self.workers.retain(|_id, entry| {
+            let stale = entry.last_heartbeat.elapsed() > threshold;
+            if stale {
+                info!(
+                    worker_id = %entry.worker_id,
+                    sip_addr = %entry.sip_addr,
+                    "reaped stale worker"
+                );
+            }
+            !stale
+        });
+        before - self.workers.len()
+    }
+
     /// Heartbeat-timeout threshold used to compute worker health.
     pub fn heartbeat_timeout(&self) -> Duration {
         self.heartbeat_timeout

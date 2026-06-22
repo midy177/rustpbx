@@ -92,6 +92,7 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
+                    .if_not_exists()
                     .table(Entity)
                     .name("idx_did_tenant_id")
                     .col(Column::TenantId)

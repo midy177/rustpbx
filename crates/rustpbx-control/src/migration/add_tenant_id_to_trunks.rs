@@ -39,6 +39,7 @@ impl MigrationTrait for Migration {
             manager
                 .create_index(
                     Index::create()
+                        .if_not_exists()
                         .table(Alias::new("rustpbx_sip_trunks"))
                         .name("idx_sip_trunks_tenant_id")
                         .col(Alias::new("tenant_id"))

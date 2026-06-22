@@ -73,7 +73,22 @@ async fn main() -> Result<()> {
     // `DatabaseConnection` is cheaply clonable (Arc inside) — keep a handle for
     // the HTTP API while `Store` owns its own clone.
     let store = Arc::new(Store::new(db.clone()));
-    let workers = Arc::new(WorkerRegistry::new(Duration::from_secs(30)));
+    let workers = Arc::new(WorkerRegistry::new(Duration::from_secs(
+        cfg.heartbeat_timeout_secs,
+    )));
+
+    // Background reaper: remove workers whose heartbeat has been stale for
+    // >2× the timeout (default 30s unhealthy → 60s reaped), so dead media
+    // nodes don't accumulate in the registry / admin API.
+    let reap_registry = Arc::clone(&workers);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.tick().await; // discard the immediate first tick
+        loop {
+            tick.tick().await;
+            reap_registry.reap_stale();
+        }
+    });
 
     let svc = ControlPlaneService::new(Arc::clone(&store), Arc::clone(&workers));
     let grpc_svc = ControlPlaneServer::new(svc);

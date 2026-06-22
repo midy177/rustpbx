@@ -29,6 +29,13 @@ pub struct ControlConfig {
     /// Log level / filter
     #[serde(default = "default_log")]
     pub log: String,
+
+    /// Worker heartbeat timeout in seconds. A Media Worker is marked unhealthy
+    /// (excluded from routing) once its heartbeat is older than this, and is
+    /// reaped from the registry after twice this duration.
+    /// Default 30s → unhealthy at 30s, reaped at 60s.
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
 }
 
 impl Default for ControlConfig {
@@ -41,6 +48,7 @@ impl Default for ControlConfig {
             admin_password: default_admin_password(),
             web_dir: default_web_dir(),
             log: default_log(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
         }
     }
 }
@@ -79,4 +87,8 @@ fn default_web_dir() -> String {
 
 fn default_log() -> String {
     "info".to_string()
+}
+
+fn default_heartbeat_timeout_secs() -> u64 {
+    30
 }
