@@ -1,0 +1,93 @@
+//! Raft type configuration and the application command/response types.
+//!
+//! The replicated state is the worker registry: a high-churn, in-memory map of
+//! live Media Workers that every control-plane replica must agree on. Persistent
+//! config/CDR stays in the DB; only this ephemeral cluster state goes through Raft.
+
+use openraft::BasicNode;
+use serde::{Deserialize, Serialize};
+
+/// Node id type — a simple monotonic integer assigned per control replica.
+pub type NodeId = u64;
+
+/// A serializable snapshot of one registered Media Worker.
+///
+/// Mirrors `worker_registry::WorkerEntry` but uses wire-friendly types: times
+/// are unix-millis (`i64`) instead of `tokio::time::Instant` (which is neither
+/// serializable nor meaningful across processes).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRecord {
+    pub worker_id: String,
+    pub sip_addr: String,
+    pub rtp_external_ip: String,
+    pub rtp_start_port: u32,
+    pub rtp_end_port: u32,
+    pub max_concurrent: u32,
+    pub active_calls: u32,
+    pub cpu_usage: f32,
+    /// Unix-millis when the worker first registered.
+    pub registered_at_ms: i64,
+    /// Unix-millis of the last heartbeat (or registration).
+    pub last_heartbeat_ms: i64,
+    pub draining: bool,
+}
+
+impl WorkerRecord {
+    pub fn available_capacity(&self) -> u32 {
+        self.max_concurrent.saturating_sub(self.active_calls)
+    }
+
+    /// Healthy = not draining and heartbeat within `timeout_ms` of `now_ms`.
+    pub fn is_healthy(&self, now_ms: i64, timeout_ms: i64) -> bool {
+        !self.draining && now_ms.saturating_sub(self.last_heartbeat_ms) < timeout_ms
+    }
+}
+
+/// Commands applied to the replicated worker registry (the Raft `AppData`).
+///
+/// Every mutation of the registry goes through `Raft::client_write` with one of
+/// these, so all replicas apply the same ordered log. Timestamps are supplied by
+/// the leader at propose time (`*_ms` fields) so application is deterministic
+/// across replicas (no replica reads its own clock during `apply`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RegistryCommand {
+    /// Insert or replace a worker (register / re-register).
+    Register { record: WorkerRecord },
+    /// Update load fields + refresh the heartbeat timestamp.
+    Heartbeat {
+        worker_id: String,
+        active_calls: u32,
+        cpu_usage: f32,
+        at_ms: i64,
+    },
+    /// Mark a worker as draining (stop routing new calls to it).
+    Drain { worker_id: String },
+    /// Remove a worker outright.
+    Remove { worker_id: String },
+    /// Remove every worker whose heartbeat is older than `before_ms`.
+    ReapStale { before_ms: i64 },
+}
+
+// Note: `AppData` / `AppDataResponse` have blanket impls for any
+// `Send + Sync + 'static` (serde) type, so we do NOT impl them manually.
+
+/// Response from applying a `RegistryCommand`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RegistryResponse {
+    /// Whether the target worker was known at apply time (used by Heartbeat to
+    /// tell an unknown worker to drain/re-register).
+    pub known: bool,
+    /// Number of entries removed (ReapStale / Remove).
+    pub removed: u32,
+}
+
+openraft::declare_raft_types!(
+    /// Raft type configuration for the control-plane worker registry.
+    pub TypeConfig:
+        D = RegistryCommand,
+        R = RegistryResponse,
+        NodeId = NodeId,
+        Node = BasicNode,
+        Entry = openraft::Entry<TypeConfig>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
+);

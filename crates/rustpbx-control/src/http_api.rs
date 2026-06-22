@@ -8,9 +8,9 @@
 //! in-memory session map. Tenant-scoped accounts are a future enhancement —
 //! for now the super-admin can scope views to a tenant from the UI.
 
+use crate::raft::registry::RaftRegistry;
 use crate::store::Store;
 use crate::tenant_service::{CreateTenantRequest, TenantService, UpdateTenantRequest};
-use crate::worker_registry::WorkerRegistry;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -38,7 +38,7 @@ const SESSION_TTL_HOURS: i64 = 12;
 pub struct HttpState {
     pub db: DatabaseConnection,
     pub store: Arc<Store>,
-    pub workers: Arc<WorkerRegistry>,
+    pub workers: RaftRegistry,
     pub sessions: Arc<DashMap<String, Session>>,
     pub admin_username: String,
     pub admin_password: String,
@@ -221,9 +221,13 @@ async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
         .await
         .map_err(ApiError::internal)?
         .len();
-    let all = state.workers.all();
-    let timeout = state.workers.heartbeat_timeout();
-    let workers_healthy = all.iter().filter(|w| w.is_healthy(timeout)).count();
+    let all = state.workers.all().await;
+    let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let workers_healthy = all
+        .iter()
+        .filter(|w| w.is_healthy(now_ms, timeout_ms))
+        .count();
     let active_calls = all.iter().map(|w| w.active_calls).sum();
     Ok(Json(Stats {
         tenants,
@@ -331,22 +335,26 @@ async fn list_routes(
 }
 
 async fn list_workers(State(state): State<HttpState>) -> Json<Vec<WorkerView>> {
-    let timeout = state.workers.heartbeat_timeout();
+    let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let views = state
         .workers
         .all()
+        .await
         .into_iter()
         .map(|w| WorkerView {
-            healthy: w.is_healthy(timeout),
+            healthy: w.is_healthy(now_ms, timeout_ms),
             available_capacity: w.available_capacity(),
-            last_heartbeat_secs_ago: w.last_heartbeat.elapsed().as_secs(),
+            last_heartbeat_secs_ago: now_ms.saturating_sub(w.last_heartbeat_ms).max(0) as u64 / 1000,
+            registered_at: chrono::DateTime::from_timestamp_millis(w.registered_at_ms)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
             worker_id: w.worker_id,
             sip_addr: w.sip_addr,
             rtp_external_ip: w.rtp_external_ip,
             active_calls: w.active_calls,
             max_concurrent: w.max_concurrent,
             cpu_usage: w.cpu_usage,
-            registered_at: w.registered_at.to_rfc3339(),
             draining: w.draining,
         })
         .collect();

@@ -6,10 +6,9 @@ use crate::{
         WorkerInfo, WorkerList,
         control_plane_server::ControlPlane,
     },
+    raft::registry::RaftRegistry,
     store::Store,
-    worker_registry::WorkerRegistry,
 };
-use chrono::Utc;
 use futures::Stream;
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::broadcast;
@@ -20,12 +19,12 @@ use tracing::{info, warn};
 
 pub struct ControlPlaneService {
     pub store: Arc<Store>,
-    pub workers: Arc<WorkerRegistry>,
+    pub workers: RaftRegistry,
     pub change_tx: broadcast::Sender<ConfigChangeEvent>,
 }
 
 impl ControlPlaneService {
-    pub fn new(store: Arc<Store>, workers: Arc<WorkerRegistry>) -> Self {
+    pub fn new(store: Arc<Store>, workers: RaftRegistry) -> Self {
         let (change_tx, _) = broadcast::channel(256);
         Self { store, workers, change_tx }
     }
@@ -158,23 +157,27 @@ impl ControlPlane for ControlPlaneService {
         &self,
         request: Request<WorkerInfo>,
     ) -> Result<Response<RegisterAck>, Status> {
-        use crate::worker_registry::WorkerEntry;
+        use crate::raft::types::WorkerRecord;
         let info = request.into_inner();
         info!(worker_id = %info.worker_id, sip_addr = %info.sip_addr, max = info.max_concurrent, "worker register");
 
-        self.workers.register(WorkerEntry {
-            worker_id: info.worker_id,
-            sip_addr: info.sip_addr,
-            rtp_external_ip: info.rtp_external_ip,
-            rtp_start_port: info.rtp_start_port,
-            rtp_end_port: info.rtp_end_port,
-            max_concurrent: info.max_concurrent,
-            active_calls: info.active_calls,
-            cpu_usage: 0.0,
-            registered_at: Utc::now(),
-            last_heartbeat: tokio::time::Instant::now(),
-            draining: false,
-        });
+        self.workers
+            .register(WorkerRecord {
+                worker_id: info.worker_id,
+                sip_addr: info.sip_addr,
+                rtp_external_ip: info.rtp_external_ip,
+                rtp_start_port: info.rtp_start_port,
+                rtp_end_port: info.rtp_end_port,
+                max_concurrent: info.max_concurrent,
+                active_calls: info.active_calls,
+                cpu_usage: 0.0,
+                // Timestamps are stamped by the registry at propose time.
+                registered_at_ms: 0,
+                last_heartbeat_ms: 0,
+                draining: false,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
 
         Ok(Response::new(RegisterAck { accepted: true }))
     }
@@ -184,12 +187,12 @@ impl ControlPlane for ControlPlaneService {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let hb = request.into_inner();
-        let known = self.workers.heartbeat(
-            &hb.worker_id,
-            hb.active_calls,
-            hb.cpu_usage,
-            hb.rtp_ports_used,
-        );
+        let _ = hb.rtp_ports_used; // reserved for future metrics
+        let known = self
+            .workers
+            .heartbeat(&hb.worker_id, hb.active_calls, hb.cpu_usage)
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
         Ok(Response::new(HeartbeatResponse { drain: !known }))
     }
 
@@ -205,6 +208,7 @@ impl ControlPlane for ControlPlaneService {
         let workers = self
             .workers
             .available()
+            .await
             .into_iter()
             .map(|w| WorkerInfo {
                 worker_id: w.worker_id,

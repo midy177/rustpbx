@@ -3,9 +3,9 @@ mod grpc;
 mod http_api;
 mod migration;
 mod models;
+mod raft;
 mod store;
 mod tenant_service;
-mod worker_registry;
 
 use crate::{
     grpc::{
@@ -14,8 +14,8 @@ use crate::{
     },
     http_api::HttpState,
     migration::ControlMigrator,
+    raft::registry::RaftRegistry,
     store::Store,
-    worker_registry::WorkerRegistry,
 };
 use anyhow::Result;
 use dashmap::DashMap;
@@ -73,31 +73,39 @@ async fn main() -> Result<()> {
     // `DatabaseConnection` is cheaply clonable (Arc inside) — keep a handle for
     // the HTTP API while `Store` owns its own clone.
     let store = Arc::new(Store::new(db.clone()));
-    let workers = Arc::new(WorkerRegistry::new(Duration::from_secs(
-        cfg.heartbeat_timeout_secs,
-    )));
+
+    // Single-node Raft backing the worker registry. Replicated cluster state
+    // (high-churn, ephemeral) lives here; persistent config/CDR stays in the DB.
+    let workers = RaftRegistry::start(
+        1, // node id; multi-replica membership comes in a later phase
+        Duration::from_secs(cfg.heartbeat_timeout_secs),
+    )
+    .await?;
 
     // Background reaper: remove workers whose heartbeat has been stale for
     // >2× the timeout (default 30s unhealthy → 60s reaped), so dead media
-    // nodes don't accumulate in the registry / admin API.
-    let reap_registry = Arc::clone(&workers);
+    // nodes don't accumulate in the registry / admin API. Reaping is a Raft
+    // write, so it's a no-op on followers' behalf — only the leader commits it.
+    let reap_registry = workers.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.tick().await; // discard the immediate first tick
         loop {
             tick.tick().await;
-            reap_registry.reap_stale();
+            if let Err(e) = reap_registry.reap_stale().await {
+                tracing::warn!(error = %e, "worker reap failed");
+            }
         }
     });
 
-    let svc = ControlPlaneService::new(Arc::clone(&store), Arc::clone(&workers));
+    let svc = ControlPlaneService::new(Arc::clone(&store), workers.clone());
     let grpc_svc = ControlPlaneServer::new(svc);
 
     // ── HTTP admin API + SPA ────────────────────────────────────────────────
     let http_state = HttpState {
         db,
         store: Arc::clone(&store),
-        workers: Arc::clone(&workers),
+        workers: workers.clone(),
         sessions: Arc::new(DashMap::new()),
         admin_username: cfg.admin_username.clone(),
         admin_password: cfg.admin_password.clone(),

@@ -1,0 +1,68 @@
+[package]
+name = "rustpbx-control"
+version = "0.1.0"
+edition = "2024"
+description = "RustPBX Control Plane — multi-tenant config distribution and CDR collection"
+license = "MIT"
+
+[[bin]]
+name = "rustpbx-control"
+path = "src/main.rs"
+
+[dependencies]
+rustpbx-core = { path = "../rustpbx-core" }
+
+# gRPC
+tonic = { version = "0.13", features = ["transport", "tls-ring"] }
+prost = "0.13"
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = "0.7"
+
+# Web (admin console HTTP API + SPA hosting)
+axum = { version = "0.8", features = ["tokio"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Database
+sea-orm = { version = "1.1", features = [
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+    "sqlx-sqlite",
+    "sqlx-mysql",
+] }
+sea-orm-migration = { version = "1.1", features = [
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+    "sqlx-sqlite",
+    "sqlx-mysql",
+] }
+
+# Config & serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+dotenvy = "0.15"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+async-trait = "0.1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+
+# Raft consensus for replicating high-churn in-memory state (WorkerRegistry)
+# across control-plane replicas. Persistent config/CDR stays in the DB.
+# `storage-v2` unseals the split RaftLogStorage / RaftStateMachine traits so we
+# can implement them in this crate.
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"
