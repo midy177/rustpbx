@@ -18,7 +18,7 @@ use tracing::info;
 use super::log_store::LogStore;
 use super::network::NetworkFactory;
 use super::state_machine::StateMachineStore;
-use super::types::{NodeId, RegistryCommand, TypeConfig, WorkerRecord};
+use super::types::{node_addr, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord};
 
 /// Current wall-clock in unix-millis. Used by the leader to stamp commands so
 /// state-machine application stays deterministic across replicas.
@@ -88,15 +88,16 @@ impl RaftRegistry {
         Ok(this)
     }
 
-    /// Start a cluster-mode Raft node advertising `advertise_addr` to peers.
+    /// Start a cluster-mode Raft node advertising both its Raft transport addr
+    /// (`advertise_addr`) and its business gRPC addr (`grpc_addr`) to peers.
     ///
     /// If `bootstrap` is true, this node initializes a fresh single-voter
-    /// cluster (with its real advertised address) that other nodes then join
-    /// via `add_learner` + `change_membership`. If false, the node starts
-    /// uninitialized and waits to be added to an existing cluster by a leader.
+    /// cluster that other nodes then join via `add_learner` + `change_membership`.
+    /// If false, the node starts uninitialized and waits to be added by a leader.
     pub async fn start_cluster(
         node_id: NodeId,
         advertise_addr: &str,
+        grpc_addr: &str,
         bootstrap: bool,
         heartbeat_timeout: Duration,
     ) -> Result<Self> {
@@ -104,9 +105,9 @@ impl RaftRegistry {
 
         if bootstrap && !this.raft.is_initialized().await? {
             let mut members = BTreeMap::new();
-            members.insert(node_id, openraft::BasicNode::new(advertise_addr.to_string()));
+            members.insert(node_id, node_addr::make(advertise_addr, grpc_addr));
             match this.raft.initialize(members).await {
-                Ok(()) => info!(node_id, advertise_addr, "raft cluster bootstrapped (single voter)"),
+                Ok(()) => info!(node_id, advertise_addr, grpc_addr, "raft cluster bootstrapped (single voter)"),
                 Err(e) => info!(node_id, error = %e, "raft bootstrap skipped"),
             }
         } else {
@@ -130,11 +131,12 @@ impl RaftRegistry {
     }
 
     /// Add a node as a learner (non-voting replica that receives the log).
-    /// First step of joining a new replica; follow with `change_membership` to
-    /// promote it to a voter.
-    pub async fn add_learner(&self, node_id: NodeId, addr: &str) -> Result<()> {
+    /// `raft_addr` is the new node's Raft transport addr; `grpc_addr` its
+    /// business gRPC addr (used for write-forwarding). First step of joining a
+    /// new replica; follow with `change_membership` to promote it to a voter.
+    pub async fn add_learner(&self, node_id: NodeId, raft_addr: &str, grpc_addr: &str) -> Result<()> {
         self.raft
-            .add_learner(node_id, openraft::BasicNode::new(addr.to_string()), true)
+            .add_learner(node_id, node_addr::make(raft_addr, grpc_addr), true)
             .await?;
         Ok(())
     }
@@ -164,6 +166,62 @@ impl RaftRegistry {
         }
     }
 
+    /// Propose a registry mutation through Raft. If this node is not the leader,
+    /// openraft returns `ForwardToLeader`; we then forward the serialized command
+    /// to the leader's `ProposeWrite` gRPC so the write still lands. This makes a
+    /// worker's register/heartbeat work no matter which replica it hit.
+    async fn propose(&self, cmd: RegistryCommand) -> Result<RegistryResponse> {
+        match self.raft.client_write(cmd.clone()).await {
+            Ok(resp) => Ok(resp.data),
+            Err(e) => {
+                // Only ForwardToLeader is forwardable; anything else propagates.
+                let fwd = e.forward_to_leader::<openraft::BasicNode>().cloned();
+                match fwd {
+                    Some(f) => self.forward_to_leader(cmd, f).await,
+                    None => Err(e.into()),
+                }
+            }
+        }
+    }
+
+    /// Forward a command to the current leader's business gRPC (`ProposeWrite`).
+    async fn forward_to_leader(
+        &self,
+        cmd: RegistryCommand,
+        fwd: openraft::error::ForwardToLeader<NodeId, openraft::BasicNode>,
+    ) -> Result<RegistryResponse> {
+        let leader = fwd
+            .leader_node
+            .as_ref()
+            .and_then(|n| node_addr::grpc_addr(&n.addr).map(|s| s.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("no known leader to forward write to"))?;
+
+        let endpoint = if leader.starts_with("http") {
+            leader
+        } else {
+            format!("http://{leader}")
+        };
+        let command = serde_json::to_vec(&cmd)?;
+        let mut client =
+            crate::grpc::proto::control::control_plane_client::ControlPlaneClient::connect(endpoint)
+                .await?;
+        let resp = client
+            .propose_write(crate::grpc::proto::control::ProposeWriteRequest { command })
+            .await?
+            .into_inner();
+        Ok(RegistryResponse {
+            known: resp.known,
+            removed: resp.removed,
+        })
+    }
+
+    /// Apply a command that was forwarded to us as the leader. Called by the
+    /// `ProposeWrite` gRPC handler.
+    pub async fn apply_forwarded(&self, cmd: RegistryCommand) -> Result<RegistryResponse> {
+        // We're presumably the leader; if not, this re-forwards (rare race).
+        self.propose(cmd).await
+    }
+
     /// Register (or replace) a worker. `registered_at_ms` / `last_heartbeat_ms`
     /// are stamped here if zero.
     pub async fn register(&self, mut record: WorkerRecord) -> Result<()> {
@@ -172,9 +230,7 @@ impl RaftRegistry {
             record.registered_at_ms = now;
         }
         record.last_heartbeat_ms = now;
-        self.raft
-            .client_write(RegistryCommand::Register { record })
-            .await?;
+        self.propose(RegistryCommand::Register { record }).await?;
         Ok(())
     }
 
@@ -186,49 +242,44 @@ impl RaftRegistry {
         cpu_usage: f32,
     ) -> Result<bool> {
         let resp = self
-            .raft
-            .client_write(RegistryCommand::Heartbeat {
+            .propose(RegistryCommand::Heartbeat {
                 worker_id: worker_id.to_string(),
                 active_calls,
                 cpu_usage,
                 at_ms: now_ms(),
             })
             .await?;
-        Ok(resp.data.known)
+        Ok(resp.known)
     }
 
     /// Mark a worker as draining.
     #[allow(dead_code)]
     pub async fn drain(&self, worker_id: &str) -> Result<()> {
-        self.raft
-            .client_write(RegistryCommand::Drain {
-                worker_id: worker_id.to_string(),
-            })
-            .await?;
+        self.propose(RegistryCommand::Drain {
+            worker_id: worker_id.to_string(),
+        })
+        .await?;
         Ok(())
     }
 
     /// Remove a worker outright.
     #[allow(dead_code)]
     pub async fn remove(&self, worker_id: &str) -> Result<()> {
-        self.raft
-            .client_write(RegistryCommand::Remove {
-                worker_id: worker_id.to_string(),
-            })
-            .await?;
+        self.propose(RegistryCommand::Remove {
+            worker_id: worker_id.to_string(),
+        })
+        .await?;
         Ok(())
     }
 
     /// Remove workers whose heartbeat is stale past 2× the timeout. Returns the
-    /// number reaped.
+    /// number reaped. Reaping is best-effort on followers — only the leader's
+    /// reaper actually commits (a follower's propose forwards to the leader).
     pub async fn reap_stale(&self) -> Result<u32> {
         let threshold_ms = (self.heartbeat_timeout.as_millis() as i64) * 2;
         let before_ms = now_ms() - threshold_ms;
-        let resp = self
-            .raft
-            .client_write(RegistryCommand::ReapStale { before_ms })
-            .await?;
-        Ok(resp.data.removed)
+        let resp = self.propose(RegistryCommand::ReapStale { before_ms }).await?;
+        Ok(resp.removed)
     }
 
     /// All registered workers (healthy or not) — for the admin API.
@@ -361,11 +412,12 @@ mod tests {
         let hb = Duration::from_secs(30);
 
         // Node 1 bootstraps a single-voter cluster advertising its real addr.
-        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), true, hb)
+        // (grpc_addr unused here — this test writes only on the leader.)
+        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), &addr1.to_string(), true, hb)
             .await
             .unwrap();
         // Node 2 starts uninitialized, waiting to be added.
-        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), false, hb)
+        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), &addr2.to_string(), false, hb)
             .await
             .unwrap();
 
@@ -376,7 +428,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Join node 2: learner first, then promote both to voters.
-        n1.add_learner(2, &addr2.to_string()).await.unwrap();
+        n1.add_learner(2, &addr2.to_string(), &addr2.to_string()).await.unwrap();
         n1.change_membership([1, 2].into_iter().collect())
             .await
             .unwrap();
@@ -402,5 +454,71 @@ mod tests {
         let m2 = n2.metrics_summary();
         assert_eq!(m2.current_leader, Some(1), "node 2 should follow leader 1");
         assert_eq!(m2.members.len(), 2, "membership should contain both nodes");
+    }
+
+    /// Start a node's business ControlPlane gRPC server (for write-forwarding).
+    /// Uses an in-memory DB since the forwarding path only touches the registry.
+    async fn spawn_control_server(reg: &RaftRegistry, addr: std::net::SocketAddr) {
+        use crate::grpc::proto::control::control_plane_server::ControlPlaneServer;
+        use crate::store::Store;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let svc = crate::grpc::control_plane::ControlPlaneService::new(
+            std::sync::Arc::new(Store::new(db)),
+            reg.clone(),
+        );
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ControlPlaneServer::new(svc))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Write hits the FOLLOWER: `register` on node 2 must forward to leader
+    /// node 1 over the business gRPC, commit there, and replicate back to
+    /// node 2's state machine. Exercises the full leader-forwarding path.
+    #[tokio::test]
+    async fn follower_forwards_write_to_leader() {
+        let raft1: std::net::SocketAddr = "127.0.0.1:24111".parse().unwrap();
+        let raft2: std::net::SocketAddr = "127.0.0.1:24112".parse().unwrap();
+        let grpc1: std::net::SocketAddr = "127.0.0.1:24113".parse().unwrap();
+        let grpc2: std::net::SocketAddr = "127.0.0.1:24114".parse().unwrap();
+        let hb = Duration::from_secs(30);
+
+        // Each node advertises its raft addr + its business grpc addr.
+        let n1 = RaftRegistry::start_cluster(1, &raft1.to_string(), &grpc1.to_string(), true, hb)
+            .await
+            .unwrap();
+        let n2 = RaftRegistry::start_cluster(2, &raft2.to_string(), &grpc2.to_string(), false, hb)
+            .await
+            .unwrap();
+
+        spawn_raft_server(&n1, raft1);
+        spawn_raft_server(&n2, raft2);
+        spawn_control_server(&n1, grpc1).await;
+        spawn_control_server(&n2, grpc2).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        n1.add_learner(2, &raft2.to_string(), &grpc2.to_string()).await.unwrap();
+        n1.change_membership([1, 2].into_iter().collect()).await.unwrap();
+
+        // Write on the FOLLOWER (node 2). Must succeed via forwarding.
+        n2.register(rec("forwarded-worker")).await.unwrap();
+
+        // It should be visible on both nodes' state machines.
+        let mut on_leader = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if n1.all().await.iter().any(|w| w.worker_id == "forwarded-worker") {
+                on_leader = true;
+                break;
+            }
+        }
+        assert!(on_leader, "forwarded write must commit on the leader");
+        assert!(
+            n2.all().await.iter().any(|w| w.worker_id == "forwarded-worker"),
+            "and replicate back to the follower"
+        );
     }
 }

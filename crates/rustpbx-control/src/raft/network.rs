@@ -52,7 +52,8 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         NetworkConnection {
             target,
-            addr: node.addr.clone(),
+            // node.addr packs "raft_addr|grpc_addr"; dial the Raft transport.
+            addr: super::types::node_addr::raft_addr(&node.addr).to_string(),
         }
     }
 }

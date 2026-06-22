@@ -20,6 +20,20 @@ service ControlPlane {
 
   // ── Worker discovery ──────────────────────────────────────────────────────
   rpc GetAvailableWorkers(GetWorkersRequest) returns (WorkerList);
+
+  // ── Internal: write-forwarding ────────────────────────────────────────────
+  // A follower that receives a registry mutation forwards the serialized
+  // RegistryCommand here, to the current Raft leader, which applies it.
+  rpc ProposeWrite(ProposeWriteRequest) returns (ProposeWriteResponse);
+}
+
+message ProposeWriteRequest {
+  // JSON-serialized raft::types::RegistryCommand.
+  bytes command = 1;
+}
+message ProposeWriteResponse {
+  bool known = 1;
+  uint32 removed = 2;
 }
 
 // ─── Trunk ───────────────────────────────────────────────────────────────────

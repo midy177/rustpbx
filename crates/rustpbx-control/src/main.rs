@@ -86,7 +86,10 @@ async fn main() -> Result<()> {
         let node_id = cfg.raft.node_id;
         let advertise = cfg.raft.effective_advertise_addr().to_string();
         let bootstrap = node_id == 1;
-        RaftRegistry::start_cluster(node_id, &advertise, bootstrap, hb_timeout).await?
+        // The business gRPC addr is advertised alongside the Raft addr so a
+        // follower can forward writes to the leader's ControlPlane service.
+        RaftRegistry::start_cluster(node_id, &advertise, &cfg.grpc_addr, bootstrap, hb_timeout)
+            .await?
     } else {
         RaftRegistry::start(cfg.raft.node_id, hb_timeout).await?
     };

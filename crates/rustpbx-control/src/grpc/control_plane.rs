@@ -226,6 +226,28 @@ impl ControlPlane for ControlPlaneService {
 
         Ok(Response::new(WorkerList { workers }))
     }
+
+    // ── Internal: write-forwarding ────────────────────────────────────────────
+
+    async fn propose_write(
+        &self,
+        request: Request<crate::grpc::proto::control::ProposeWriteRequest>,
+    ) -> Result<Response<crate::grpc::proto::control::ProposeWriteResponse>, Status> {
+        let req = request.into_inner();
+        let cmd: crate::raft::types::RegistryCommand = serde_json::from_slice(&req.command)
+            .map_err(|e| Status::invalid_argument(format!("decode command: {e}")))?;
+        let resp = self
+            .workers
+            .apply_forwarded(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("apply forwarded write: {e}")))?;
+        Ok(Response::new(
+            crate::grpc::proto::control::ProposeWriteResponse {
+                known: resp.known,
+                removed: resp.removed,
+            },
+        ))
+    }
 }
 
 /// Use current unix seconds as a cheap monotonic version number.

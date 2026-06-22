@@ -375,8 +375,12 @@ async fn raft_metrics(State(state): State<HttpState>) -> Json<crate::raft::regis
 #[derive(serde::Deserialize)]
 struct AddLearnerRequest {
     node_id: u64,
-    /// Address peers use to reach the new node's Raft server (host:port).
+    /// Address peers use to reach the new node's Raft transport server (host:port).
     addr: String,
+    /// The new node's business gRPC (`ControlPlane`) address, used for
+    /// write-forwarding. Defaults to `addr` if omitted.
+    #[serde(default)]
+    grpc_addr: String,
 }
 
 /// Add a node as a non-voting learner. Must be called on the current leader.
@@ -384,9 +388,14 @@ async fn raft_add_learner(
     State(state): State<HttpState>,
     Json(req): Json<AddLearnerRequest>,
 ) -> ApiResult<Response> {
+    let grpc_addr = if req.grpc_addr.trim().is_empty() {
+        req.addr.as_str()
+    } else {
+        req.grpc_addr.as_str()
+    };
     state
         .workers
-        .add_learner(req.node_id, &req.addr)
+        .add_learner(req.node_id, &req.addr, grpc_addr)
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok((StatusCode::OK, Json(serde_json::json!({"added": req.node_id}))).into_response())

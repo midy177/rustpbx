@@ -10,6 +10,33 @@ use serde::{Deserialize, Serialize};
 /// Node id type — a simple monotonic integer assigned per control replica.
 pub type NodeId = u64;
 
+/// We need to track two addresses per control node:
+/// - the **Raft transport** addr (where its `RaftService` gRPC server listens), and
+/// - the **business gRPC** addr (its `ControlPlane` service), used to forward a
+///   write to the leader when a follower receives it.
+///
+/// openraft's `BasicNode` carries a single `addr` string, so we pack both as
+/// `"<raft_addr>|<grpc_addr>"`. Helpers below encode/decode; a value with no
+/// `|` is treated as raft-only (grpc addr unknown), keeping older nodes working.
+pub mod node_addr {
+    use super::BasicNode;
+
+    /// Build a `BasicNode` whose addr encodes both transport and business addrs.
+    pub fn make(raft_addr: &str, grpc_addr: &str) -> BasicNode {
+        BasicNode::new(format!("{raft_addr}|{grpc_addr}"))
+    }
+
+    /// The Raft transport address (for dialing the peer's `RaftService`).
+    pub fn raft_addr(node_addr: &str) -> &str {
+        node_addr.split('|').next().unwrap_or(node_addr)
+    }
+
+    /// The business gRPC address (`ControlPlane`), if encoded.
+    pub fn grpc_addr(node_addr: &str) -> Option<&str> {
+        node_addr.split('|').nth(1).filter(|s| !s.is_empty())
+    }
+}
+
 /// A serializable snapshot of one registered Media Worker.
 ///
 /// Mirrors `worker_registry::WorkerEntry` but uses wire-friendly types: times
