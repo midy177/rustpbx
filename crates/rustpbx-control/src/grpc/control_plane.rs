@@ -97,11 +97,13 @@ impl ControlPlane for ControlPlaneService {
         let req = request.into_inner();
         info!(tenant_id = ?req.tenant_id, "get_acl_rules");
 
-        // ACL rules currently come from config files in the main rustpbx instance.
-        // Control Plane returns an empty list for now; future: read from a
-        // dedicated rustpbx_acl_rules table managed by the Control Plane.
-        let _ = req.tenant_id;
-        Ok(Response::new(AclRuleList { rules: vec![], version: version_now() }))
+        let rules = self
+            .store
+            .load_acl_rules(req.tenant_id)
+            .await
+            .map_err(|e| Status::internal(format!("load acl rules: {e}")))?;
+
+        Ok(Response::new(AclRuleList { rules, version: version_now() }))
     }
 
     // ── Config push (server streaming) ────────────────────────────────────────

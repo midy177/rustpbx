@@ -230,6 +230,45 @@ impl Store {
             .await?;
         rows.iter().map(row_to_route_view).collect()
     }
+
+    /// Load active ACL rules as `"<action> <target>"` strings, optionally scoped
+    /// to a tenant (matches the tenant plus global/NULL-tenant rows), ordered by
+    /// priority ascending. Format matches the main binary's `acl_rules` config.
+    pub async fn load_acl_rules(&self, tenant_id: Option<i64>) -> Result<Vec<String>> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let (sql, values) = match tenant_id {
+            Some(tid) => (
+                "SELECT action, target FROM rustpbx_acl_rules \
+                 WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
+                 ORDER BY priority ASC, id ASC",
+                vec![sea_orm::Value::BigInt(Some(tid))],
+            ),
+            None => (
+                "SELECT action, target FROM rustpbx_acl_rules \
+                 WHERE is_active = TRUE \
+                 ORDER BY priority ASC, id ASC",
+                vec![],
+            ),
+        };
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                values,
+            ))
+            .await?;
+
+        let mut rules = Vec::with_capacity(rows.len());
+        for row in rows {
+            let action: String = row.try_get("", "action")?;
+            let target: String = row.try_get("", "target")?;
+            rules.push(format!("{action} {target}"));
+        }
+        Ok(rules)
+    }
 }
 
 fn row_to_trunk_view(row: &sea_orm::QueryResult) -> Result<crate::store::TrunkView> {
@@ -476,4 +515,68 @@ fn json_string_array(value: Option<serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::ControlMigrator;
+    use sea_orm::{Database, Statement};
+    use sea_orm_migration::{MigratorTrait, SchemaManager};
+
+    /// Spin up an in-memory SQLite DB with the full control schema applied.
+    async fn fresh_store() -> Store {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db);
+        for m in ControlMigrator::migrations() {
+            m.up(&manager).await.unwrap();
+        }
+        Store::new(db)
+    }
+
+    async fn insert_rule(store: &Store, tenant: Option<i64>, action: &str, target: &str, prio: i32) {
+        let sql = "INSERT INTO rustpbx_acl_rules (tenant_id, action, target, priority, is_active) \
+                   VALUES ($1,$2,$3,$4,TRUE)";
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                sql,
+                vec![
+                    sea_orm::Value::BigInt(tenant),
+                    sea_orm::Value::String(Some(Box::new(action.into()))),
+                    sea_orm::Value::String(Some(Box::new(target.into()))),
+                    sea_orm::Value::Int(Some(prio)),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_acl_rules_orders_by_priority_and_formats() {
+        let store = fresh_store().await;
+        insert_rule(&store, None, "deny", "all", 200).await;
+        insert_rule(&store, None, "allow", "10.0.0.0/8", 100).await;
+
+        let rules = store.load_acl_rules(None).await.unwrap();
+        // priority ascending → allow (100) before deny (200), formatted "action target".
+        assert_eq!(rules, vec!["allow 10.0.0.0/8".to_string(), "deny all".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn load_acl_rules_scopes_by_tenant_including_globals() {
+        let store = fresh_store().await;
+        insert_rule(&store, None, "allow", "192.168.0.0/16", 10).await; // global
+        insert_rule(&store, Some(1), "deny", "all", 20).await; // tenant 1
+        insert_rule(&store, Some(2), "allow", "172.16.0.0/12", 30).await; // tenant 2 only
+
+        // tenant 1 sees its own rule + globals, not tenant 2's.
+        let t1 = store.load_acl_rules(Some(1)).await.unwrap();
+        assert_eq!(t1, vec!["allow 192.168.0.0/16".to_string(), "deny all".to_string()]);
+
+        // no tenant filter → all rules.
+        let all = store.load_acl_rules(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
 }

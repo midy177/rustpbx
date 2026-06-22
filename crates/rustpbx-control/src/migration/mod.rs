@@ -1,6 +1,7 @@
 pub mod add_tenant_id_to_call_records;
 pub mod add_tenant_id_to_routing;
 pub mod add_tenant_id_to_trunks;
+pub mod create_acl_rules;
 pub mod create_call_records;
 pub mod create_routing;
 pub mod create_sip_trunks;
@@ -22,6 +23,7 @@ impl MigratorTrait for ControlMigrator {
             Box::new(create_sip_trunks::Migration),
             Box::new(create_routing::Migration),
             Box::new(create_call_records::Migration),
+            Box::new(create_acl_rules::Migration),
             // Add tenant_id to the base tables
             Box::new(add_tenant_id_to_trunks::Migration),
             Box::new(add_tenant_id_to_routing::Migration),
