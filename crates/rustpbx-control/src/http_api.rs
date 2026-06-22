@@ -100,6 +100,10 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/workers", get(list_workers))
         .route("/trunks", get(list_trunks))
         .route("/routes", get(list_routes))
+        // Raft cluster admin (dynamic membership)
+        .route("/raft/metrics", get(raft_metrics))
+        .route("/raft/add-learner", post(raft_add_learner))
+        .route("/raft/change-membership", post(raft_change_membership))
         .layer(middleware::from_fn_with_state(state.clone(), auth_guard))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -359,4 +363,51 @@ async fn list_workers(State(state): State<HttpState>) -> Json<Vec<WorkerView>> {
         })
         .collect();
     Json(views)
+}
+
+// ── Raft cluster admin ─────────────────────────────────────────────────────
+
+/// Current Raft state (term, leader, members, applied index).
+async fn raft_metrics(State(state): State<HttpState>) -> Json<crate::raft::registry::RaftMetricsSummary> {
+    Json(state.workers.metrics_summary())
+}
+
+#[derive(serde::Deserialize)]
+struct AddLearnerRequest {
+    node_id: u64,
+    /// Address peers use to reach the new node's Raft server (host:port).
+    addr: String,
+}
+
+/// Add a node as a non-voting learner. Must be called on the current leader.
+async fn raft_add_learner(
+    State(state): State<HttpState>,
+    Json(req): Json<AddLearnerRequest>,
+) -> ApiResult<Response> {
+    state
+        .workers
+        .add_learner(req.node_id, &req.addr)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok((StatusCode::OK, Json(serde_json::json!({"added": req.node_id}))).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct ChangeMembershipRequest {
+    /// The complete set of voter node ids after the change.
+    voters: std::collections::BTreeSet<u64>,
+}
+
+/// Set the cluster's voter membership. Promotes learners / removes voters.
+/// Must be called on the current leader.
+async fn raft_change_membership(
+    State(state): State<HttpState>,
+    Json(req): Json<ChangeMembershipRequest>,
+) -> ApiResult<Response> {
+    state
+        .workers
+        .change_membership(req.voters)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }

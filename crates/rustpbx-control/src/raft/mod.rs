@@ -7,6 +7,7 @@
 pub mod log_store;
 pub mod network;
 pub mod registry;
+pub mod server;
 pub mod state_machine;
 pub mod types;
 

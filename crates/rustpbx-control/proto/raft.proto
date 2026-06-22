@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package rustpbx.raft;
+
+// Inter-node Raft transport for control-plane replication.
+//
+// Each RPC carries the openraft request/response serialized as bytes (bincode/
+// JSON via serde), so we don't have to mirror openraft's message types in
+// protobuf. The three RPCs map 1:1 to the openraft RaftNetwork methods.
+service RaftService {
+  // Replicate log entries (also the Raft heartbeat).
+  rpc AppendEntries(RaftBytes) returns (RaftBytes);
+  // Leader election vote.
+  rpc Vote(RaftBytes) returns (RaftBytes);
+  // Install a snapshot chunk on a lagging follower.
+  rpc InstallSnapshot(RaftBytes) returns (RaftBytes);
+}
+
+// Opaque serialized openraft message (request or response).
+message RaftBytes {
+  bytes data = 1;
+}

@@ -9,4 +9,7 @@ pub mod proto {
     pub mod edge {
         tonic::include_proto!("rustpbx.edge");
     }
+    pub mod raft {
+        tonic::include_proto!("rustpbx.raft");
+    }
 }

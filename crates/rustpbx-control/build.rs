@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/control_plane.proto",
                 "proto/edge_worker.proto",
+                "proto/raft.proto",
             ],
             &["proto/"],
         )?;

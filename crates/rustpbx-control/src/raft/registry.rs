@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use openraft::Config;
 use openraft::Raft;
+use serde::Serialize;
 use tracing::info;
 
 use super::log_store::LogStore;
@@ -25,6 +26,19 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Compact view of Raft cluster state for the admin API.
+#[derive(Debug, Clone, Serialize)]
+pub struct RaftMetricsSummary {
+    pub id: NodeId,
+    pub state: String,
+    pub current_term: u64,
+    pub current_leader: Option<NodeId>,
+    pub last_log_index: Option<u64>,
+    pub last_applied: Option<u64>,
+    /// node_id -> advertised address.
+    pub members: Vec<(NodeId, String)>,
+}
+
 #[derive(Clone)]
 pub struct RaftRegistry {
     raft: Raft<TypeConfig>,
@@ -33,8 +47,9 @@ pub struct RaftRegistry {
 }
 
 impl RaftRegistry {
-    /// Start a single-node Raft and initialize this node as the sole voter.
-    pub async fn start(node_id: NodeId, heartbeat_timeout: Duration) -> Result<Self> {
+    /// Build the Raft node without initializing any cluster membership. Used by
+    /// both single-node and cluster startup paths.
+    async fn build(node_id: NodeId, heartbeat_timeout: Duration) -> Result<Self> {
         let config = Config {
             cluster_name: "rustpbx-control".to_string(),
             // Snapshot fairly often: the registry is small and this keeps the
@@ -50,16 +65,6 @@ impl RaftRegistry {
 
         let raft = Raft::new(node_id, config, network, log_store, sm.clone()).await?;
 
-        // Initialize a single-voter cluster (this node only). Idempotent-ish:
-        // if already initialized (e.g. restart with persisted log — not in
-        // Phase 1) this errors, which we tolerate.
-        let mut members = BTreeMap::new();
-        members.insert(node_id, openraft::BasicNode::new("127.0.0.1:0"));
-        match raft.initialize(members).await {
-            Ok(()) => info!(node_id, "raft initialized as single-voter cluster"),
-            Err(e) => info!(node_id, error = %e, "raft already initialized or init skipped"),
-        }
-
         Ok(Self {
             raft,
             sm,
@@ -67,15 +72,96 @@ impl RaftRegistry {
         })
     }
 
+    /// Start a single-node Raft and initialize this node as the sole voter.
+    /// Backward-compatible default when no Raft address is configured.
+    pub async fn start(node_id: NodeId, heartbeat_timeout: Duration) -> Result<Self> {
+        let this = Self::build(node_id, heartbeat_timeout).await?;
+
+        // Initialize a single-voter cluster (this node only).
+        let mut members = BTreeMap::new();
+        members.insert(node_id, openraft::BasicNode::new("127.0.0.1:0"));
+        match this.raft.initialize(members).await {
+            Ok(()) => info!(node_id, "raft initialized as single-voter cluster"),
+            Err(e) => info!(node_id, error = %e, "raft already initialized or init skipped"),
+        }
+
+        Ok(this)
+    }
+
+    /// Start a cluster-mode Raft node advertising `advertise_addr` to peers.
+    ///
+    /// If `bootstrap` is true, this node initializes a fresh single-voter
+    /// cluster (with its real advertised address) that other nodes then join
+    /// via `add_learner` + `change_membership`. If false, the node starts
+    /// uninitialized and waits to be added to an existing cluster by a leader.
+    pub async fn start_cluster(
+        node_id: NodeId,
+        advertise_addr: &str,
+        bootstrap: bool,
+        heartbeat_timeout: Duration,
+    ) -> Result<Self> {
+        let this = Self::build(node_id, heartbeat_timeout).await?;
+
+        if bootstrap && !this.raft.is_initialized().await? {
+            let mut members = BTreeMap::new();
+            members.insert(node_id, openraft::BasicNode::new(advertise_addr.to_string()));
+            match this.raft.initialize(members).await {
+                Ok(()) => info!(node_id, advertise_addr, "raft cluster bootstrapped (single voter)"),
+                Err(e) => info!(node_id, error = %e, "raft bootstrap skipped"),
+            }
+        } else {
+            info!(
+                node_id,
+                advertise_addr, "raft node started uninitialized; awaiting join from a cluster leader"
+            );
+        }
+
+        Ok(this)
+    }
+
     pub fn heartbeat_timeout(&self) -> Duration {
         self.heartbeat_timeout
     }
 
-    /// The underlying Raft handle (for metrics / graceful shutdown / membership
-    /// changes — wired in the multi-replica phase).
+    /// The underlying Raft handle (for graceful shutdown / advanced ops).
     #[allow(dead_code)]
     pub fn raft(&self) -> &Raft<TypeConfig> {
         &self.raft
+    }
+
+    /// Add a node as a learner (non-voting replica that receives the log).
+    /// First step of joining a new replica; follow with `change_membership` to
+    /// promote it to a voter.
+    pub async fn add_learner(&self, node_id: NodeId, addr: &str) -> Result<()> {
+        self.raft
+            .add_learner(node_id, openraft::BasicNode::new(addr.to_string()), true)
+            .await?;
+        Ok(())
+    }
+
+    /// Set the cluster's voter membership to exactly `voters`. Learners not in
+    /// the set are retained as learners (`retain = true`).
+    pub async fn change_membership(&self, voters: std::collections::BTreeSet<NodeId>) -> Result<()> {
+        self.raft.change_membership(voters, true).await?;
+        Ok(())
+    }
+
+    /// A compact, JSON-friendly snapshot of Raft state for the admin API.
+    pub fn metrics_summary(&self) -> RaftMetricsSummary {
+        let m = self.raft.metrics().borrow().clone();
+        RaftMetricsSummary {
+            id: m.id,
+            state: format!("{:?}", m.state),
+            current_term: m.current_term,
+            current_leader: m.current_leader,
+            last_log_index: m.last_log_index,
+            last_applied: m.last_applied.map(|l| l.index),
+            members: m
+                .membership_config
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
+        }
     }
 
     /// Register (or replace) a worker. `registered_at_ms` / `last_heartbeat_ms`
@@ -249,5 +335,72 @@ mod tests {
 
         let ids: Vec<String> = reg.all().await.into_iter().map(|w| w.worker_id).collect();
         assert_eq!(ids, vec!["fresh".to_string()]);
+    }
+
+    /// Start a node's Raft gRPC transport on `addr` so peers can reach it.
+    fn spawn_raft_server(reg: &RaftRegistry, addr: std::net::SocketAddr) {
+        use crate::grpc::proto::raft::raft_service_server::RaftServiceServer;
+        let server = crate::raft::server::RaftServer::new(reg.raft().clone());
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(RaftServiceServer::new(server))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Full two-node cluster: bootstrap node 1, start node 2 uninitialized,
+    /// join it as a learner then promote to voter, write on the leader, and
+    /// verify the write replicates to the follower's state machine. Exercises
+    /// the real gRPC transport, serialization, leader election and replication.
+    #[tokio::test]
+    async fn two_node_cluster_replicates_writes() {
+        let addr1: std::net::SocketAddr = "127.0.0.1:24101".parse().unwrap();
+        let addr2: std::net::SocketAddr = "127.0.0.1:24102".parse().unwrap();
+        let hb = Duration::from_secs(30);
+
+        // Node 1 bootstraps a single-voter cluster advertising its real addr.
+        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), true, hb)
+            .await
+            .unwrap();
+        // Node 2 starts uninitialized, waiting to be added.
+        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), false, hb)
+            .await
+            .unwrap();
+
+        spawn_raft_server(&n1, addr1);
+        spawn_raft_server(&n2, addr2);
+
+        // Let node 1 win the initial election.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Join node 2: learner first, then promote both to voters.
+        n1.add_learner(2, &addr2.to_string()).await.unwrap();
+        n1.change_membership([1, 2].into_iter().collect())
+            .await
+            .unwrap();
+
+        // Write on the leader (node 1).
+        n1.register(rec("replicated-worker")).await.unwrap();
+
+        // Wait for replication, then read node 2's local state machine directly.
+        let mut found = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if n2.all().await.iter().any(|w| w.worker_id == "replicated-worker") {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "write on the leader must replicate to the follower's state machine"
+        );
+
+        // Sanity: node 2 sees node 1 as leader and 2 voters in the membership.
+        let m2 = n2.metrics_summary();
+        assert_eq!(m2.current_leader, Some(1), "node 2 should follow leader 1");
+        assert_eq!(m2.members.len(), 2, "membership should contain both nodes");
     }
 }

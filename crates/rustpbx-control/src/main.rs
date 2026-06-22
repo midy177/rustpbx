@@ -74,13 +74,39 @@ async fn main() -> Result<()> {
     // the HTTP API while `Store` owns its own clone.
     let store = Arc::new(Store::new(db.clone()));
 
-    // Single-node Raft backing the worker registry. Replicated cluster state
-    // (high-churn, ephemeral) lives here; persistent config/CDR stays in the DB.
-    let workers = RaftRegistry::start(
-        1, // node id; multi-replica membership comes in a later phase
-        Duration::from_secs(cfg.heartbeat_timeout_secs),
-    )
-    .await?;
+    // Raft backing the worker registry. Replicated cluster state (high-churn,
+    // ephemeral) lives here; persistent config/CDR stays in the DB.
+    //
+    // No `raft.addr` → single-node mode (backward compatible). With an addr,
+    // start cluster mode: the seed node (id 1) bootstraps a single-voter
+    // cluster, others start uninitialized and are added at runtime via the
+    // admin API (`add_learner` + `change_membership`).
+    let hb_timeout = Duration::from_secs(cfg.heartbeat_timeout_secs);
+    let workers = if cfg.raft.is_cluster_mode() {
+        let node_id = cfg.raft.node_id;
+        let advertise = cfg.raft.effective_advertise_addr().to_string();
+        let bootstrap = node_id == 1;
+        RaftRegistry::start_cluster(node_id, &advertise, bootstrap, hb_timeout).await?
+    } else {
+        RaftRegistry::start(cfg.raft.node_id, hb_timeout).await?
+    };
+
+    // In cluster mode, run the dedicated Raft gRPC server so peers can reach us.
+    if cfg.raft.is_cluster_mode() {
+        let raft_addr: std::net::SocketAddr = cfg.raft.addr.parse()?;
+        let raft_server = raft::server::RaftServer::new(workers.raft().clone());
+        info!(%raft_addr, node_id = cfg.raft.node_id, "raft transport listening");
+        tokio::spawn(async move {
+            let svc = grpc::proto::raft::raft_service_server::RaftServiceServer::new(raft_server);
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(raft_addr)
+                .await
+            {
+                tracing::error!(error = %e, "raft transport server exited");
+            }
+        });
+    }
 
     // Background reaper: remove workers whose heartbeat has been stale for
     // >2× the timeout (default 30s unhealthy → 60s reaped), so dead media

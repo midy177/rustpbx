@@ -36,6 +36,61 @@ pub struct ControlConfig {
     /// Default 30s → unhealthy at 30s, reaped at 60s.
     #[serde(default = "default_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
+
+    /// Raft cluster settings for control-plane replication.
+    #[serde(default)]
+    pub raft: RaftConfig,
+}
+
+/// Raft replication config for the worker registry.
+///
+/// With no `addr` configured the node runs as a single-voter cluster (Phase 1
+/// behaviour, fully backward compatible). Setting `addr` starts a dedicated
+/// Raft gRPC server so this node can join a multi-replica cluster; peers are
+/// added dynamically at runtime via the admin API (`add_learner` +
+/// `change_membership`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RaftConfig {
+    /// This node's Raft id. Must be unique and stable across the cluster.
+    #[serde(default = "default_raft_node_id")]
+    pub node_id: u64,
+
+    /// Dedicated address for inter-node Raft traffic, e.g. `0.0.0.0:9091`.
+    /// Empty (default) → single-node mode, no Raft server started.
+    #[serde(default)]
+    pub addr: String,
+
+    /// Address other replicas use to reach this node's Raft server, e.g.
+    /// `10.0.0.7:9091`. Advertised when joining a cluster. Defaults to `addr`
+    /// if empty.
+    #[serde(default)]
+    pub advertise_addr: String,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: default_raft_node_id(),
+            addr: String::new(),
+            advertise_addr: String::new(),
+        }
+    }
+}
+
+impl RaftConfig {
+    /// Whether this node should run a Raft server and operate in cluster mode.
+    pub fn is_cluster_mode(&self) -> bool {
+        !self.addr.trim().is_empty()
+    }
+
+    /// The address to advertise to peers (falls back to `addr`).
+    pub fn effective_advertise_addr(&self) -> &str {
+        if self.advertise_addr.trim().is_empty() {
+            &self.addr
+        } else {
+            &self.advertise_addr
+        }
+    }
 }
 
 impl Default for ControlConfig {
@@ -49,6 +104,7 @@ impl Default for ControlConfig {
             web_dir: default_web_dir(),
             log: default_log(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            raft: RaftConfig::default(),
         }
     }
 }
@@ -91,4 +147,8 @@ fn default_log() -> String {
 
 fn default_heartbeat_timeout_secs() -> u64 {
     30
+}
+
+fn default_raft_node_id() -> u64 {
+    1
 }
