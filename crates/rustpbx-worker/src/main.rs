@@ -3,12 +3,15 @@ mod call_router;
 mod cdr_hook;
 mod config;
 mod control_client;
+mod edge_worker;
 mod headers;
 mod internal_peer;
 mod metrics;
 mod proto;
+mod reservations;
 mod rtp_gateway;
 mod session_hook;
+mod state_reporter;
 #[allow(dead_code)]
 mod worker_call_module;
 
@@ -141,6 +144,14 @@ async fn main() -> Result<()> {
     cdr_builder = cdr_builder.with_hook(tracker_hook);
     cdr_builder = cdr_builder.with_hook(grpc_hook);
 
+    // Out-of-band terminal call-state reporting to the Edge (optional).
+    if let Some(ref edge_addr) = cfg.edge_report_addr {
+        let reporter: Box<dyn rustpbx::callrecord::CallRecordHook> = Box::new(
+            state_reporter::CallStateReporter::new(edge_addr, cfg.worker_id.clone()),
+        );
+        cdr_builder = cdr_builder.with_hook(reporter);
+    }
+
     let mut cdr_manager = cdr_builder.build().await?;
     let cdr_sender = cdr_manager.sender.clone();
     tokio::spawn(async move { cdr_manager.serve().await });
@@ -163,6 +174,11 @@ async fn main() -> Result<()> {
     );
     let routing_state = Arc::new(RoutingState::new());
 
+    // Call reservations bridge AllocateCall (gRPC) and the INVITE arrival so a
+    // reserved call is counted exactly once. 30s TTL releases slots whose
+    // INVITE never came.
+    let reservations = reservations::CallReservations::new(Arc::clone(&active_calls), 30_000);
+
     // WorkerCallRouter: shares active_calls counter with ControlClient (for
     // heartbeat reporting) and ActiveCallTrackerHook (for decrement on CDR).
     let worker_router = WorkerCallRouter {
@@ -172,7 +188,49 @@ async fn main() -> Result<()> {
         active_calls: Arc::clone(&active_calls),
         metrics: Arc::clone(&worker_metrics),
         edge_sip_addr: cfg.edge_sip_addr.clone(),
+        reservations: reservations.clone(),
     };
+
+    // EdgeWorker gRPC server (AllocateCall) — lets the Edge reserve a slot
+    // before sending the INVITE. Optional: only started when configured.
+    if let Some(ref ew_addr) = cfg.edge_worker_addr {
+        let ew_addr: std::net::SocketAddr = ew_addr.parse()?;
+        let sip_contact = cfg
+            .sip_contact
+            .clone()
+            .unwrap_or_else(|| format!("sip:{}:{}", cfg.sip_addr, cfg.sip_port));
+        let svc = edge_worker::EdgeWorkerService::new(
+            reservations.clone(),
+            sip_contact,
+            Arc::clone(&active_calls),
+            cfg.max_concurrent,
+        );
+        let ct = cancel.clone();
+        info!(%ew_addr, "edge-worker gRPC (AllocateCall) listening");
+        tokio::spawn(async move {
+            let server = rustpbx_proto::edge::edge_worker_server::EdgeWorkerServer::new(svc);
+            let res = tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_shutdown(ew_addr, async move { ct.cancelled().await })
+                .await;
+            if let Err(e) = res {
+                tracing::error!(error = %e, "edge-worker server exited");
+            }
+        });
+
+        // Reservation reaper: release slots whose INVITE never arrived.
+        let reap = reservations.clone();
+        let ct = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = ct.cancelled() => break,
+                    _ = tick.tick() => { reap.reap_expired(); }
+                }
+            }
+        });
+    }
 
     // ── SIP Server ────────────────────────────────────────────────────────────
     // Module chain: internal-peer → acl → auth → registrar → presence → call

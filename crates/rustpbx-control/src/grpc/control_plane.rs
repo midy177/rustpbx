@@ -173,6 +173,7 @@ impl ControlPlane for ControlPlaneService {
                 max_concurrent: info.max_concurrent,
                 active_calls: info.active_calls,
                 cpu_usage: 0.0,
+                edge_worker_addr: info.edge_worker_addr,
                 // Timestamps are stamped by the registry at propose time.
                 registered_at_ms: 0,
                 last_heartbeat_ms: 0,
@@ -221,6 +222,7 @@ impl ControlPlane for ControlPlaneService {
                 max_concurrent: w.max_concurrent,
                 active_calls: w.active_calls,
                 labels: Default::default(),
+                edge_worker_addr: w.edge_worker_addr,
             })
             .collect();
 

@@ -331,6 +331,7 @@ mod tests {
             max_concurrent: 100,
             active_calls: 0,
             cpu_usage: 0.0,
+            edge_worker_addr: String::new(),
             registered_at_ms: 0,
             last_heartbeat_ms: 0,
             draining: false,

@@ -216,6 +216,9 @@ message WorkerInfo {
   uint32 max_concurrent  = 6;
   uint32 active_calls    = 7;
   map<string, string> labels = 8;
+  // EdgeWorker gRPC address (host:port) for AllocateCall. Empty if the worker
+  // doesn't serve AllocateCall (Edge then selects without reservation).
+  string edge_worker_addr = 9;
 }
 
 message RegisterAck    { bool accepted = 1; }

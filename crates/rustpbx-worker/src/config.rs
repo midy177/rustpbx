@@ -67,6 +67,24 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub edge_sip_addr: Option<String>,
 
+    /// EdgeWorker gRPC listen address (`host:port`, e.g. "0.0.0.0:9092"). When
+    /// set, the Worker serves `AllocateCall` so the Edge can reserve a slot
+    /// before sending the INVITE. Empty → the Edge falls back to selecting via
+    /// the Control Plane's worker list without reservation.
+    #[serde(default)]
+    pub edge_worker_addr: Option<String>,
+
+    /// SIP contact advertised to the Edge in `AllocateCall` responses
+    /// (`sip:host:port`). Defaults to `sip:{sip_addr}:{sip_port}` when unset.
+    #[serde(default)]
+    pub sip_contact: Option<String>,
+
+    /// Edge's EdgeWorker gRPC address (`host:port`) that this Worker reports
+    /// `CallStateUpdate` events to. Empty → no out-of-band state reporting
+    /// (state still flows over SIP).
+    #[serde(default)]
+    pub edge_report_addr: Option<String>,
+
     #[serde(default = "default_log")]
     pub log: String,
 }
@@ -89,6 +107,9 @@ impl Default for WorkerConfig {
             metrics_addr: None,
             trusted_edges: Vec::new(),
             edge_sip_addr: None,
+            edge_worker_addr: None,
+            sip_contact: None,
+            edge_report_addr: None,
             log: default_log(),
         }
     }

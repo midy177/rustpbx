@@ -16,6 +16,9 @@ pub struct WorkerEndpoint {
     /// Internal SIP contact: sip:<ip>:<port>
     pub sip_contact: String,
     pub available_capacity: u32,
+    /// EdgeWorker gRPC addr (host:port) for AllocateCall; empty if the worker
+    /// doesn't serve it (Edge then forwards without reservation).
+    pub edge_worker_addr: String,
 }
 
 pub struct WorkerSelector {
@@ -52,6 +55,7 @@ impl WorkerSelector {
             worker_id: best.worker_id.clone(),
             sip_contact: format!("sip:{}", best.sip_addr),
             available_capacity: capacity,
+            edge_worker_addr: best.edge_worker_addr.clone(),
         })
     }
 }

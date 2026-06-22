@@ -50,6 +50,12 @@ pub struct EdgeConfig {
     /// Trusted Worker IP/CIDR list (internal INVITEs from these sources skip ACL/Auth)
     #[serde(default)]
     pub trusted_workers: Vec<String>,
+
+    /// EdgeWorker gRPC listen address (`host:port`). When set, the Edge serves
+    /// `CallStateUpdate` so Workers can report call state out-of-band. Empty →
+    /// no control channel (state still flows over SIP).
+    #[serde(default)]
+    pub edge_worker_addr: Option<String>,
 }
 
 impl Default for EdgeConfig {
@@ -67,6 +73,7 @@ impl Default for EdgeConfig {
             config_poll_secs: default_config_poll_secs(),
             log: default_log(),
             trusted_workers: Vec::new(),
+            edge_worker_addr: None,
         }
     }
 }

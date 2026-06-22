@@ -29,6 +29,8 @@ pub struct ControlClient {
     rtp_start_port: u32,
     rtp_end_port: u32,
     max_concurrent: u32,
+    /// EdgeWorker gRPC addr advertised for AllocateCall (empty if disabled).
+    edge_worker_addr: String,
     /// Shared counter updated by call sessions
     pub active_calls: Arc<AtomicU32>,
 }
@@ -54,6 +56,7 @@ impl ControlClient {
             rtp_start_port: cfg.rtp_start_port as u32,
             rtp_end_port: cfg.rtp_end_port as u32,
             max_concurrent: cfg.max_concurrent,
+            edge_worker_addr: cfg.edge_worker_addr.clone().unwrap_or_default(),
             active_calls: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -71,6 +74,7 @@ impl ControlClient {
                 max_concurrent: self.max_concurrent,
                 active_calls: self.active_calls.load(Ordering::Relaxed),
                 labels: Default::default(),
+                edge_worker_addr: self.edge_worker_addr.clone(),
             })
             .await?;
         Ok(resp.into_inner())

@@ -52,6 +52,9 @@ pub struct WorkerRecord {
     pub max_concurrent: u32,
     pub active_calls: u32,
     pub cpu_usage: f32,
+    /// EdgeWorker gRPC address (host:port) for AllocateCall; empty if absent.
+    #[serde(default)]
+    pub edge_worker_addr: String,
     /// Unix-millis when the worker first registered.
     pub registered_at_ms: i64,
     /// Unix-millis of the last heartbeat (or registration).

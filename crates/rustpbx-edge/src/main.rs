@@ -2,6 +2,7 @@ mod call_router;
 mod config;
 mod config_source;
 mod config_watcher;
+mod edge_worker_server;
 mod grpc_client;
 mod headers;
 mod internal_peer;
@@ -129,6 +130,25 @@ async fn main() -> Result<()> {
         Arc::clone(&data_context),
         cancel.clone(),
     ));
+
+    // ── EdgeWorker gRPC server (CallStateUpdate receiver) ─────────────────────
+    if let Some(ref ew_addr) = cfg.edge_worker_addr {
+        let ew_addr: std::net::SocketAddr = ew_addr.parse()?;
+        let ct = cancel.clone();
+        tracing::info!(%ew_addr, "edge-worker gRPC (CallStateUpdate) listening");
+        tokio::spawn(async move {
+            let svc = rustpbx_proto::edge::edge_worker_server::EdgeWorkerServer::new(
+                edge_worker_server::EdgeWorkerServer,
+            );
+            let res = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_shutdown(ew_addr, async move { ct.cancelled().await })
+                .await;
+            if let Err(e) = res {
+                tracing::error!(error = %e, "edge-worker server exited");
+            }
+        });
+    }
 
     // ── SIP Server ────────────────────────────────────────────────────────────
     let _sip_server = SipServerBuilder::new(proxy_config)

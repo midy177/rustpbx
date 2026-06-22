@@ -43,6 +43,10 @@ pub struct WorkerCallRouter {
     /// SIP address of the Edge used for outbound origination (`host:port`).
     /// `None` disables outbound from local extensions (inbound-only worker).
     pub edge_sip_addr: Option<String>,
+    /// Pending `AllocateCall` reservations. When an internal INVITE arrives for
+    /// a call that was reserved, the slot is *claimed* (already counted) rather
+    /// than incremented again.
+    pub reservations: crate::reservations::CallReservations,
 }
 
 #[async_trait]
@@ -119,7 +123,7 @@ impl WorkerCallRouter {
             InternalDirection::Internal => DialDirection::Internal,
         };
 
-        let mut dialplan = Dialplan::new(session_id, original.clone(), dial_direction)
+        let mut dialplan = Dialplan::new(session_id.clone(), original.clone(), dial_direction)
             .with_caller(caller_uri.clone());
 
         // ── Build flow based on routing action ────────────────────────────────
@@ -198,10 +202,18 @@ impl WorkerCallRouter {
             dialplan = dialplan.with_extension(TenantId(tid));
         }
 
-        // ── Track active calls (optimistic increment; CDR hook decrements on end) ─
-        let prev = self.active_calls.fetch_add(1, Ordering::Relaxed);
-        self.metrics.call_started();
-        debug!(active_calls = prev + 1, "worker accepted internal call");
+        // ── Track active calls ────────────────────────────────────────────────
+        // If the Edge reserved this call via AllocateCall, the slot is already
+        // counted — claim it. Otherwise (direct INVITE), increment now. Either
+        // way the CDR hook decrements exactly once on call end.
+        if self.reservations.claim(&session_id) {
+            self.metrics.call_started();
+            debug!(call_id = %session_id, "worker accepted internal call (claimed reservation)");
+        } else {
+            let prev = self.active_calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.call_started();
+            debug!(active_calls = prev + 1, "worker accepted internal call");
+        }
 
         Ok(dialplan)
     }

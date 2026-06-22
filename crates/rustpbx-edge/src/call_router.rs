@@ -49,6 +49,67 @@ impl EdgeCallRouter {
     ) -> Self {
         Self { worker_selector, data_context, routing_state, edge_id }
     }
+
+    /// Reserve a slot on the selected worker via `AllocateCall`, returning the
+    /// SIP contact the worker wants the INVITE sent to.
+    ///
+    /// Best-effort: if the worker doesn't advertise an EdgeWorker addr, returns
+    /// the worker's pre-known `sip_contact` (no reservation — backward
+    /// compatible). A rejection (`accepted=false`) or transport error is
+    /// surfaced as an error so the caller can fail the call rather than send an
+    /// INVITE the worker won't accept.
+    async fn allocate_on_worker(
+        &self,
+        worker: &crate::worker_selector::WorkerEndpoint,
+        call_id: &str,
+        tenant_id: Option<i64>,
+        caller: &str,
+        callee: &str,
+    ) -> Result<String> {
+        use rustpbx_proto::edge::{
+            edge_worker_client::EdgeWorkerClient, AllocateCallRequest,
+        };
+
+        if worker.edge_worker_addr.trim().is_empty() {
+            // Worker doesn't serve AllocateCall — use the known SIP contact.
+            return Ok(worker.sip_contact.clone());
+        }
+
+        let endpoint = if worker.edge_worker_addr.starts_with("http") {
+            worker.edge_worker_addr.clone()
+        } else {
+            format!("http://{}", worker.edge_worker_addr)
+        };
+        let mut client = EdgeWorkerClient::connect(endpoint)
+            .await
+            .map_err(|e| anyhow!("connect AllocateCall: {e}"))?;
+        let resp = client
+            .allocate_call(AllocateCallRequest {
+                call_id: call_id.to_string(),
+                tenant_id: tenant_id.unwrap_or(0),
+                trunk_name: String::new(),
+                caller: caller.to_string(),
+                callee: callee.to_string(),
+                direction: "inbound".to_string(),
+                custom_headers: Default::default(),
+            })
+            .await
+            .map_err(|e| anyhow!("AllocateCall rpc: {e}"))?
+            .into_inner();
+
+        if !resp.accepted {
+            return Err(anyhow!(
+                "worker rejected allocation: {}",
+                resp.reject_reason.unwrap_or_default()
+            ));
+        }
+        // Prefer the worker's returned contact; fall back to the known one.
+        if resp.worker_sip_contact.trim().is_empty() {
+            Ok(worker.sip_contact.clone())
+        } else {
+            Ok(resp.worker_sip_contact)
+        }
+    }
 }
 
 #[async_trait]
@@ -257,7 +318,24 @@ impl EdgeCallRouter {
             .map(|h| h.value().to_string())
             .unwrap_or_else(|_| format!("edge-{}", std::process::id()));
 
-        let worker_uri = Uri::try_from(worker.sip_contact.as_str())
+        // Reserve a slot on the worker (AllocateCall) and learn the exact SIP
+        // contact to target. Falls back to the known contact when the worker
+        // doesn't serve AllocateCall.
+        let worker_contact = self
+            .allocate_on_worker(
+                &worker,
+                &session_id,
+                trunk_ctx.tenant_id,
+                &caller_uri.to_string(),
+                &callee_uri.to_string(),
+            )
+            .await
+            .map_err(|e| {
+                warn!(worker_id = %worker.worker_id, error = %e, "worker allocation failed");
+                RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
+            })?;
+
+        let worker_uri = Uri::try_from(worker_contact.as_str())
             .map_err(|e| RouteError::from((anyhow!("invalid worker sip_contact: {}", e), None)))?;
 
         let x_headers = encode_headers(&internal_ctx);
