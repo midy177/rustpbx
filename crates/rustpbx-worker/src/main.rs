@@ -100,6 +100,19 @@ async fn main() -> Result<()> {
     }
     let worker_metrics = Arc::new(WorkerMetrics::new());
 
+    // Health endpoint: /healthz (liveness) immediately; /readyz flips to 200
+    // once the worker registers with the control plane.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(ref h) = cfg.health_addr {
+        let addr: std::net::SocketAddr = h.parse()?;
+        let ready = Arc::clone(&ready);
+        tokio::spawn(async move {
+            if let Err(e) = rustpbx_netprobe::health::serve(addr, ready).await {
+                tracing::error!(error = %e, "health server exited");
+            }
+        });
+    }
+
     // ── Detect public IP + NAT type (STUN) ────────────────────────────────────
     // Fills rtp_external_ip when it wasn't configured (so media advertises the
     // real public IP), and reports the NAT classification to the control plane.
@@ -126,6 +139,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("control plane rejected worker registration");
     }
     info!("registered with control plane");
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let cp_client = Arc::new(Mutex::new(cp_client));
 

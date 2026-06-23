@@ -85,6 +85,20 @@ async fn main() -> Result<()> {
         .collect();
     init_trusted_workers(trusted_networks);
 
+    // ── Health endpoint (started early, before any blocking connect) ──────────
+    // /healthz (liveness) responds immediately; /readyz flips to 200 once the
+    // edge registers with the control plane.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(ref h) = cfg.health_addr {
+        let addr: std::net::SocketAddr = h.parse()?;
+        let ready = Arc::clone(&ready);
+        tokio::spawn(async move {
+            if let Err(e) = rustpbx_netprobe::health::serve(addr, ready).await {
+                tracing::error!(error = %e, "health server exited");
+            }
+        });
+    }
+
     // ── Connect to Control Plane ──────────────────────────────────────────────
     let grpc_client = GrpcControlClient::connect_with_retry(
         &cfg.control_plane_addr,
@@ -131,7 +145,10 @@ async fn main() -> Result<()> {
             GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone()).await?;
         let info = build_edge_info(&cfg, &nat.nat_type);
         match reg_client.register_edge(info.clone()).await {
-            Ok(_) => info!(edge_id = %cfg.edge_id, "registered with control plane"),
+            Ok(_) => {
+                info!(edge_id = %cfg.edge_id, "registered with control plane");
+                ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Err(e) => warn!(error = %e, "edge registration failed (will retry via heartbeat)"),
         }
         // Heartbeat loop: refresh liveness, re-register if the control plane

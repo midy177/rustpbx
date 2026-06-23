@@ -50,4 +50,9 @@ trusted_workers = ["10.0.0.0/24"]
 # CallStateUpdate so Workers can report terminal call state out-of-band.
 # edge_worker_addr = "0.0.0.0:9093"
 
+# HTTP health endpoint (host:port) for k8s/LB probes: GET /healthz (liveness)
+# and /readyz (200 once registered with the control plane). Unset → no server
+# (probe the SIP TCP port instead).
+# health_addr = "0.0.0.0:8081"
+
 log = "info"

@@ -18,6 +18,8 @@
 //! With a basic STUN server (e.g. Google's, no `CHANGE-REQUEST`), it falls back
 //! to the mapping-only test: `cone` (endpoint-independent) vs `symmetric`.
 
+pub mod health;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 

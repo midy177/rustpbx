@@ -6,7 +6,7 @@ description = "STUN-based public-IP and NAT-type detection for RustPBX edge/work
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.52", features = ["net", "time", "rt"] }
+tokio = { version = "1.52", features = ["net", "time", "rt", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

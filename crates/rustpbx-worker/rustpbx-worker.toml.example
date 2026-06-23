@@ -65,4 +65,8 @@ stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 # Edge's EdgeWorker gRPC address this Worker reports CallStateUpdate events to.
 # edge_report_addr = "10.0.0.3:9093"
 
+# HTTP health endpoint (host:port) for k8s/LB probes: GET /healthz (liveness)
+# and /readyz (200 once registered with the control plane).
+# health_addr = "0.0.0.0:8081"
+
 log = "info"

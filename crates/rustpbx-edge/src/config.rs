@@ -70,6 +70,12 @@ pub struct EdgeConfig {
     /// no control channel (state still flows over SIP).
     #[serde(default)]
     pub edge_worker_addr: Option<String>,
+
+    /// HTTP health endpoint listen address (`host:port`, e.g. "0.0.0.0:8081").
+    /// Serves GET /healthz (liveness) and /readyz (ready once registered with
+    /// the Control Plane). Empty → no health server (use a tcpSocket probe).
+    #[serde(default)]
+    pub health_addr: Option<String>,
 }
 
 impl Default for EdgeConfig {
@@ -91,6 +97,7 @@ impl Default for EdgeConfig {
             log: default_log(),
             trusted_workers: Vec::new(),
             edge_worker_addr: None,
+            health_addr: None,
         }
     }
 }

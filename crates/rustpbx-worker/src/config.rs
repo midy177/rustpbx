@@ -91,6 +91,12 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub edge_report_addr: Option<String>,
 
+    /// HTTP health endpoint listen address (`host:port`, e.g. "0.0.0.0:8081").
+    /// Serves GET /healthz (liveness) and /readyz (ready once registered with
+    /// the Control Plane). Empty → no health server (use a tcpSocket probe).
+    #[serde(default)]
+    pub health_addr: Option<String>,
+
     #[serde(default = "default_log")]
     pub log: String,
 }
@@ -117,6 +123,7 @@ impl Default for WorkerConfig {
             edge_worker_addr: None,
             sip_contact: None,
             edge_report_addr: None,
+            health_addr: None,
             log: default_log(),
         }
     }
