@@ -51,6 +51,14 @@ export default {
     invalidCredentials: "Invalid credentials",
     loginFailed: "Login failed",
   },
+  account: {
+    changePassword: "Change password",
+    current: "Current password",
+    new: "New password",
+    confirm: "Confirm new password",
+    mismatch: "Passwords don't match",
+    tooShort: "Must be at least 6 characters",
+  },
   roles: {
     superadmin: "Super Admin",
     tenant_admin: "Tenant Admin",

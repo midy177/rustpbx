@@ -236,6 +236,32 @@ impl<'a> TenantUserService<'a> {
         Ok(model.update(self.db).await?.into())
     }
 
+    /// Self-service password change: verify the current password, then set a new
+    /// one. Used by a logged-in tenant user changing their own password.
+    pub async fn change_password(
+        &self,
+        tenant_id: i64,
+        username: &str,
+        current: &str,
+        new: &str,
+    ) -> Result<()> {
+        let user = self
+            .find_by_username(tenant_id, username)
+            .await?
+            .ok_or_else(|| anyhow!("account not found"))?;
+        if !verify_password(current, &user.password_hash) {
+            bail!("current password is incorrect");
+        }
+        if new.len() < 6 {
+            bail!("new password must be at least 6 characters");
+        }
+        let mut am: ActiveModel = user.into();
+        am.password_hash = Set(hash_password(new)?);
+        am.updated_at = Set(Utc::now());
+        am.update(self.db).await?;
+        Ok(())
+    }
+
     pub async fn delete(&self, id: i64) -> Result<()> {
         let existing = self.get(id).await?;
         let model: ActiveModel = existing.into();
@@ -368,6 +394,22 @@ mod tests {
         .await
         .unwrap();
         assert!(svc.authenticate(1, "root", "hunter2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn change_password_checks_current_and_rotates() {
+        let db = svc_db().await;
+        let svc = TenantUserService::new(&db);
+        svc.create_initial_admin(1, "root", "oldpass").await.unwrap();
+
+        // Wrong current password → rejected.
+        assert!(svc.change_password(1, "root", "nope", "newpass1").await.is_err());
+        // Too-short new password → rejected.
+        assert!(svc.change_password(1, "root", "oldpass", "abc").await.is_err());
+        // Correct current + valid new → succeeds; old stops working, new works.
+        svc.change_password(1, "root", "oldpass", "newpass1").await.unwrap();
+        assert!(svc.authenticate(1, "root", "oldpass").await.unwrap().is_none());
+        assert!(svc.authenticate(1, "root", "newpass1").await.unwrap().is_some());
     }
 
     #[tokio::test]

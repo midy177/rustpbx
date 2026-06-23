@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { ref, onMounted, type Component } from "vue";
+import { ref, reactive, computed, onMounted, type Component } from "vue";
 import { RouterView, RouterLink, useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { SUPPORTED_LOCALES, setLocale, type AppLocale } from "@/i18n";
+import { api } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { LogOut, Moon, Sun, Languages } from "lucide-vue-next";
+import { Dialog } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { LogOut, Moon, Sun, Languages, KeyRound } from "lucide-vue-next";
 
 export interface NavItem {
   to: string;
@@ -54,6 +58,37 @@ function changeLocale(e: Event) {
 async function onLogout() {
   await auth.logout();
   router.push({ name: "login" });
+}
+
+// ── Self-service password change (tenant accounts only) ───────────────────────
+const pwOpen = ref(false);
+const pw = reactive({ current: "", next: "", confirm: "" });
+const pwSaving = ref(false);
+const pwError = ref("");
+const pwInvalid = computed(
+  () => !pw.current || pw.next.length < 6 || pw.next !== pw.confirm,
+);
+
+function openPw() {
+  pw.current = "";
+  pw.next = "";
+  pw.confirm = "";
+  pwError.value = "";
+  pwOpen.value = true;
+}
+
+async function savePw() {
+  if (pwInvalid.value) return;
+  pwSaving.value = true;
+  pwError.value = "";
+  try {
+    await api.post("/me/password", { current_password: pw.current, new_password: pw.next });
+    pwOpen.value = false;
+  } catch (e) {
+    pwError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    pwSaving.value = false;
+  }
 }
 </script>
 
@@ -108,6 +143,15 @@ async function onLogout() {
           </Button>
           <Badge variant="muted">{{ t(`roles.${auth.user?.role ?? "tenant"}`) }}</Badge>
           <span class="hidden text-sm text-muted-foreground sm:inline">{{ auth.user?.username }}</span>
+          <Button
+            v-if="!auth.isSuperAdmin"
+            variant="ghost"
+            size="icon"
+            @click="openPw"
+            :aria-label="t('account.changePassword')"
+          >
+            <KeyRound class="size-4" />
+          </Button>
           <Button variant="outline" size="sm" @click="onLogout">
             <LogOut class="size-4" />
             <span class="hidden sm:inline">{{ t("auth.logout") }}</span>
@@ -119,5 +163,48 @@ async function onLogout() {
         <RouterView />
       </main>
     </div>
+
+    <!-- Self-service password change -->
+    <Dialog v-model:open="pwOpen" :title="t('account.changePassword')">
+      <form class="grid gap-4" @submit.prevent="savePw">
+        <div class="grid gap-2">
+          <Label for="pw-cur">{{ t("account.current") }}</Label>
+          <Input id="pw-cur" v-model="pw.current" type="password" autocomplete="current-password" />
+        </div>
+        <div class="grid gap-2">
+          <Label for="pw-new">{{ t("account.new") }}</Label>
+          <Input
+            id="pw-new"
+            v-model="pw.next"
+            type="password"
+            autocomplete="new-password"
+            :class="{ 'border-destructive': pw.next.length > 0 && pw.next.length < 6 }"
+          />
+          <p v-if="pw.next.length > 0 && pw.next.length < 6" class="text-xs text-destructive">
+            {{ t("account.tooShort") }}
+          </p>
+        </div>
+        <div class="grid gap-2">
+          <Label for="pw-conf">{{ t("account.confirm") }}</Label>
+          <Input
+            id="pw-conf"
+            v-model="pw.confirm"
+            type="password"
+            autocomplete="new-password"
+            :class="{ 'border-destructive': pw.confirm.length > 0 && pw.confirm !== pw.next }"
+          />
+          <p v-if="pw.confirm.length > 0 && pw.confirm !== pw.next" class="text-xs text-destructive">
+            {{ t("account.mismatch") }}
+          </p>
+        </div>
+      </form>
+
+      <p v-if="pwError" class="text-sm text-destructive">{{ pwError }}</p>
+
+      <template #footer>
+        <Button variant="outline" @click="pwOpen = false">{{ t("common.cancel") }}</Button>
+        <Button :disabled="pwSaving || pwInvalid" @click="savePw">{{ t("common.save") }}</Button>
+      </template>
+    </Dialog>
   </div>
 </template>

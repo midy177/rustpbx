@@ -202,6 +202,7 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         // protected
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
+        .route("/me/password", post(change_my_password))
         .route("/stats", get(stats))
         .route("/tenant-stats", get(tenant_stats))
         // platform (superadmin)
@@ -368,6 +369,29 @@ async fn logout(State(state): State<HttpState>, req: Request) -> StatusCode {
 
 async fn me(Extension(user): Extension<UserInfo>) -> Json<UserInfo> {
     Json(user)
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// Self-service password change for the logged-in tenant account. The platform
+/// super-admin password is config-managed, so it's rejected here.
+async fn change_my_password(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Json(req): Json<ChangePasswordReq>,
+) -> ApiResult<StatusCode> {
+    let tid = user.tenant_id.ok_or_else(|| {
+        ApiError::bad("the platform administrator password is managed via config")
+    })?;
+    TenantUserService::new(&state.db)
+        .change_password(tid, &user.username, &req.current_password, &req.new_password)
+        .await
+        .map_err(ApiError::bad)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The permission catalogue, for the tenant-admin user editor.

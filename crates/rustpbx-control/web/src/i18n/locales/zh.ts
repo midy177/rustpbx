@@ -50,6 +50,14 @@ export default {
     invalidCredentials: "凭据无效",
     loginFailed: "登录失败",
   },
+  account: {
+    changePassword: "修改密码",
+    current: "当前密码",
+    new: "新密码",
+    confirm: "确认新密码",
+    mismatch: "两次密码不一致",
+    tooShort: "至少 6 位",
+  },
   roles: {
     superadmin: "超级管理员",
     tenant_admin: "租户管理员",
