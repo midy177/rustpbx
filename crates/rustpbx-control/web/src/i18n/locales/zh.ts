@@ -32,6 +32,13 @@ export default {
   auth: {
     loginTitle: "登录控制台",
     loginSubtitle: "平台管理员，或填写域名登录租户账号",
+    iamTitle: "租户登录",
+    iamSubtitle: "使用租户域名登录你的账号",
+    rootTitle: "平台管理员",
+    rootSubtitle: "登录平台控制台",
+    switchToRoot: "切换到平台管理员登录",
+    switchToIam: "切换到租户账号登录",
+    domainRequired: "请输入租户域名",
     username: "用户名",
     password: "密码",
     domain: "租户域名",

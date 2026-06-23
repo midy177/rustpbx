@@ -81,6 +81,8 @@ impl Store {
                  max_cps, max_concurrent, metadata \
                  FROM rustpbx_sip_trunks \
                  WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY name",
                 vec![sea_orm::Value::BigInt(Some(tid))],
             )
@@ -94,6 +96,8 @@ impl Store {
                  max_cps, max_concurrent, metadata \
                  FROM rustpbx_sip_trunks \
                  WHERE is_active = TRUE \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY name",
                 vec![],
             )
@@ -131,6 +135,8 @@ impl Store {
                  source_trunk_id, metadata \
                  FROM rustpbx_routing \
                  WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY priority ASC",
                 vec![sea_orm::Value::BigInt(Some(tid))],
             )
@@ -142,6 +148,8 @@ impl Store {
                  source_trunk_id, metadata \
                  FROM rustpbx_routing \
                  WHERE is_active = TRUE \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY priority ASC",
                 vec![],
             )
@@ -287,12 +295,16 @@ impl Store {
             Some(tid) => (
                 "SELECT action, target FROM rustpbx_acl_rules \
                  WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY priority ASC, id ASC",
                 vec![sea_orm::Value::BigInt(Some(tid))],
             ),
             None => (
                 "SELECT action, target FROM rustpbx_acl_rules \
                  WHERE is_active = TRUE \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
                  ORDER BY priority ASC, id ASC",
                 vec![],
             ),
@@ -644,6 +656,62 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    async fn insert_tenant(store: &Store, id: i64, status: &str) {
+        let sql = "INSERT INTO rustpbx_tenants (id, name, status, created_at, updated_at) \
+                   VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                sql,
+                vec![
+                    sea_orm::Value::BigInt(Some(id)),
+                    sea_orm::Value::String(Some(Box::new(format!("tenant-{id}")))),
+                    sea_orm::Value::String(Some(Box::new(status.into()))),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn insert_trunk(store: &Store, name: &str, tenant: Option<i64>) {
+        let sql = "INSERT INTO rustpbx_sip_trunks (name, direction, sip_transport, tenant_id) \
+                   VALUES ($1, 'outbound', 'udp', $2)";
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                sql,
+                vec![
+                    sea_orm::Value::String(Some(Box::new(name.into()))),
+                    sea_orm::Value::BigInt(tenant),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_distribution_excludes_suspended_tenants() {
+        let store = fresh_store().await;
+        insert_tenant(&store, 1, "active").await;
+        insert_tenant(&store, 2, "suspended").await;
+        insert_trunk(&store, "t1", Some(1)).await;
+        insert_trunk(&store, "t2", Some(2)).await;
+        insert_trunk(&store, "global", None).await;
+
+        // Serving all config drops the suspended tenant's trunk, keeps active +
+        // global.
+        let names: Vec<String> = store.load_trunks(None).await.unwrap().into_iter().map(|t| t.name).collect();
+        assert!(names.contains(&"t1".to_string()));
+        assert!(names.contains(&"global".to_string()));
+        assert!(!names.contains(&"t2".to_string()), "suspended tenant's trunk must not be distributed");
+
+        // Even asking for the suspended tenant explicitly yields only global rows.
+        let for_t2: Vec<String> = store.load_trunks(Some(2)).await.unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(for_t2, vec!["global".to_string()]);
     }
 
     #[tokio::test]

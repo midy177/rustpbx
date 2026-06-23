@@ -33,6 +33,13 @@ export default {
   auth: {
     loginTitle: "Sign in",
     loginSubtitle: "Platform admin, or a tenant account with its domain",
+    iamTitle: "Tenant sign-in",
+    iamSubtitle: "Sign in to your tenant account with its domain",
+    rootTitle: "Platform administrator",
+    rootSubtitle: "Sign in to the platform console",
+    switchToRoot: "Sign in as platform administrator",
+    switchToIam: "Sign in to a tenant account",
+    domainRequired: "Tenant domain is required",
     username: "Username",
     password: "Password",
     domain: "Tenant domain",
