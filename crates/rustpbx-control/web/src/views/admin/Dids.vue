@@ -52,6 +52,7 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, {
     number: "", tenant_id: null, status: "available", country: "", city: "",
@@ -61,6 +62,7 @@ function openCreate() {
 }
 
 function openEdit(d: Did) {
+  error.value = "";
   editingId.value = d.id;
   Object.assign(form, {
     number: d.number,
@@ -147,7 +149,7 @@ function statusLabel(s: string) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -192,7 +194,7 @@ function statusLabel(s: string) {
       <form class="grid gap-4" @submit.prevent="save">
         <div class="grid gap-2">
           <Label for="d-num">{{ t("didsPage.number") }}</Label>
-          <Input id="d-num" v-model="form.number" :disabled="!!editingId" placeholder="+12025550100" />
+          <Input id="d-num" v-model="form.number" :disabled="!!editingId" :class="{ 'border-destructive': !form.number.trim() && form.number.length > 0 }" placeholder="+12025550100" />
         </div>
         <div class="grid grid-cols-2 gap-3">
           <div class="grid gap-2">
@@ -233,9 +235,11 @@ function statusLabel(s: string) {
         </label>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.number.trim()" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

@@ -96,12 +96,14 @@ function resetForm() {
 }
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   resetForm();
   dialogOpen.value = true;
 }
 
 function openEdit(tk: Trunk) {
+  error.value = "";
   editingId.value = tk.id;
   resetForm();
   // The list Trunk only carries a subset of input fields; prefill what we have
@@ -202,7 +204,7 @@ async function remove(tk: Trunk) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -263,7 +265,7 @@ async function remove(tk: Trunk) {
         <div class="grid grid-cols-2 gap-3">
           <div class="grid gap-2">
             <Label for="tk-name">{{ t("common.name") }}</Label>
-            <Input id="tk-name" v-model="form.name" />
+            <Input id="tk-name" v-model="form.name" :class="{ 'border-destructive': !form.name.trim() && form.name.length > 0 }" />
           </div>
           <div class="grid gap-2">
             <Label for="tk-carrier">{{ t("common.optional") }}</Label>
@@ -363,9 +365,11 @@ async function remove(tk: Trunk) {
         </div>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.name.trim()" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

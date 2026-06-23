@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted } from "vue";
+import { ref, reactive, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { api, type Tenant, type CreateTenant } from "@/api/client";
@@ -50,6 +50,7 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, {
     name: "",
@@ -66,6 +67,7 @@ function openCreate() {
 }
 
 function openEdit(tn: Tenant) {
+  error.value = "";
   editingId.value = tn.id;
   Object.assign(form, {
     name: tn.name,
@@ -87,14 +89,23 @@ function num(v: unknown): number | null {
   return Number.isNaN(n) ? null : n;
 }
 
+// ── Field validation (live) ───────────────────────────────────────────────
+const nameInvalid = computed(() => !form.name.trim());
+// When an initial-admin username is given, its password must be >= 6 chars.
+const adminPwInvalid = computed(
+  () =>
+    !editingId.value &&
+    !!form.admin_username?.trim() &&
+    (form.admin_password ?? "").length < 6,
+);
+const canSave = computed(() => !nameInvalid.value && !adminPwInvalid.value);
+
 async function save() {
-  if (!form.name.trim()) {
+  if (nameInvalid.value) {
     error.value = t("tenants.nameRequired");
     return;
   }
-  // When provisioning an initial admin, the password must be valid up front so
-  // we never half-create a tenant.
-  if (!editingId.value && form.admin_username && (form.admin_password ?? "").length < 6) {
+  if (adminPwInvalid.value) {
     error.value = t("tenants.adminPasswordTooShort");
     return;
   }
@@ -169,7 +180,7 @@ function statusLabel(s: string) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -226,7 +237,12 @@ function statusLabel(s: string) {
       <form class="grid gap-4" @submit.prevent="save">
         <div class="grid gap-2">
           <Label for="t-name">{{ t("common.name") }}</Label>
-          <Input id="t-name" v-model="form.name" :placeholder="t('tenants.namePlaceholder')" />
+          <Input
+            id="t-name"
+            v-model="form.name"
+            :placeholder="t('tenants.namePlaceholder')"
+            :class="{ 'border-destructive': nameInvalid && form.name.length > 0 }"
+          />
         </div>
         <div class="grid grid-cols-3 gap-3">
           <div class="grid gap-2">
@@ -264,7 +280,16 @@ function statusLabel(s: string) {
               </div>
               <div class="grid gap-2">
                 <Label for="t-ap">{{ t("tenants.adminPassword") }}</Label>
-                <Input id="t-ap" v-model="form.admin_password" type="password" autocomplete="new-password" />
+                <Input
+                  id="t-ap"
+                  v-model="form.admin_password"
+                  type="password"
+                  autocomplete="new-password"
+                  :class="{ 'border-destructive': adminPwInvalid }"
+                />
+                <p v-if="adminPwInvalid" class="text-xs text-destructive">
+                  {{ t("tenants.adminPasswordTooShort") }}
+                </p>
               </div>
             </div>
           </div>
@@ -283,9 +308,11 @@ function statusLabel(s: string) {
         </div>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !canSave" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

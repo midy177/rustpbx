@@ -71,6 +71,7 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, {
     username: "",
@@ -84,6 +85,7 @@ function openCreate() {
 }
 
 function openEdit(u: TenantUser) {
+  error.value = "";
   editingId.value = u.id;
   Object.assign(form, {
     username: u.username,
@@ -175,7 +177,7 @@ function roleLabel(r: string) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -231,7 +233,7 @@ function roleLabel(r: string) {
         <div class="grid grid-cols-2 gap-3">
           <div class="grid gap-2">
             <Label for="u-name">{{ t("iam.username") }}</Label>
-            <Input id="u-name" v-model="form.username" :disabled="!!editingId" autocomplete="off" />
+            <Input id="u-name" v-model="form.username" :disabled="!!editingId" autocomplete="off" :class="{ 'border-destructive': !form.username.trim() && form.username.length > 0 }" />
           </div>
           <div class="grid gap-2">
             <Label for="u-display">{{ t("iam.displayName") }}</Label>
@@ -286,9 +288,11 @@ function roleLabel(r: string) {
         </div>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.username.trim() || (!editingId && form.password.length < 6)" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

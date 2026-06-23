@@ -55,6 +55,7 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, {
     extension: "",
@@ -73,6 +74,7 @@ function openCreate() {
 }
 
 function openEdit(ext: Extension) {
+  error.value = "";
   editingId.value = ext.id;
   Object.assign(form, {
     extension: ext.extension,
@@ -163,7 +165,7 @@ function statusVariant(s: string | null) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -209,7 +211,7 @@ function statusVariant(s: string | null) {
         <div class="grid grid-cols-2 gap-3">
           <div class="grid gap-2">
             <Label for="e-ext">{{ t("extensionsPage.extension") }}</Label>
-            <Input id="e-ext" v-model="form.extension" />
+            <Input id="e-ext" v-model="form.extension" :class="{ 'border-destructive': !form.extension.trim() && form.extension.length > 0 }" />
           </div>
           <div class="grid gap-2">
             <Label for="e-dn">{{ t("extensionsPage.displayName") }}</Label>
@@ -276,9 +278,11 @@ function statusVariant(s: string | null) {
         </div>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.extension.trim()" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

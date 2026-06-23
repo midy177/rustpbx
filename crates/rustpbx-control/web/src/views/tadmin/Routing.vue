@@ -65,6 +65,7 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, {
     name: "",
@@ -82,6 +83,7 @@ function openCreate() {
 }
 
 function openEdit(r: Route) {
+  error.value = "";
   editingId.value = r.id;
   Object.assign(form, {
     name: r.name,
@@ -167,7 +169,7 @@ async function remove(r: Route) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -226,7 +228,7 @@ async function remove(r: Route) {
       <form class="grid gap-4" @submit.prevent="save">
         <div class="grid gap-2">
           <Label for="r-name">{{ t("common.name") }}</Label>
-          <Input id="r-name" v-model="form.name" />
+          <Input id="r-name" v-model="form.name" :class="{ 'border-destructive': !form.name.trim() && form.name.length > 0 }" />
         </div>
         <div class="grid gap-2">
           <Label for="r-desc">{{ t("routingPage.description") }} <span class="text-muted-foreground">({{ t("common.optional") }})</span></Label>
@@ -288,9 +290,11 @@ async function remove(r: Route) {
         </label>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.name.trim()" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

@@ -54,11 +54,13 @@ async function load() {
 onMounted(load);
 
 function openCreate() {
+  error.value = "";
   editingId.value = null;
   Object.assign(form, { action: "allow", target: "", priority: 100, is_active: true });
   dialogOpen.value = true;
 }
 function openEdit(r: AclRule) {
+  error.value = "";
   editingId.value = r.id;
   Object.assign(form, {
     action: r.action,
@@ -122,7 +124,7 @@ async function remove(r: AclRule) {
       </div>
     </div>
 
-    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+    <p v-if="error && !dialogOpen" class="text-sm text-destructive">{{ error }}</p>
 
     <Card>
       <Table>
@@ -190,7 +192,7 @@ async function remove(r: AclRule) {
         </div>
         <div class="grid gap-2">
           <Label for="a-target">{{ t("aclPage.target") }}</Label>
-          <Input id="a-target" v-model="form.target" placeholder="10.0.0.0/8" />
+          <Input id="a-target" v-model="form.target" placeholder="10.0.0.0/8" :class="{ 'border-destructive': !form.target.trim() && form.target.length > 0 }" />
           <p class="text-xs text-muted-foreground">{{ t("aclPage.targetHint") }}</p>
         </div>
         <label class="flex items-center gap-2 text-sm">
@@ -199,9 +201,11 @@ async function remove(r: AclRule) {
         </label>
       </form>
 
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("common.save") }}</Button>
+        <Button :disabled="saving || !form.target.trim()" @click="save">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>
