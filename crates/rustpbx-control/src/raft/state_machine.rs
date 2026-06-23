@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::types::{
-    EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
+    CallSlotRecord, EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
 };
 
 /// The data captured in a snapshot: the full state machine contents.
@@ -35,6 +35,9 @@ pub struct StoredSnapshot {
     /// Serialized edge map (defaulted for snapshots written before edges existed).
     #[serde(default)]
     pub edges: BTreeMap<String, EdgeRecord>,
+    /// Per-tenant call slots keyed by call_id (defaulted for older snapshots).
+    #[serde(default)]
+    pub call_slots: BTreeMap<String, CallSlotRecord>,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -46,6 +49,8 @@ struct StateMachineData {
     workers: BTreeMap<String, WorkerRecord>,
     /// edge_id -> record
     edges: BTreeMap<String, EdgeRecord>,
+    /// call_id -> reserved call slot (per-tenant concurrency control)
+    call_slots: BTreeMap<String, CallSlotRecord>,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -74,6 +79,27 @@ impl StateMachineStore {
     pub async fn list_edges(&self) -> Vec<EdgeRecord> {
         self.data.lock().await.edges.values().cloned().collect()
     }
+
+    /// Current number of reserved call slots for a tenant (read-only).
+    pub async fn tenant_call_count(&self, tenant_id: i64) -> u32 {
+        self.data
+            .lock()
+            .await
+            .call_slots
+            .values()
+            .filter(|s| s.tenant_id == tenant_id)
+            .count() as u32
+    }
+
+    /// Total reserved call slots across all tenants (read-only, for stats).
+    pub async fn call_slot_count(&self) -> u32 {
+        self.data.lock().await.call_slots.len() as u32
+    }
+}
+
+/// Count a tenant's currently-held slots in the map.
+fn tenant_slots(slots: &BTreeMap<String, CallSlotRecord>, tenant_id: i64) -> u32 {
+    slots.values().filter(|s| s.tenant_id == tenant_id).count() as u32
 }
 
 /// Apply one command to the registry maps. Pure function of (data, command) so
@@ -83,16 +109,16 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
     match cmd {
         RegistryCommand::Register { record } => {
             workers.insert(record.worker_id.clone(), record);
-            RegistryResponse { known: true, removed: 0 }
+            RegistryResponse::known(true, 0)
         }
         RegistryCommand::Heartbeat { worker_id, active_calls, cpu_usage, at_ms } => {
             if let Some(w) = workers.get_mut(&worker_id) {
                 w.active_calls = active_calls;
                 w.cpu_usage = cpu_usage;
                 w.last_heartbeat_ms = at_ms;
-                RegistryResponse { known: true, removed: 0 }
+                RegistryResponse::known(true, 0)
             } else {
-                RegistryResponse { known: false, removed: 0 }
+                RegistryResponse::known(false, 0)
             }
         }
         RegistryCommand::Drain { worker_id } => {
@@ -102,54 +128,83 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             } else {
                 false
             };
-            RegistryResponse { known, removed: 0 }
+            RegistryResponse::known(known, 0)
         }
         RegistryCommand::Remove { worker_id } => {
             let removed = workers.remove(&worker_id).is_some() as u32;
-            RegistryResponse { known: removed > 0, removed }
+            RegistryResponse::known(removed > 0, removed)
         }
         RegistryCommand::ReapStale { before_ms } => {
             let before = workers.len();
             workers.retain(|_, w| w.last_heartbeat_ms >= before_ms);
             let removed = (before - workers.len()) as u32;
-            RegistryResponse { known: true, removed }
+            RegistryResponse::known(true, removed)
         }
         // ── Edge registry ──────────────────────────────────────────────────────
         RegistryCommand::RegisterEdge { record } => {
             data.edges.insert(record.edge_id.clone(), record);
-            RegistryResponse { known: true, removed: 0 }
+            RegistryResponse::known(true, 0)
         }
         RegistryCommand::EdgeHeartbeat { edge_id, active_calls, at_ms } => {
             if let Some(e) = data.edges.get_mut(&edge_id) {
                 e.active_calls = active_calls;
                 e.last_heartbeat_ms = at_ms;
-                RegistryResponse { known: true, removed: 0 }
+                RegistryResponse::known(true, 0)
             } else {
-                RegistryResponse { known: false, removed: 0 }
+                RegistryResponse::known(false, 0)
             }
         }
         RegistryCommand::RemoveEdge { edge_id } => {
             let removed = data.edges.remove(&edge_id).is_some() as u32;
-            RegistryResponse { known: removed > 0, removed }
+            RegistryResponse::known(removed > 0, removed)
         }
         RegistryCommand::ReapStaleEdges { before_ms } => {
             let before = data.edges.len();
             data.edges.retain(|_, e| e.last_heartbeat_ms >= before_ms);
             let removed = (before - data.edges.len()) as u32;
-            RegistryResponse { known: true, removed }
+            RegistryResponse::known(true, removed)
+        }
+        // ── Per-tenant call slots ───────────────────────────────────────────────
+        RegistryCommand::AcquireCallSlot { call_id, tenant_id, max, at_ms } => {
+            let slots = &mut data.call_slots;
+            // Idempotent: re-acquiring an existing call_id is always granted.
+            if slots.contains_key(&call_id) {
+                let count = tenant_slots(slots, tenant_id);
+                return RegistryResponse { known: true, removed: 0, granted: true, count };
+            }
+            let current = tenant_slots(slots, tenant_id);
+            // Enforce the cap (evaluated here, in log order, so it's linearizable).
+            if let Some(m) = max {
+                if m > 0 && current >= m {
+                    return RegistryResponse { known: true, removed: 0, granted: false, count: current };
+                }
+            }
+            slots.insert(call_id, CallSlotRecord { tenant_id, at_ms });
+            RegistryResponse { known: true, removed: 0, granted: true, count: current + 1 }
+        }
+        RegistryCommand::ReleaseCallSlot { call_id } => {
+            let removed = data.call_slots.remove(&call_id).is_some() as u32;
+            RegistryResponse::known(removed > 0, removed)
+        }
+        RegistryCommand::ReapCallSlots { before_ms } => {
+            let before = data.call_slots.len();
+            data.call_slots.retain(|_, s| s.at_ms >= before_ms);
+            let removed = (before - data.call_slots.len()) as u32;
+            RegistryResponse::known(true, removed)
         }
     }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (last_applied, last_membership, workers, edges) = {
+        let (last_applied, last_membership, workers, edges, call_slots) = {
             let data = self.data.lock().await;
             (
                 data.last_applied,
                 data.last_membership.clone(),
                 data.workers.clone(),
                 data.edges.clone(),
+                data.call_slots.clone(),
             )
         };
 
@@ -167,6 +222,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             last_membership: last_membership.clone(),
             workers,
             edges,
+            call_slots,
         };
         let bytes = serde_json::to_vec(&stored)
             .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -210,7 +266,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             data.last_applied = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Blank => {
-                    responses.push(RegistryResponse { known: false, removed: 0 });
+                    responses.push(RegistryResponse::known(false, 0));
                 }
                 EntryPayload::Normal(cmd) => {
                     let resp = apply_command(&mut data, cmd);
@@ -218,7 +274,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 }
                 EntryPayload::Membership(mem) => {
                     data.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                    responses.push(RegistryResponse { known: false, removed: 0 });
+                    responses.push(RegistryResponse::known(false, 0));
                 }
             }
         }
@@ -249,6 +305,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.last_membership = stored.last_membership;
         data.workers = stored.workers;
         data.edges = stored.edges;
+        data.call_slots = stored.call_slots;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {

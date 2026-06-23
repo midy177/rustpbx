@@ -226,6 +226,7 @@ async fn main() -> Result<()> {
         Arc::clone(&routing_state),
         cfg.edge_id.clone(),
         Arc::clone(&active_calls),
+        Arc::clone(&grpc_client),
     ));
 
     // ── Config watcher (background, re-pulls + re-injects on change) ──────────

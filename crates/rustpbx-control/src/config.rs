@@ -44,6 +44,14 @@ pub struct ControlConfig {
     #[serde(default = "default_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
 
+    /// TTL (seconds) for per-tenant call-concurrency slots — a crash/leak
+    /// backstop. A slot is normally released when its CDR arrives; one whose
+    /// CDR never comes (worker/edge crash) is reaped after this long. Set it
+    /// above your longest expected call so live calls aren't undercounted.
+    /// Default 4h.
+    #[serde(default = "default_call_slot_ttl_secs")]
+    pub call_slot_ttl_secs: u64,
+
     /// Raft cluster settings for control-plane replication.
     #[serde(default)]
     pub raft: RaftConfig,
@@ -186,6 +194,7 @@ impl Default for ControlConfig {
             log: default_log(),
             base_domain: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            call_slot_ttl_secs: default_call_slot_ttl_secs(),
             raft: RaftConfig::default(),
             tls: TlsConfig::default(),
         }
@@ -230,6 +239,10 @@ fn default_log() -> String {
 
 fn default_heartbeat_timeout_secs() -> u64 {
     30
+}
+
+fn default_call_slot_ttl_secs() -> u64 {
+    4 * 60 * 60 // 4 hours
 }
 
 fn default_raft_node_id() -> u64 {

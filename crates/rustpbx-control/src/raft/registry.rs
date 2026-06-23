@@ -228,6 +228,8 @@ impl RaftRegistry {
         Ok(RegistryResponse {
             known: resp.known,
             removed: resp.removed,
+            granted: resp.granted,
+            count: resp.count,
         })
     }
 
@@ -340,6 +342,52 @@ impl RaftRegistry {
         self.sm.list_edges().await
     }
 
+    // ── Per-tenant call slots (concurrency control) ─────────────────────────────
+
+    /// Reserve a call slot for a tenant, enforcing `max` (None/0 = unlimited).
+    /// Returns `(granted, active_count)`. Idempotent per `call_id`.
+    pub async fn acquire_call_slot(
+        &self,
+        call_id: &str,
+        tenant_id: i64,
+        max: Option<u32>,
+    ) -> Result<(bool, u32)> {
+        let resp = self
+            .propose(RegistryCommand::AcquireCallSlot {
+                call_id: call_id.to_string(),
+                tenant_id,
+                max,
+                at_ms: now_ms(),
+            })
+            .await?;
+        Ok((resp.granted, resp.count))
+    }
+
+    /// Release a call slot (on CDR). Returns whether a slot was held.
+    pub async fn release_call_slot(&self, call_id: &str) -> Result<bool> {
+        let resp = self
+            .propose(RegistryCommand::ReleaseCallSlot { call_id: call_id.to_string() })
+            .await?;
+        Ok(resp.removed > 0)
+    }
+
+    /// Reap call slots older than `ttl` (crash/leak backstop). Returns the count.
+    pub async fn reap_call_slots(&self, ttl: Duration) -> Result<u32> {
+        let before_ms = now_ms() - ttl.as_millis() as i64;
+        let resp = self.propose(RegistryCommand::ReapCallSlots { before_ms }).await?;
+        Ok(resp.removed)
+    }
+
+    /// Current reserved call slots for a tenant (read from the local SM).
+    pub async fn tenant_active_calls(&self, tenant_id: i64) -> u32 {
+        self.sm.tenant_call_count(tenant_id).await
+    }
+
+    /// Total reserved call slots across all tenants (read-only, for stats).
+    pub async fn total_call_slots(&self) -> u32 {
+        self.sm.call_slot_count().await
+    }
+
     /// Healthy workers with spare capacity, most-available first.
     pub async fn available(&self) -> Vec<WorkerRecord> {
         let now = now_ms();
@@ -425,6 +473,66 @@ mod tests {
         assert_eq!(ids, vec!["edge-1".to_string()]);
         // Worker registry is unaffected by edge commands.
         assert!(reg.all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_slots_enforce_per_tenant_limit() {
+        let reg = start().await;
+
+        // Tenant 1 capped at 2; tenant 2 capped at 1.
+        let (g, n) = reg.acquire_call_slot("t1-a", 1, Some(2)).await.unwrap();
+        assert!(g && n == 1);
+        let (g, n) = reg.acquire_call_slot("t1-b", 1, Some(2)).await.unwrap();
+        assert!(g && n == 2, "second call fills the cap");
+        let (g, n) = reg.acquire_call_slot("t1-c", 1, Some(2)).await.unwrap();
+        assert!(!g && n == 2, "third call is denied — tenant at cap");
+
+        // A different tenant has its own independent count.
+        let (g, n) = reg.acquire_call_slot("t2-a", 2, Some(1)).await.unwrap();
+        assert!(g && n == 1, "tenant 2 is independent of tenant 1");
+        assert_eq!(reg.tenant_active_calls(1).await, 2);
+        assert_eq!(reg.tenant_active_calls(2).await, 1);
+
+        // Idempotent re-acquire of an existing call_id is always granted and
+        // does not double-count.
+        let (g, n) = reg.acquire_call_slot("t1-a", 1, Some(2)).await.unwrap();
+        assert!(g && n == 2, "re-acquiring an existing slot is idempotent");
+
+        // Releasing one frees capacity for a new call.
+        assert!(reg.release_call_slot("t1-a").await.unwrap());
+        assert_eq!(reg.tenant_active_calls(1).await, 1);
+        let (g, n) = reg.acquire_call_slot("t1-d", 1, Some(2)).await.unwrap();
+        assert!(g && n == 2, "a freed slot can be re-used");
+
+        // Releasing an unknown call_id is a no-op.
+        assert!(!reg.release_call_slot("nope").await.unwrap());
+
+        // No limit (None) → always granted.
+        let (g, _) = reg.acquire_call_slot("nolimit", 9, None).await.unwrap();
+        assert!(g, "tenants with no cap are never denied");
+    }
+
+    #[tokio::test]
+    async fn call_slots_reaper_frees_leaked_slots() {
+        let reg = start().await;
+        reg.acquire_call_slot("live", 1, Some(10)).await.unwrap();
+        // Inject a slot with an ancient timestamp (simulating a leaked reservation).
+        reg.raft()
+            .client_write(RegistryCommand::AcquireCallSlot {
+                call_id: "leaked".to_string(),
+                tenant_id: 1,
+                max: Some(10),
+                at_ms: 1, // 1970
+            })
+            .await
+            .unwrap();
+        assert_eq!(reg.tenant_active_calls(1).await, 2);
+
+        // Reaping with any positive TTL drops the ancient slot, keeps the live one.
+        let removed = reg.reap_call_slots(Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(removed, 1, "only the leaked slot is reaped");
+        assert_eq!(reg.tenant_active_calls(1).await, 1);
+        assert_eq!(reg.total_call_slots().await, 1);
     }
 
     #[tokio::test]

@@ -28,6 +28,12 @@ service ControlPlane {
   // ── Worker discovery ──────────────────────────────────────────────────────
   rpc GetAvailableWorkers(GetWorkersRequest) returns (WorkerList);
 
+  // ── Per-tenant concurrency control ────────────────────────────────────────
+  // The Edge calls this before forwarding an inbound INVITE: the control plane
+  // atomically checks the tenant's max_concurrent_calls and reserves a slot.
+  // The slot is released when the call's CDR arrives (or reaped after a TTL).
+  rpc AcquireCallSlot(AcquireSlotRequest) returns (AcquireSlotResponse);
+
   // ── Platform config (centrally-managed node settings) ─────────────────────
   // Nodes fetch this on startup (e.g. the STUN server list for NAT detection),
   // falling back to their local config when empty/unreachable.
@@ -46,6 +52,22 @@ message ProposeWriteRequest {
 message ProposeWriteResponse {
   bool known = 1;
   uint32 removed = 2;
+  // Carry the acquire-slot result back through the leader-forwarding path.
+  bool granted = 3;
+  uint32 count = 4;
+}
+
+message AcquireSlotRequest {
+  int64  tenant_id = 1;
+  string call_id   = 2;
+}
+message AcquireSlotResponse {
+  // Whether a slot was reserved. false → the tenant is at its concurrency cap.
+  bool   granted = 1;
+  // The tenant's active-call count (including this one when granted).
+  uint32 active  = 2;
+  // The tenant's configured limit; 0 = unlimited.
+  uint32 max     = 3;
 }
 
 // ─── Trunk ───────────────────────────────────────────────────────────────────

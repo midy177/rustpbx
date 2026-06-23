@@ -91,6 +91,28 @@ impl GrpcControlClient {
         Ok(resp.into_inner())
     }
 
+    /// Reserve a per-tenant concurrency slot for `call_id` before forwarding an
+    /// inbound INVITE. Returns `(granted, active, max)`: when `granted` is false
+    /// the tenant is at its `max_concurrent_calls` cap and the call should be
+    /// rejected. The slot is released when the call's CDR reaches the control
+    /// plane (or reaped after a TTL).
+    pub async fn acquire_call_slot(
+        &mut self,
+        tenant_id: i64,
+        call_id: &str,
+    ) -> Result<(bool, u32, u32)> {
+        use crate::proto::control::AcquireSlotRequest;
+        let resp = self
+            .client
+            .acquire_call_slot(AcquireSlotRequest {
+                tenant_id,
+                call_id: call_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok((resp.granted, resp.active, resp.max))
+    }
+
     /// Register this edge with the Control Plane (observability only).
     pub async fn register_edge(&mut self, info: EdgeInfo) -> Result<RegisterAck> {
         let resp = self.client.register_edge(info).await?;

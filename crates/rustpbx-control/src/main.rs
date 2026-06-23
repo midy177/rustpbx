@@ -145,6 +145,7 @@ async fn main() -> Result<()> {
     // nodes don't accumulate in the registry / admin API. Reaping is a Raft
     // write, so it's a no-op on followers' behalf — only the leader commits it.
     let reap_registry = workers.clone();
+    let call_slot_ttl = Duration::from_secs(cfg.call_slot_ttl_secs);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.tick().await; // discard the immediate first tick
@@ -155,6 +156,13 @@ async fn main() -> Result<()> {
             }
             if let Err(e) = reap_registry.reap_stale_edges().await {
                 tracing::warn!(error = %e, "edge reap failed");
+            }
+            // Backstop: free per-tenant call slots whose CDR never arrived
+            // (worker/edge crash), so a leaked slot doesn't pin a tenant's quota.
+            match reap_registry.reap_call_slots(call_slot_ttl).await {
+                Ok(n) if n > 0 => tracing::info!(reaped = n, "reaped stale call slots"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "call-slot reap failed"),
             }
         }
     });

@@ -12,6 +12,7 @@
 //!
 //! Media always flows directly between carrier and Worker (Edge is signaling-only).
 
+use crate::grpc_client::GrpcControlClient;
 use crate::headers::encode_headers;
 use crate::worker_selector::WorkerSelector;
 use anyhow::{Result, anyhow};
@@ -32,6 +33,7 @@ use rsipstack::sip::Transport;
 use rsipstack::sip::prelude::HeadersExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 pub struct EdgeCallRouter {
@@ -44,6 +46,9 @@ pub struct EdgeCallRouter {
     /// Incremented here on a successful route; decremented by
     /// `EdgeActiveCallHook` when the call's CDR completes.
     pub active_calls: Arc<AtomicU32>,
+    /// Control Plane client, used to reserve a per-tenant concurrency slot
+    /// before forwarding an inbound call.
+    pub control: Arc<RwLock<GrpcControlClient>>,
 }
 
 impl EdgeCallRouter {
@@ -53,8 +58,9 @@ impl EdgeCallRouter {
         routing_state: Arc<RoutingState>,
         edge_id: String,
         active_calls: Arc<AtomicU32>,
+        control: Arc<RwLock<GrpcControlClient>>,
     ) -> Self {
-        Self { worker_selector, data_context, routing_state, edge_id, active_calls }
+        Self { worker_selector, data_context, routing_state, edge_id, active_calls, control }
     }
 
     /// Reserve a slot on the selected worker via `AllocateCall`, returning the
@@ -359,7 +365,7 @@ impl EdgeCallRouter {
             ..Default::default()
         };
 
-        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Inbound)
+        let mut dialplan = Dialplan::new(session_id.clone(), original.clone(), DialDirection::Inbound)
             .with_caller(caller_uri)
             .with_targets(DialStrategy::Sequential(vec![worker_location]));
 
@@ -368,6 +374,35 @@ impl EdgeCallRouter {
         dialplan.recording = CallRecordingConfig::default();
         // Let SIP failure codes (4xx/5xx from Worker) pass through to the carrier.
         dialplan = dialplan.with_passthrough_failure(true);
+
+        // ── Enforce the tenant's concurrency cap ──────────────────────────────
+        // Done last (after worker selection) so the failure paths above never
+        // leave a slot reserved for a call that won't proceed. The control plane
+        // releases the slot when this call's CDR arrives. Fail OPEN on an RPC
+        // error — a control-plane blip shouldn't drop every call.
+        if let Some(tenant_id) = trunk_ctx.tenant_id {
+            match self
+                .control
+                .write()
+                .await
+                .acquire_call_slot(tenant_id, &session_id)
+                .await
+            {
+                Ok((true, active, max)) => {
+                    debug!(tenant_id, active, max, "tenant call slot acquired");
+                }
+                Ok((false, active, max)) => {
+                    warn!(tenant_id, active, max, "rejecting call — tenant concurrency cap reached");
+                    return Err(RouteError::from((
+                        anyhow!("tenant concurrency limit reached ({active}/{max})"),
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
+                Err(e) => {
+                    warn!(tenant_id, error = %e, "call-slot acquire failed; allowing call (fail-open)");
+                }
+            }
+        }
 
         self.active_calls.fetch_add(1, Ordering::Relaxed);
         Ok(dialplan)

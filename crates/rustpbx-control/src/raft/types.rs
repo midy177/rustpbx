@@ -101,6 +101,16 @@ impl EdgeRecord {
     }
 }
 
+/// A reserved per-tenant call slot, keyed by `call_id` in the state machine.
+/// Tracked so concurrency enforcement is linearizable across control replicas
+/// and survives leader changes (it rides the same Raft log as the registry).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallSlotRecord {
+    pub tenant_id: i64,
+    /// Unix-millis when the slot was reserved (for the TTL reaper backstop).
+    pub at_ms: i64,
+}
+
 /// Commands applied to the replicated worker registry (the Raft `AppData`).
 ///
 /// Every mutation of the registry goes through `Raft::client_write` with one of
@@ -134,6 +144,23 @@ pub enum RegistryCommand {
     RemoveEdge { edge_id: String },
     /// Remove every edge whose heartbeat is older than `before_ms`.
     ReapStaleEdges { before_ms: i64 },
+
+    // ── Per-tenant call slots (concurrency control) ─────────────────────────────
+    /// Reserve a call slot for `tenant_id` keyed by `call_id`. If `max` is
+    /// `Some(m)` and the tenant already holds ≥ m slots, the reservation is
+    /// rejected (response `granted = false`). Re-acquiring an existing `call_id`
+    /// is idempotent (always granted). Enforcement happens here, in log order,
+    /// so two replicas can't both slip past the cap.
+    AcquireCallSlot {
+        call_id: String,
+        tenant_id: i64,
+        max: Option<u32>,
+        at_ms: i64,
+    },
+    /// Release the slot held by `call_id` (called when its CDR arrives).
+    ReleaseCallSlot { call_id: String },
+    /// Reap slots reserved before `before_ms` (crash/leak backstop).
+    ReapCallSlots { before_ms: i64 },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any
@@ -145,8 +172,26 @@ pub struct RegistryResponse {
     /// Whether the target worker was known at apply time (used by Heartbeat to
     /// tell an unknown worker to drain/re-register).
     pub known: bool,
-    /// Number of entries removed (ReapStale / Remove).
+    /// Number of entries removed (ReapStale / Remove / ReapCallSlots).
     pub removed: u32,
+    /// AcquireCallSlot: whether the slot was granted. Defaulted so older
+    /// serialized responses (no field) deserialize as granted.
+    #[serde(default = "default_true")]
+    pub granted: bool,
+    /// AcquireCallSlot: the tenant's active-call count after applying.
+    #[serde(default)]
+    pub count: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RegistryResponse {
+    /// The common worker/edge response (granted/count unused).
+    pub fn known(known: bool, removed: u32) -> Self {
+        Self { known, removed, granted: true, count: 0 }
+    }
 }
 
 openraft::declare_raft_types!(

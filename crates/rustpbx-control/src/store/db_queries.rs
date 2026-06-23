@@ -268,6 +268,24 @@ impl Store {
         rows.iter().map(row_to_route_view).collect()
     }
 
+    /// The tenant's `max_concurrent_calls` limit, or `None` when unset
+    /// (unlimited) or the tenant doesn't exist. Used to enforce concurrency.
+    pub async fn tenant_max_concurrent(&self, tenant_id: i64) -> Result<Option<u32>> {
+        use sea_orm::Statement;
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "SELECT max_concurrent_calls FROM rustpbx_tenants WHERE id = $1",
+                vec![sea_orm::Value::BigInt(Some(tenant_id))],
+            ))
+            .await?;
+        Ok(row
+            .and_then(|r| r.try_get::<Option<i32>>("", "max_concurrent_calls").ok().flatten())
+            .filter(|&v| v > 0)
+            .map(|v| v as u32))
+    }
+
     /// Paged + filtered CDR listing for the admin console. Returns the page of
     /// rows (newest first) plus the total matching count for pagination.
     pub async fn list_call_records_paged(
@@ -770,6 +788,38 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tenant_max_concurrent_reads_limit_or_none() {
+        let store = fresh_store().await;
+        insert_tenant(&store, 1, "active").await; // no max set → NULL
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                "UPDATE rustpbx_tenants SET max_concurrent_calls = $1 WHERE id = 1",
+                vec![sea_orm::Value::Int(Some(5))],
+            ))
+            .await
+            .unwrap();
+        insert_tenant(&store, 2, "active").await; // stays NULL (unlimited)
+        // Tenant 3 explicitly 0 → treated as unlimited (None).
+        insert_tenant(&store, 3, "active").await;
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                "UPDATE rustpbx_tenants SET max_concurrent_calls = $1 WHERE id = 3",
+                vec![sea_orm::Value::Int(Some(0))],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(store.tenant_max_concurrent(1).await.unwrap(), Some(5));
+        assert_eq!(store.tenant_max_concurrent(2).await.unwrap(), None, "NULL → unlimited");
+        assert_eq!(store.tenant_max_concurrent(3).await.unwrap(), None, "0 → unlimited");
+        assert_eq!(store.tenant_max_concurrent(999).await.unwrap(), None, "missing tenant → None");
     }
 
     #[tokio::test]

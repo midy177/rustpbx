@@ -1,9 +1,9 @@
 use crate::{
     grpc::proto::control::{
-        AclRuleList, CallRecordReport, ConfigChangeEvent, EdgeHeartbeatRequest, EdgeInfo,
-        GetAclRulesRequest, GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest,
-        HeartbeatRequest, HeartbeatResponse, RegisterAck, ReportAck, RouteRuleList, TrunkConfigList,
-        WatchRequest, WorkerInfo, WorkerList,
+        AclRuleList, AcquireSlotRequest, AcquireSlotResponse, CallRecordReport, ConfigChangeEvent,
+        EdgeHeartbeatRequest, EdgeInfo, GetAclRulesRequest, GetRouteRulesRequest,
+        GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest, HeartbeatResponse, RegisterAck,
+        ReportAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerInfo, WorkerList,
         control_plane_server::ControlPlane,
     },
     raft::registry::RaftRegistry,
@@ -150,6 +150,12 @@ impl ControlPlane for ControlPlaneService {
             // Still ack — losing a CDR is better than blocking the worker
         }
 
+        // Release the per-tenant concurrency slot reserved at call setup. A
+        // no-op if none was held (e.g. outbound, or slots disabled). Best-effort.
+        if let Err(e) = self.workers.release_call_slot(&rec.call_id).await {
+            warn!(error = %e, call_id = %rec.call_id, "call-slot release failed");
+        }
+
         Ok(Response::new(ReportAck { accepted: true }))
     }
 
@@ -274,6 +280,45 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(WorkerList { workers }))
     }
 
+    // ── Per-tenant concurrency control ────────────────────────────────────────
+
+    async fn acquire_call_slot(
+        &self,
+        request: Request<AcquireSlotRequest>,
+    ) -> Result<Response<AcquireSlotResponse>, Status> {
+        let req = request.into_inner();
+        // Read the tenant's limit (None/0 → unlimited). tenant_id ≤ 0 means no
+        // tenant scope, so no cap — but we still reserve a slot so the call is
+        // counted and released uniformly on CDR.
+        let max = if req.tenant_id > 0 {
+            self.store
+                .tenant_max_concurrent(req.tenant_id)
+                .await
+                .map_err(|e| Status::internal(format!("read tenant quota: {e}")))?
+        } else {
+            None
+        };
+        let (granted, active) = self
+            .workers
+            .acquire_call_slot(&req.call_id, req.tenant_id, max)
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+        if !granted {
+            warn!(
+                tenant = req.tenant_id,
+                call_id = %req.call_id,
+                active,
+                max = ?max,
+                "call slot denied — tenant at concurrency cap"
+            );
+        }
+        Ok(Response::new(AcquireSlotResponse {
+            granted,
+            active,
+            max: max.unwrap_or(0),
+        }))
+    }
+
     // ── Platform config ───────────────────────────────────────────────────────
 
     async fn get_platform_config(
@@ -306,6 +351,8 @@ impl ControlPlane for ControlPlaneService {
             crate::grpc::proto::control::ProposeWriteResponse {
                 known: resp.known,
                 removed: resp.removed,
+                granted: resp.granted,
+                count: resp.count,
             },
         ))
     }
