@@ -8,11 +8,34 @@ import { Card } from "@/components/ui/card";
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmpty,
 } from "@/components/ui/table";
-import { RefreshCw } from "lucide-vue-next";
+import { RefreshCw, Pause, Trash2 } from "lucide-vue-next";
 
 const { t } = useI18n();
 const workers = ref<Worker[]>([]);
 const loading = ref(true);
+const error = ref("");
+
+async function drainWorker(w: Worker) {
+  if (!confirm(t("workers.drainConfirm", { id: w.worker_id }))) return;
+  error.value = "";
+  try {
+    await api.post(`/workers/${encodeURIComponent(w.worker_id)}/drain`);
+    await load();
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function removeWorker(w: Worker) {
+  if (!confirm(t("workers.removeConfirm", { id: w.worker_id }))) return;
+  error.value = "";
+  try {
+    await api.del(`/workers/${encodeURIComponent(w.worker_id)}`);
+    await load();
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 function natVariant(n: string) {
   if (n === "open" || n === "cone") return "success" as const;
@@ -44,6 +67,8 @@ onMounted(load);
       </Button>
     </div>
 
+    <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
     <Card>
       <Table>
         <TableHeader>
@@ -56,11 +81,12 @@ onMounted(load);
             <TableHead>{{ t("workers.cpu") }}</TableHead>
             <TableHead>{{ t("workers.lastHeartbeat") }}</TableHead>
             <TableHead>{{ t("common.status") }}</TableHead>
+            <TableHead class="text-right">{{ t("common.actions") }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="8">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="workers.length === 0" :colspan="8">{{ t("workers.noWorkers") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="9">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="workers.length === 0" :colspan="9">{{ t("workers.noWorkers") }}</TableEmpty>
           <TableRow v-for="w in workers" :key="w.worker_id">
             <TableCell class="font-medium">{{ w.worker_id }}</TableCell>
             <TableCell class="font-mono text-xs">{{ w.sip_addr }}</TableCell>
@@ -78,6 +104,22 @@ onMounted(load);
               <Badge v-if="w.draining" variant="warning">{{ t("workers.draining") }}</Badge>
               <Badge v-else-if="w.healthy" variant="success">{{ t("workers.healthy") }}</Badge>
               <Badge v-else variant="destructive">{{ t("workers.unhealthy") }}</Badge>
+            </TableCell>
+            <TableCell class="text-right">
+              <div class="flex justify-end gap-1">
+                <Button
+                  v-if="!w.draining"
+                  variant="ghost"
+                  size="sm"
+                  @click="drainWorker(w)"
+                  :aria-label="t('workers.drain')"
+                >
+                  <Pause class="size-4" /> {{ t("workers.drain") }}
+                </Button>
+                <Button variant="ghost" size="icon" @click="removeWorker(w)" :aria-label="t('workers.remove')">
+                  <Trash2 class="size-4 text-destructive" />
+                </Button>
+              </div>
             </TableCell>
           </TableRow>
         </TableBody>

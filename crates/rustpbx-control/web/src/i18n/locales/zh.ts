@@ -148,6 +148,10 @@ export default {
     draining: "排空中",
     secondsAgo: "{n} 秒前",
     noWorkers: "暂无已注册的媒体节点",
+    drain: "排空",
+    remove: "移除",
+    drainConfirm: "排空节点 “{id}”？将停止分配新呼叫，已有呼叫继续直到结束。",
+    removeConfirm: "从注册表移除节点 “{id}”？仅用于已死/卡住的节点。",
   },
   edges: {
     title: "边缘网关",

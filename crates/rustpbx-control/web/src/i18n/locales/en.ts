@@ -149,6 +149,10 @@ export default {
     draining: "Draining",
     secondsAgo: "{n}s ago",
     noWorkers: "No registered media workers",
+    drain: "Drain",
+    remove: "Remove",
+    drainConfirm: 'Drain worker "{id}"? It stops taking new calls; existing calls finish.',
+    removeConfirm: 'Remove worker "{id}" from the registry? Use only for a dead/stuck node.',
   },
   edges: {
     title: "Edge Gateways",

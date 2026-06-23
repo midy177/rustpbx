@@ -230,6 +230,8 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/dids", get(list_dids).post(create_did))
         .route("/dids/{id}", post(update_did).delete(delete_did))
         .route("/workers", get(list_workers))
+        .route("/workers/{id}/drain", post(drain_worker))
+        .route("/workers/{id}", axum::routing::delete(remove_worker))
         .route("/edges", get(list_edges_admin))
         // Raft cluster admin (dynamic membership)
         .route("/raft/metrics", get(raft_metrics))
@@ -985,6 +987,29 @@ async fn list_workers(
         })
         .collect();
     Ok(Json(views))
+}
+
+/// Gracefully drain a worker: it stops being selected for new calls (excluded
+/// from `available()`) while existing calls finish. Superadmin only.
+async fn drain_worker(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_superadmin(&user)?;
+    state.workers.drain(&id).await.map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Force-remove a worker entry from the registry (for stuck/dead nodes).
+async fn remove_worker(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_superadmin(&user)?;
+    state.workers.remove(&id).await.map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Edges ─────────────────────────────────────────────────────────────────────

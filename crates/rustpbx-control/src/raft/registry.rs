@@ -269,7 +269,6 @@ impl RaftRegistry {
     }
 
     /// Mark a worker as draining.
-    #[allow(dead_code)]
     pub async fn drain(&self, worker_id: &str) -> Result<()> {
         self.propose(RegistryCommand::Drain {
             worker_id: worker_id.to_string(),
@@ -279,7 +278,6 @@ impl RaftRegistry {
     }
 
     /// Remove a worker outright.
-    #[allow(dead_code)]
     pub async fn remove(&self, worker_id: &str) -> Result<()> {
         self.propose(RegistryCommand::Remove {
             worker_id: worker_id.to_string(),
