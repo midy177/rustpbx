@@ -7,6 +7,18 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Lower/upper bounds for AWS-account-style tenant ids: always exactly 12
+/// digits, so default domains look like `100035381533.pbx.example.com`.
+const TENANT_ID_MIN: i64 = 100_000_000_000;
+const TENANT_ID_SPAN: u64 = 900_000_000_000;
+
+/// Generate a random, non-sequential 12-digit tenant id (AWS-account style).
+/// Derived from a v4 UUID's randomness — no extra RNG dependency.
+fn random_tenant_id() -> i64 {
+    let r = (uuid::Uuid::new_v4().as_u128() as u64) % TENANT_ID_SPAN;
+    TENANT_ID_MIN + r as i64
+}
+
 // ── Domain helpers ────────────────────────────────────────────────────────────
 
 /// The auto-assigned default domain for a tenant: `{id}.{base_domain}`.
@@ -147,7 +159,13 @@ impl<'a> TenantService<'a> {
         if let Some(ref d) = custom_domain {
             self.ensure_domain_unique(d, None).await?;
         }
+
+        // Allocate an AWS-style 12-digit id, retrying on the (astronomically
+        // unlikely) collision rather than relying on DB auto-increment.
+        let id = self.allocate_tenant_id().await?;
+
         let model = ActiveModel {
+            id: Set(id),
             name: Set(req.name.clone()),
             status: Set(TenantStatus::Active),
             max_concurrent_calls: Set(req.max_concurrent_calls),
@@ -266,6 +284,17 @@ impl<'a> TenantService<'a> {
         Ok(None)
     }
 
+    /// Pick a free 12-digit tenant id, retrying on collision.
+    async fn allocate_tenant_id(&self) -> Result<i64> {
+        for _ in 0..8 {
+            let candidate = random_tenant_id();
+            if Entity::find_by_id(candidate).one(self.db).await?.is_none() {
+                return Ok(candidate);
+            }
+        }
+        Err(anyhow!("could not allocate a unique tenant id after several attempts"))
+    }
+
     /// Reject a custom domain already taken by another tenant.
     async fn ensure_domain_unique(&self, domain: &str, exclude_id: Option<i64>) -> Result<()> {
         let mut q = Entity::find()
@@ -365,6 +394,23 @@ mod tests {
         let t = svc.create(&req("acme", None)).await.unwrap();
         let resolved = svc.resolve_by_domain(&format!("{}.pbx.example.com", t.id)).await.unwrap();
         assert_eq!(resolved.map(|m| m.id), Some(t.id));
+    }
+
+    #[tokio::test]
+    async fn tenant_id_is_aws_style_12_digits() {
+        let db = fresh_db().await;
+        let svc = TenantService::new(&db, "pbx.example.com");
+        let t = svc.create(&req("acme", None)).await.unwrap();
+        assert!(
+            (100_000_000_000..=999_999_999_999).contains(&t.id),
+            "tenant id must be 12 digits, got {}",
+            t.id
+        );
+        // Default domain embeds the 12-digit id.
+        assert_eq!(t.default_domain, Some(format!("{}.pbx.example.com", t.id)));
+        // Distinct tenants get distinct ids.
+        let t2 = svc.create(&req("beta", None)).await.unwrap();
+        assert_ne!(t.id, t2.id);
     }
 
     #[tokio::test]
