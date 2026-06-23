@@ -1,0 +1,68 @@
+# rustpbx-worker — Media Worker reference config.
+# Copy to `rustpbx-worker.toml` and adjust. Run with:
+#   cargo run -p rustpbx-worker --bin rustpbx-worker -- crates/rustpbx-worker/rustpbx-worker.toml
+#
+# The Worker is the B2BUA + media node: the Edge forwards INVITEs to it over
+# internal SIP (TCP), and it anchors RTP, runs IVR/queue/recording, and reports
+# CDRs to the Control Plane.
+
+# Control Plane gRPC address (registration, heartbeat, CDR upload).
+control_plane_addr = "http://127.0.0.1:9090"
+
+# SIP listen address + port (internal, from the Edge). The Worker listens on
+# both UDP and TCP on this port; the Edge connects over TCP.
+sip_addr = "0.0.0.0"
+sip_port = 5060
+
+# Public/external IP for RTP (must be reachable by carriers/WebRTC). Leave unset
+# to auto-fill from the STUN probe (see stun_servers).
+# rtp_external_ip = "203.0.113.20"
+
+# RTP bind IP + port range.
+rtp_bind_ip = "0.0.0.0"
+rtp_start_port = 20000
+rtp_end_port = 40000
+
+# Max concurrent calls this worker accepts (reported as capacity; the Edge
+# stops selecting it once full).
+max_concurrent = 500
+
+# Worker instance id reported to the Control Plane (defaults to host:pid).
+worker_id = "worker-1"
+
+# Optional DB for IVR/queue state (empty → stateless) and recording root.
+# database_url = "sqlite://rustpbx-worker.sqlite3?mode=rwc"
+# recording_path = "/var/lib/rustpbx/recordings"
+
+# Heartbeat interval (seconds).
+heartbeat_secs = 5
+
+# Prometheus metrics listen address (unset → disabled).
+# metrics_addr = "0.0.0.0:9095"
+
+# Trusted Edge IPs/CIDRs — INVITEs from these sources are internal (bypass
+# ACL/Auth, decode X-* routing headers). The Edge's source IP must be listed.
+trusted_edges = ["10.0.0.0/24"]
+
+# STUN servers (host:port) for public-IP + NAT-type detection. Overridden by the
+# central list in Platform Settings when set. See the edge example for the
+# four-type-detection caveat.
+stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
+
+# Edge SIP address for outbound origination (host:port). Unset → inbound-only
+# (the Worker rejects outbound from local extensions). The Worker's source IP
+# must be in the target Edge's trusted_workers.
+# edge_sip_addr = "10.0.0.3:5060"
+
+# EdgeWorker gRPC listen address (host:port). When set, the Worker serves
+# AllocateCall so the Edge reserves a slot before sending the INVITE.
+# edge_worker_addr = "0.0.0.0:9092"
+
+# SIP contact advertised to the Edge in AllocateCall responses
+# (defaults to sip:{sip_addr}:{sip_port}).
+# sip_contact = "sip:10.0.0.7:5060"
+
+# Edge's EdgeWorker gRPC address this Worker reports CallStateUpdate events to.
+# edge_report_addr = "10.0.0.3:9093"
+
+log = "info"

@@ -1,0 +1,56 @@
+# rustpbx-control — Control Plane reference config.
+# Copy to `rustpbx-control.toml` and adjust. All keys are optional; the values
+# shown are the built-in defaults. Run with:
+#   cargo run -p rustpbx-control --bin rustpbx-control -- crates/rustpbx-control/rustpbx-control.toml
+
+# gRPC server (edges/workers connect here for config, registration, CDR).
+grpc_addr = "0.0.0.0:9090"
+
+# HTTP server: admin console SPA + JSON API.
+http_addr = "0.0.0.0:9080"
+
+# Database. SQLite (auto-created with ?mode=rwc), MySQL or Postgres.
+#   sqlite://rustpbx-control.sqlite3?mode=rwc
+#   mysql://user:pass@host/db
+#   postgres://user:pass@host/db
+database_url = "sqlite://rustpbx-control.sqlite3?mode=rwc"
+
+# Platform super-admin (config-backed). CHANGE IN PRODUCTION.
+# Logs in with no domain on the login page's "platform administrator" tab.
+admin_username = "admin"
+admin_password = "admin"
+
+# Built SPA directory (served at the HTTP root). `cargo build` builds it here.
+web_dir = "crates/rustpbx-control/web/dist"
+
+# Log filter (tracing EnvFilter syntax). `debug` also shows per-query SQL.
+log = "info"
+
+# Wildcard base domain for tenant default domains: {tenant_id}.{base_domain}
+# (e.g. 100035381533.pbx.example.com). Empty → no default domains until set.
+# Seeded into platform settings on first start; later edits via the console win.
+# base_domain = "pbx.example.com"
+
+# Worker/edge heartbeat timeout (seconds). A node is marked unhealthy after this
+# and reaped from the registry after twice this duration (30s → unhealthy at
+# 30s, reaped at 60s).
+heartbeat_timeout_secs = 30
+
+# ── Raft (control-plane HA) ───────────────────────────────────────────────────
+# Replicate the high-churn worker/edge registry across control replicas (the
+# persistent config/CDR stays in the shared DB). With no `addr`, the node runs
+# single-node (default, fully functional). Set `addr` to join a cluster; peers
+# are added at runtime via POST /api/raft/{add-learner,change-membership}.
+# [raft]
+# node_id = 1                       # unique & stable per replica; seed node = 1
+# addr = "0.0.0.0:9091"             # this node's Raft transport listen addr
+# advertise_addr = "10.0.0.5:9091"  # addr peers use to reach it (defaults to addr)
+
+# ── TLS (optional, covers business gRPC + Raft transport) ─────────────────────
+# When cert_path and key_path are both set, all control-plane gRPC uses TLS.
+# Empty (default) → plaintext.
+# [tls]
+# cert_path = "/etc/rustpbx/tls/server.pem"
+# key_path  = "/etc/rustpbx/tls/server.key"
+# ca_path   = "/etc/rustpbx/tls/ca.pem"   # defaults to cert_path
+# domain    = "control.pbx.example.com"   # name verified in peer certs

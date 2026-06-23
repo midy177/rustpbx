@@ -1,0 +1,53 @@
+# rustpbx-edge — SIP Edge Gateway reference config.
+# Copy to `rustpbx-edge.toml` and adjust. Run with:
+#   cargo run -p rustpbx-edge --bin rustpbx-edge -- crates/rustpbx-edge/rustpbx-edge.toml
+#
+# The Edge faces carriers/WebRTC, runs ACL/auth/routing, picks a Media Worker
+# from the Control Plane, and forwards INVITEs to it over internal SIP (TCP).
+
+# Control Plane gRPC address (config pull, worker discovery, registration).
+control_plane_addr = "http://127.0.0.1:9090"
+
+# SIP listen address + ports. The Edge always also listens on TCP (so Workers
+# reach it over a persistent TCP connection); set tcp_port to override the port.
+sip_addr = "0.0.0.0"
+udp_port = 5060
+tcp_port = 0          # 0 → TCP listens on udp_port; set to use a different port
+tls_port = 0          # 0 → disabled
+
+# Fixed public IP advertised in SIP Contact/Via. Leave unset to auto-fill from
+# the STUN probe (see stun_servers).
+# public_ip = "203.0.113.10"
+
+# RTP port range (media flows carrier/WebRTC ↔ Worker directly; Edge is
+# signaling-only, but the range is configured for completeness).
+rtp_start_port = 12000
+rtp_end_port = 42000
+
+# Edge instance id reported to the Control Plane (defaults to edge-<pid>).
+edge_id = "edge-1"
+
+# Region/zone label shown in the admin console.
+region = "us-east"
+
+# How often (seconds) to re-pull config from the Control Plane.
+config_poll_secs = 30
+
+# Heartbeat interval (seconds) so the Control Plane tracks liveness.
+heartbeat_secs = 10
+
+# STUN servers (host:port) for public-IP + NAT-type detection on startup.
+# Overridden by the central list in the console's Platform Settings when set.
+# Google STUN gives the public IP + cone/symmetric; full four-type detection
+# needs a server with two IPs supporting CHANGE-REQUEST (RFC 5780).
+stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
+
+# Trusted Worker IPs/CIDRs — internal INVITEs (worker→edge outbound) from these
+# sources skip ACL/Auth and decode X-* routing headers.
+trusted_workers = ["10.0.0.0/24"]
+
+# EdgeWorker gRPC listen address (host:port). When set, the Edge serves
+# CallStateUpdate so Workers can report terminal call state out-of-band.
+# edge_worker_addr = "0.0.0.0:9093"
+
+log = "info"
