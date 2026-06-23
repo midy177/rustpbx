@@ -38,9 +38,10 @@ async function removeWorker(w: Worker) {
 }
 
 function natVariant(n: string) {
-  if (n === "open" || n === "cone") return "success" as const;
-  if (n === "symmetric") return "destructive" as const;
-  if (n === "blocked") return "destructive" as const;
+  // symmetric / firewall / blocked need a media relay (TURN) → flag red.
+  if (n === "symmetric" || n === "firewall" || n === "blocked") return "destructive" as const;
+  // open + any *cone (full/restricted/port-restricted) support P2P media.
+  if (n === "open" || n.endsWith("cone")) return "success" as const;
   return "muted" as const; // nat / unknown
 }
 

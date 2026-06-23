@@ -15,9 +15,9 @@ const edges = ref<Edge[]>([]);
 const loading = ref(true);
 
 function natVariant(n: string) {
-  if (n === "open" || n === "cone") return "success" as const;
-  if (n === "symmetric" || n === "blocked") return "destructive" as const;
-  return "muted" as const;
+  if (n === "symmetric" || n === "firewall" || n === "blocked") return "destructive" as const;
+  if (n === "open" || n.endsWith("cone")) return "success" as const;
+  return "muted" as const; // nat / unknown
 }
 
 async function load() {
