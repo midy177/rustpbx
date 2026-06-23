@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     init_trusted_workers(trusted_networks);
 
     // ── Connect to Control Plane ──────────────────────────────────────────────
-    let grpc_client = GrpcControlClient::connect(
+    let grpc_client = GrpcControlClient::connect_with_retry(
         &cfg.control_plane_addr,
         cfg.edge_id.clone(),
     ).await?;
@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
 
     // ── GrpcConfigSource ──────────────────────────────────────────────────────
     let config_source = GrpcConfigSource::new(
-        GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone()).await?,
+        GrpcControlClient::connect_with_retry(&cfg.control_plane_addr, cfg.edge_id.clone()).await?,
         None,
     );
 

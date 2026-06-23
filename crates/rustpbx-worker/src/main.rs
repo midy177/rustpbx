@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
     }
 
     // ── Connect to Control Plane & register ──────────────────────────────────
-    let mut cp_client = ControlClient::connect(&cfg).await?;
+    let mut cp_client = ControlClient::connect_with_retry(&cfg).await?;
     cp_client.nat_type = nat.nat_type.clone();
     let active_calls = Arc::clone(&cp_client.active_calls);
 
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
 
     // ── Heartbeat loop ────────────────────────────────────────────────────────
     {
-        let mut hb_client = ControlClient::connect(&cfg).await?;
+        let mut hb_client = ControlClient::connect_with_retry(&cfg).await?;
         hb_client.active_calls = Arc::clone(&active_calls);
         tokio::spawn(run_heartbeat(hb_client, cfg.heartbeat_secs, cancel.clone()));
     }

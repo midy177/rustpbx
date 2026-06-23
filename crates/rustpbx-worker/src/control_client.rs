@@ -64,6 +64,26 @@ impl ControlClient {
         })
     }
 
+    /// Connect, retrying with exponential backoff until the control plane is
+    /// reachable — so a worker started before the control plane waits instead of
+    /// crashing.
+    pub async fn connect_with_retry(cfg: &WorkerConfig) -> Result<Self> {
+        let mut delay = Duration::from_millis(500);
+        loop {
+            match Self::connect(cfg).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    if Channel::from_shared(cfg.control_plane_addr.clone()).is_err() {
+                        return Err(e);
+                    }
+                    warn!(error = %e, ?delay, "control plane unreachable; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(15));
+                }
+            }
+        }
+    }
+
     /// Register this worker with the Control Plane on startup.
     pub async fn register(&mut self) -> Result<RegisterAck> {
         let resp = self

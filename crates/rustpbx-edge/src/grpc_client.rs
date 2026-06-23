@@ -29,6 +29,27 @@ impl GrpcControlClient {
         })
     }
 
+    /// Connect, retrying with exponential backoff until the control plane is
+    /// reachable — so a node started before the control plane waits instead of
+    /// crashing. (An invalid address fails fast.)
+    pub async fn connect_with_retry(addr: &str, edge_id: String) -> Result<Self> {
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            match Self::connect(addr, edge_id.clone()).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    // A malformed address never becomes valid — don't loop forever.
+                    if Channel::from_shared(addr.to_string()).is_err() {
+                        return Err(e);
+                    }
+                    tracing::warn!(error = %e, ?delay, "control plane unreachable; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(15));
+                }
+            }
+        }
+    }
+
     pub async fn get_trunk_configs(&mut self, tenant_id: Option<i64>) -> Result<TrunkConfigList> {
         let resp = self
             .client
