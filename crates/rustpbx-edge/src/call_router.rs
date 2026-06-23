@@ -30,6 +30,7 @@ use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Uri;
 use rsipstack::sip::prelude::HeadersExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 pub struct EdgeCallRouter {
@@ -38,6 +39,10 @@ pub struct EdgeCallRouter {
     #[allow(dead_code)]
     pub routing_state: Arc<RoutingState>,
     pub edge_id: String,
+    /// Live count of in-flight proxied calls, reported in the edge heartbeat.
+    /// Incremented here on a successful route; decremented by
+    /// `EdgeActiveCallHook` when the call's CDR completes.
+    pub active_calls: Arc<AtomicU32>,
 }
 
 impl EdgeCallRouter {
@@ -46,8 +51,9 @@ impl EdgeCallRouter {
         data_context: Arc<ProxyDataContext>,
         routing_state: Arc<RoutingState>,
         edge_id: String,
+        active_calls: Arc<AtomicU32>,
     ) -> Self {
-        Self { worker_selector, data_context, routing_state, edge_id }
+        Self { worker_selector, data_context, routing_state, edge_id, active_calls }
     }
 
     /// Reserve a slot on the selected worker via `AllocateCall`, returning the
@@ -235,6 +241,7 @@ impl EdgeCallRouter {
         dialplan.media.proxy_mode = MediaProxyMode::None;
         dialplan = dialplan.with_passthrough_failure(true);
 
+        self.active_calls.fetch_add(1, Ordering::Relaxed);
         Ok(dialplan)
     }
 
@@ -356,6 +363,7 @@ impl EdgeCallRouter {
         // Let SIP failure codes (4xx/5xx from Worker) pass through to the carrier.
         dialplan = dialplan.with_passthrough_failure(true);
 
+        self.active_calls.fetch_add(1, Ordering::Relaxed);
         Ok(dialplan)
     }
 

@@ -1,3 +1,4 @@
+mod active_call_hook;
 mod call_router;
 mod config;
 mod config_source;
@@ -10,6 +11,7 @@ mod proto;
 mod worker_selector;
 
 use crate::{
+    active_call_hook::EdgeActiveCallHook,
     call_router::EdgeCallRouter,
     config::EdgeConfig,
     config_source::{ConfigSource, GrpcConfigSource},
@@ -23,6 +25,7 @@ use anyhow::Result;
 use ipnetwork::IpNetwork;
 use rustpbx::{
     call::RoutingState,
+    callrecord::CallRecordManagerBuilder,
     config::ProxyConfig,
     proxy::{
         acl::AclModule,
@@ -34,6 +37,7 @@ use rustpbx::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -100,6 +104,11 @@ async fn main() -> Result<()> {
     // ── CancellationToken ─────────────────────────────────────────────────────
     let cancel = CancellationToken::new();
 
+    // Live in-flight call gauge: incremented by EdgeCallRouter on a successful
+    // route, decremented by EdgeActiveCallHook on CDR completion, reported in
+    // the heartbeat below.
+    let active_calls = Arc::new(AtomicU32::new(0));
+
     // ── Register with Control Plane + heartbeat (observability only) ──────────
     // Edges aren't load-selected; this just lets the admin console see which
     // edges are alive, their address/version/region, and health.
@@ -115,13 +124,15 @@ async fn main() -> Result<()> {
         // forgot us (e.g. it restarted).
         let hb_secs = cfg.heartbeat_secs.max(1);
         let ct = cancel.clone();
+        let hb_active = Arc::clone(&active_calls);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hb_secs));
             loop {
                 tokio::select! {
                     _ = ct.cancelled() => break,
                     _ = ticker.tick() => {
-                        match reg_client.edge_heartbeat(0).await {
+                        let n = hb_active.load(Ordering::Relaxed);
+                        match reg_client.edge_heartbeat(n).await {
                             Ok(true) => {}
                             Ok(false) => {
                                 if let Err(e) = reg_client.register_edge(info.clone()).await {
@@ -150,12 +161,25 @@ async fn main() -> Result<()> {
     // ── RoutingState (round-robin / hash state for trunk selection) ───────────
     let routing_state = Arc::new(RoutingState::new());
 
+    // ── CDR manager (edge-local) — drives the active-call gauge ───────────────
+    // The CallModule emits a CDR per proxied call; the only hook here decrements
+    // `active_calls` on completion. The authoritative CDR is reported by the
+    // worker, so the edge uploads nothing.
+    let mut cdr_builder = CallRecordManagerBuilder::new().with_cancel_token(cancel.clone());
+    let active_hook: Box<dyn rustpbx::callrecord::CallRecordHook> =
+        Box::new(EdgeActiveCallHook { active_calls: Arc::clone(&active_calls) });
+    cdr_builder = cdr_builder.with_hook(active_hook);
+    let mut cdr_manager = cdr_builder.build().await?;
+    let cdr_sender = cdr_manager.sender.clone();
+    tokio::spawn(async move { cdr_manager.serve().await });
+
     // ── EdgeCallRouter ────────────────────────────────────────────────────────
     let edge_router = Box::new(EdgeCallRouter::new(
         Arc::clone(&worker_selector),
         Arc::clone(&data_context),
         Arc::clone(&routing_state),
         cfg.edge_id.clone(),
+        Arc::clone(&active_calls),
     ));
 
     // ── Config watcher (background, re-pulls + re-injects on change) ──────────
@@ -190,6 +214,7 @@ async fn main() -> Result<()> {
     let _sip_server = SipServerBuilder::new(proxy_config)
         .with_cancel_token(cancel.clone())
         .with_skip_migrate(true)
+        .with_callrecord_sender(Some(cdr_sender))
         .with_data_context(Arc::clone(&data_context))
         .with_call_router(edge_router)
         .register_module("internal-peer", InternalPeerModule::create)
