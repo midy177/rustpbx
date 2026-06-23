@@ -100,15 +100,28 @@ async fn main() -> Result<()> {
     }
 
     // ── Connect to Control Plane ──────────────────────────────────────────────
+    // Load client TLS once (CA verify + optional client cert for mutual TLS);
+    // None → plaintext. Reused for every Control Plane connection below.
+    let cp_tls = cfg.tls.load()?;
+    if cp_tls.is_some() {
+        let mutual = !cfg.tls.client_cert_path.trim().is_empty();
+        info!(mutual, "control plane TLS enabled");
+    }
     let grpc_client = GrpcControlClient::connect_with_retry(
         &cfg.control_plane_addr,
         cfg.edge_id.clone(),
+        cp_tls.as_ref(),
     ).await?;
     let grpc_client = Arc::new(tokio::sync::RwLock::new(grpc_client));
 
     // ── GrpcConfigSource ──────────────────────────────────────────────────────
     let config_source = GrpcConfigSource::new(
-        GrpcControlClient::connect_with_retry(&cfg.control_plane_addr, cfg.edge_id.clone()).await?,
+        GrpcControlClient::connect_with_retry(
+            &cfg.control_plane_addr,
+            cfg.edge_id.clone(),
+            cp_tls.as_ref(),
+        )
+        .await?,
         None,
     );
 
@@ -126,7 +139,8 @@ async fn main() -> Result<()> {
     // ── Detect public IP + NAT type (STUN) ────────────────────────────────────
     // Prefer the centrally-managed STUN list (superadmin → platform settings);
     // fall back to the node's local config when none is configured/reachable.
-    let central_stun = grpc_client::fetch_platform_stun(&cfg.control_plane_addr).await;
+    let central_stun =
+        grpc_client::fetch_platform_stun(&cfg.control_plane_addr, cp_tls.as_ref()).await;
     let stun = if central_stun.is_empty() { cfg.stun_servers.clone() } else { central_stun };
     let nat = rustpbx_netprobe::probe(&stun, std::time::Duration::from_secs(3)).await;
     info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
@@ -142,7 +156,8 @@ async fn main() -> Result<()> {
     // edges are alive, their address/version/region, and health.
     {
         let mut reg_client =
-            GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone()).await?;
+            GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone(), cp_tls.as_ref())
+                .await?;
         let info = build_edge_info(&cfg, &nat.nat_type);
         match reg_client.register_edge(info.clone()).await {
             Ok(_) => {

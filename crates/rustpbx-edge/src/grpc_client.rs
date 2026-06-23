@@ -5,6 +5,7 @@ use crate::proto::control::{
     RegisterAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerList,
 };
 use anyhow::{Context, Result};
+use rustpbx_proto::tls::ClientTls;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
@@ -15,14 +16,14 @@ pub struct GrpcControlClient {
 }
 
 impl GrpcControlClient {
-    pub async fn connect(addr: &str, edge_id: String) -> Result<Self> {
-        let channel = Channel::from_shared(addr.to_string())
-            .context("invalid control plane address")?
+    pub async fn connect(addr: &str, edge_id: String, tls: Option<&ClientTls>) -> Result<Self> {
+        let channel = rustpbx_proto::tls::endpoint(addr, tls)
+            .map_err(|e| anyhow::anyhow!("invalid control plane address/TLS: {e}"))?
             .connect()
             .await
             .context("failed to connect to control plane")?;
 
-        info!(%addr, %edge_id, "connected to control plane");
+        info!(%addr, %edge_id, tls = tls.is_some(), "connected to control plane");
         Ok(Self {
             client: ControlPlaneClient::new(channel),
             edge_id,
@@ -31,15 +32,20 @@ impl GrpcControlClient {
 
     /// Connect, retrying with exponential backoff until the control plane is
     /// reachable — so a node started before the control plane waits instead of
-    /// crashing. (An invalid address fails fast.)
-    pub async fn connect_with_retry(addr: &str, edge_id: String) -> Result<Self> {
+    /// crashing. (An invalid address/TLS config fails fast.)
+    pub async fn connect_with_retry(
+        addr: &str,
+        edge_id: String,
+        tls: Option<&ClientTls>,
+    ) -> Result<Self> {
         let mut delay = std::time::Duration::from_millis(500);
         loop {
-            match Self::connect(addr, edge_id.clone()).await {
+            match Self::connect(addr, edge_id.clone(), tls).await {
                 Ok(c) => return Ok(c),
                 Err(e) => {
-                    // A malformed address never becomes valid — don't loop forever.
-                    if Channel::from_shared(addr.to_string()).is_err() {
+                    // A malformed address/TLS config never becomes valid — don't
+                    // loop forever.
+                    if rustpbx_proto::tls::endpoint(addr, tls).is_err() {
                         return Err(e);
                     }
                     tracing::warn!(error = %e, ?delay, "control plane unreachable; retrying");
@@ -127,9 +133,9 @@ impl GrpcControlClient {
 /// Fetch the centrally-managed STUN list from the control plane (superadmin →
 /// platform settings). Returns empty on any error — the caller then falls back
 /// to the node's local `stun_servers` config.
-pub async fn fetch_platform_stun(control_plane_addr: &str) -> Vec<String> {
+pub async fn fetch_platform_stun(control_plane_addr: &str, tls: Option<&ClientTls>) -> Vec<String> {
     use crate::proto::control::{PlatformConfigRequest, control_plane_client::ControlPlaneClient};
-    let Ok(ep) = tonic::transport::Channel::from_shared(control_plane_addr.to_string()) else {
+    let Ok(ep) = rustpbx_proto::tls::endpoint(control_plane_addr, tls) else {
         return Vec::new();
     };
     let Ok(channel) = ep.connect().await else {

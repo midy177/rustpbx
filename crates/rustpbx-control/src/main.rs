@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     // ── gRPC Server ───────────────────────────────────────────────────────────
     let grpc_addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
 
-    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, tls = cfg.tls.is_enabled(), "control plane listening");
+    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, tls = cfg.tls.is_enabled(), mutual_tls = cfg.tls.is_mutual(), "control plane listening");
 
     let mut grpc_builder = tonic::transport::Server::builder();
     if cfg.tls.is_enabled() {

@@ -54,3 +54,7 @@ heartbeat_timeout_secs = 30
 # key_path  = "/etc/rustpbx/tls/server.key"
 # ca_path   = "/etc/rustpbx/tls/ca.pem"   # defaults to cert_path
 # domain    = "control.pbx.example.com"   # name verified in peer certs
+# Set client_ca_path to REQUIRE mutual TLS: every edge/worker must present a
+# client cert signed by this CA, or its gRPC connection is rejected. Empty →
+# server-auth only (nodes verify the control plane, not vice versa).
+# client_ca_path = "/etc/rustpbx/tls/ca.pem"

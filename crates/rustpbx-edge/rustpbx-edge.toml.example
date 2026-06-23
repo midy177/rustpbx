@@ -56,3 +56,14 @@ trusted_workers = ["10.0.0.0/24"]
 # health_addr = "0.0.0.0:8081"
 
 log = "info"
+
+# ── TLS for the Control Plane gRPC connection (optional) ──────────────────────
+# Set ca_path to verify the control plane's server cert (use an https://
+# control_plane_addr). Add client_cert_path + client_key_path for mutual TLS
+# (required when the control plane sets client_ca_path). domain overrides the
+# name verified against the server cert SAN (handy when connecting to an IP).
+# [tls]
+# ca_path          = "/etc/rustpbx/tls/ca.pem"
+# client_cert_path = "/etc/rustpbx/tls/edge.crt"
+# client_key_path  = "/etc/rustpbx/tls/edge.key"
+# domain           = "control.pbx.example.com"

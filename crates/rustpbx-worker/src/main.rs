@@ -118,7 +118,9 @@ async fn main() -> Result<()> {
     // real public IP), and reports the NAT classification to the control plane.
     // Prefer the centrally-managed STUN list (superadmin → platform settings);
     // fall back to the node's local config when none is configured/reachable.
-    let central_stun = control_client::fetch_platform_stun(&cfg.control_plane_addr).await;
+    let cp_tls = cfg.tls.load()?;
+    let central_stun =
+        control_client::fetch_platform_stun(&cfg.control_plane_addr, cp_tls.as_ref()).await;
     let stun = if central_stun.is_empty() { cfg.stun_servers.clone() } else { central_stun };
     let nat = rustpbx_netprobe::probe(&stun, std::time::Duration::from_secs(3)).await;
     info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");

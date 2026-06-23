@@ -73,6 +73,12 @@ pub struct TlsConfig {
     /// host when empty.
     #[serde(default)]
     pub domain: String,
+    /// CA certificate (PEM) used to verify *client* certs — when set, the gRPC
+    /// server requires mutual TLS and rejects nodes without a cert signed by
+    /// this CA. Empty → server-auth only (clients verify the server, not vice
+    /// versa). Usually the same CA as `ca_path`.
+    #[serde(default)]
+    pub client_ca_path: String,
 }
 
 impl TlsConfig {
@@ -81,12 +87,23 @@ impl TlsConfig {
         !self.cert_path.trim().is_empty() && !self.key_path.trim().is_empty()
     }
 
-    /// Build the server-side TLS config (identity from cert+key).
+    /// Whether mutual TLS is required (a client-CA is configured).
+    pub fn is_mutual(&self) -> bool {
+        !self.client_ca_path.trim().is_empty()
+    }
+
+    /// Build the server-side TLS config (identity from cert+key, plus a client
+    /// CA root when mutual TLS is configured).
     pub fn server_tls(&self) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
         let cert = std::fs::read(&self.cert_path)?;
         let key = std::fs::read(&self.key_path)?;
         let identity = tonic::transport::Identity::from_pem(cert, key);
-        Ok(tonic::transport::ServerTlsConfig::new().identity(identity))
+        let mut cfg = tonic::transport::ServerTlsConfig::new().identity(identity);
+        if self.is_mutual() {
+            let ca = std::fs::read(&self.client_ca_path)?;
+            cfg = cfg.client_ca_root(tonic::transport::Certificate::from_pem(ca));
+        }
+        Ok(cfg)
     }
 
     /// Build the client-side TLS config (CA to verify peers, optional domain).

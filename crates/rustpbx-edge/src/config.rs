@@ -76,6 +76,59 @@ pub struct EdgeConfig {
     /// the Control Plane). Empty → no health server (use a tcpSocket probe).
     #[serde(default)]
     pub health_addr: Option<String>,
+
+    /// TLS for the Control Plane gRPC connection. Empty → plaintext. Use an
+    /// `https://` `control_plane_addr` when this is set.
+    #[serde(default)]
+    pub tls: TlsClientConfig,
+}
+
+/// Client-side TLS material for connecting to the Control Plane. Setting
+/// `ca_path` enables TLS (verify the server cert); adding a client cert + key
+/// turns on mutual TLS so the Control Plane can authenticate this node.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TlsClientConfig {
+    /// CA cert (PEM) used to verify the Control Plane's server cert. Empty →
+    /// TLS disabled.
+    #[serde(default)]
+    pub ca_path: String,
+    /// Client cert (PEM) presented for mutual TLS. Optional.
+    #[serde(default)]
+    pub client_cert_path: String,
+    /// Client private key (PEM) for mutual TLS. Optional.
+    #[serde(default)]
+    pub client_key_path: String,
+    /// Domain to verify against the server cert SAN (override; useful when the
+    /// address is an IP). Empty → derived from the address host.
+    #[serde(default)]
+    pub domain: String,
+}
+
+impl TlsClientConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.ca_path.trim().is_empty()
+    }
+
+    /// Load the PEM files into a shared `ClientTls`, or `None` when TLS isn't
+    /// configured (plaintext, backward compatible).
+    pub fn load(&self) -> anyhow::Result<Option<rustpbx_proto::tls::ClientTls>> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let ca_pem = std::fs::read(&self.ca_path)?;
+        let identity = if !self.client_cert_path.trim().is_empty()
+            && !self.client_key_path.trim().is_empty()
+        {
+            Some((
+                std::fs::read(&self.client_cert_path)?,
+                std::fs::read(&self.client_key_path)?,
+            ))
+        } else {
+            None
+        };
+        let domain = (!self.domain.trim().is_empty()).then(|| self.domain.clone());
+        Ok(Some(rustpbx_proto::tls::ClientTls { ca_pem, identity, domain }))
+    }
 }
 
 impl Default for EdgeConfig {
@@ -98,6 +151,7 @@ impl Default for EdgeConfig {
             trusted_workers: Vec::new(),
             edge_worker_addr: None,
             health_addr: None,
+            tls: TlsClientConfig::default(),
         }
     }
 }
