@@ -1,5 +1,5 @@
 use crate::models::tenant::{self, ActiveModel, Entity, Model, TenantStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -150,6 +150,14 @@ impl<'a> TenantService<'a> {
 
     pub async fn create(&self, req: &CreateTenantRequest) -> Result<TenantResponse> {
         let now = Utc::now();
+        let name = req.name.trim();
+        if name.is_empty() {
+            bail!("tenant name is required");
+        }
+        // Reject an active duplicate with a clear message; free the name if it's
+        // only held by a soft-deleted tenant (so names can be reused).
+        self.claim_name(name, None).await?;
+
         let custom_domain = req
             .custom_domain
             .as_deref()
@@ -166,7 +174,7 @@ impl<'a> TenantService<'a> {
 
         let model = ActiveModel {
             id: Set(id),
-            name: Set(req.name.clone()),
+            name: Set(name.to_string()),
             status: Set(TenantStatus::Active),
             max_concurrent_calls: Set(req.max_concurrent_calls),
             max_trunks: Set(req.max_trunks),
@@ -187,7 +195,12 @@ impl<'a> TenantService<'a> {
         let existing = self.get_model(id).await?;
         let mut model: ActiveModel = existing.into();
         if let Some(name) = req.name {
-            model.name = Set(name);
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("tenant name is required");
+            }
+            self.claim_name(name, Some(id)).await?;
+            model.name = Set(name.to_string());
         }
         if let Some(status) = req.status {
             model.status = Set(match status.as_str() {
@@ -284,6 +297,27 @@ impl<'a> TenantService<'a> {
         Ok(None)
     }
 
+    /// Make `name` available for a new/renamed tenant. `exclude_id` skips the
+    /// tenant being updated. An active (non-deleted) holder → friendly error; a
+    /// soft-deleted holder is renamed so the name is freed for reuse.
+    async fn claim_name(&self, name: &str, exclude_id: Option<i64>) -> Result<()> {
+        let mut q = Entity::find().filter(tenant::Column::Name.eq(name));
+        if let Some(id) = exclude_id {
+            q = q.filter(tenant::Column::Id.ne(id));
+        }
+        if let Some(existing) = q.one(self.db).await? {
+            if existing.status != TenantStatus::Deleted {
+                bail!("tenant name '{}' is already in use", name);
+            }
+            // Free the name held by a soft-deleted tenant.
+            let freed = format!("{name}__deleted__{}", existing.id);
+            let mut am: ActiveModel = existing.into();
+            am.name = Set(freed);
+            am.update(self.db).await?;
+        }
+        Ok(())
+    }
+
     /// Pick a free 12-digit tenant id, retrying on collision.
     async fn allocate_tenant_id(&self) -> Result<i64> {
         for _ in 0..8 {
@@ -311,7 +345,15 @@ impl<'a> TenantService<'a> {
 
     pub async fn delete(&self, id: i64) -> Result<()> {
         let existing = self.get_model(id).await?;
+        // Free the (unique) name so it can be reused; deleted tenants are
+        // excluded from listings anyway. Skip if already mangled.
+        let freed = if existing.status == TenantStatus::Deleted {
+            existing.name.clone()
+        } else {
+            format!("{}__deleted__{}", existing.name, existing.id)
+        };
         let mut model: ActiveModel = existing.into();
+        model.name = Set(freed);
         model.status = Set(TenantStatus::Deleted);
         model.updated_at = Set(Utc::now());
         model.update(self.db).await?;
@@ -411,6 +453,23 @@ mod tests {
         // Distinct tenants get distinct ids.
         let t2 = svc.create(&req("beta", None)).await.unwrap();
         assert_ne!(t.id, t2.id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_rejected_but_reusable_after_delete() {
+        let db = fresh_db().await;
+        let svc = TenantService::new(&db, "pbx.example.com");
+        let a = svc.create(&req("acme", None)).await.unwrap();
+
+        // Active duplicate → friendly error, not a raw DB constraint failure.
+        let err = svc.create(&req("acme", None)).await.unwrap_err().to_string();
+        assert!(err.contains("already in use"), "got: {err}");
+
+        // After deleting, the name frees up and can be reused.
+        svc.delete(a.id).await.unwrap();
+        let b = svc.create(&req("acme", None)).await.unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(b.name, "acme");
     }
 
     #[tokio::test]

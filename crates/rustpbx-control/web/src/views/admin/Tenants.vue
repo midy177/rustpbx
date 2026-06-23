@@ -92,6 +92,12 @@ async function save() {
     error.value = t("tenants.nameRequired");
     return;
   }
+  // When provisioning an initial admin, the password must be valid up front so
+  // we never half-create a tenant.
+  if (!editingId.value && form.admin_username && (form.admin_password ?? "").length < 6) {
+    error.value = t("tenants.adminPasswordTooShort");
+    return;
+  }
   saving.value = true;
   error.value = "";
   const payload = {

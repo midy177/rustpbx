@@ -111,6 +111,7 @@ export default {
     adminHint: "Provisions the tenant's first admin (leave blank to add later)",
     adminUsername: "Admin username",
     adminPassword: "Admin password",
+    adminPasswordTooShort: "Admin password must be at least 6 characters",
   },
   workers: {
     title: "Media Workers",

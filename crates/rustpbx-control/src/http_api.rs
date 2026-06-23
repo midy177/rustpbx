@@ -487,20 +487,31 @@ async fn create_tenant(
     Json(req): Json<CreateTenantRequest>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
+
+    // Validate the optional initial-admin credentials BEFORE creating the
+    // tenant, so an invalid password doesn't leave behind an orphan tenant.
+    let admin_creds = match (req.admin_username.as_deref().map(str::trim), req.admin_password.as_deref()) {
+        (Some(u), p) if !u.is_empty() => {
+            let p = p.unwrap_or("");
+            if p.len() < 6 {
+                return Err(ApiError::bad("admin password must be at least 6 characters"));
+            }
+            Some((u.to_string(), p.to_string()))
+        }
+        _ => None,
+    };
+
     let tenant = state.tenants().await.create(&req).await.map_err(ApiError::bad)?;
 
-    // Optionally provision the tenant's first admin account.
+    // Provision the tenant's first admin account (creds already validated).
     let mut provisioned_admin = None;
-    if let (Some(u), Some(p)) = (req.admin_username.as_deref(), req.admin_password.as_deref())
-        && !u.trim().is_empty()
-    {
+    if let Some((u, p)) = admin_creds {
         match TenantUserService::new(&state.db)
-            .create_initial_admin(tenant.id, u.trim(), p)
+            .create_initial_admin(tenant.id, &u, &p)
             .await
         {
             Ok(admin) => provisioned_admin = Some(admin),
             Err(e) => {
-                // Tenant exists but admin failed — surface a clear partial error.
                 return Err(ApiError::bad(format!(
                     "tenant created (id {}) but admin account failed: {e}",
                     tenant.id

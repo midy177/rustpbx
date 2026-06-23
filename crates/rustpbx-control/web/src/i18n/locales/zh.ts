@@ -110,6 +110,7 @@ export default {
     adminHint: "为租户创建首个管理员（留空可稍后添加）",
     adminUsername: "管理员用户名",
     adminPassword: "管理员密码",
+    adminPasswordTooShort: "管理员密码至少 6 位",
   },
   workers: {
     title: "媒体节点",
