@@ -174,6 +174,7 @@ impl ControlPlane for ControlPlaneService {
                 active_calls: info.active_calls,
                 cpu_usage: 0.0,
                 edge_worker_addr: info.edge_worker_addr,
+                nat_type: info.nat_type,
                 // Timestamps are stamped by the registry at propose time.
                 registered_at_ms: 0,
                 last_heartbeat_ms: 0,
@@ -218,6 +219,7 @@ impl ControlPlane for ControlPlaneService {
                 region: info.region,
                 version: info.version,
                 active_calls: info.active_calls,
+                nat_type: info.nat_type,
                 registered_at_ms: 0,
                 last_heartbeat_ms: 0,
             })
@@ -265,6 +267,7 @@ impl ControlPlane for ControlPlaneService {
                 active_calls: w.active_calls,
                 labels: Default::default(),
                 edge_worker_addr: w.edge_worker_addr,
+                nat_type: w.nat_type,
             })
             .collect();
 

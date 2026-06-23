@@ -142,6 +142,7 @@ export default {
     load: "Load",
     capacity: "Capacity",
     cpu: "CPU",
+    nat: "NAT",
     lastHeartbeat: "Last heartbeat",
     healthy: "Healthy",
     unhealthy: "Offline",

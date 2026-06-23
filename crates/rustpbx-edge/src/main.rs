@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "rustpbx-edge.toml".to_string());
 
-    let cfg = if std::path::Path::new(&config_path).exists() {
+    let mut cfg = if std::path::Path::new(&config_path).exists() {
         EdgeConfig::load(&config_path)?
     } else {
         EdgeConfig::default()
@@ -109,13 +109,23 @@ async fn main() -> Result<()> {
     // the heartbeat below.
     let active_calls = Arc::new(AtomicU32::new(0));
 
+    // ── Detect public IP + NAT type (STUN) ────────────────────────────────────
+    let nat = rustpbx_netprobe::probe(&cfg.stun_servers, std::time::Duration::from_secs(3)).await;
+    info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
+    if cfg.public_ip.is_none()
+        && let Some(ip) = nat.public_ip.clone()
+    {
+        info!(%ip, "using STUN-detected public IP as the edge public IP");
+        cfg.public_ip = Some(ip);
+    }
+
     // ── Register with Control Plane + heartbeat (observability only) ──────────
     // Edges aren't load-selected; this just lets the admin console see which
     // edges are alive, their address/version/region, and health.
     {
         let mut reg_client =
             GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone()).await?;
-        let info = build_edge_info(&cfg);
+        let info = build_edge_info(&cfg, &nat.nat_type);
         match reg_client.register_edge(info.clone()).await {
             Ok(_) => info!(edge_id = %cfg.edge_id, "registered with control plane"),
             Err(e) => warn!(error = %e, "edge registration failed (will retry via heartbeat)"),
@@ -233,7 +243,7 @@ async fn main() -> Result<()> {
 }
 
 /// Build the EdgeInfo reported to the Control Plane (for the admin console).
-fn build_edge_info(cfg: &EdgeConfig) -> crate::proto::control::EdgeInfo {
+fn build_edge_info(cfg: &EdgeConfig, nat_type: &str) -> crate::proto::control::EdgeInfo {
     let host = cfg.public_ip.clone().unwrap_or_else(|| cfg.sip_addr.clone());
     let mut transports = vec!["udp".to_string()];
     if cfg.tcp_port > 0 {
@@ -249,7 +259,8 @@ fn build_edge_info(cfg: &EdgeConfig) -> crate::proto::control::EdgeInfo {
         transports,
         region: cfg.region.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        active_calls: 0, // not yet wired (edge SIP session tracking is a follow-up)
+        active_calls: 0,
+        nat_type: nat_type.to_string(),
     }
 }
 

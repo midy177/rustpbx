@@ -60,6 +60,12 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub trusted_edges: Vec<String>,
 
+    /// STUN servers (`host:port`) for public-IP + NAT-type detection on startup.
+    /// Two different servers enable cone-vs-symmetric classification. Empty →
+    /// skip the probe (nat_type reported as "unknown").
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
+
     /// SIP address of the Edge to which outbound calls are forwarded
     /// (`host:port`, e.g. "10.0.0.3:5060"). When unset, the Worker rejects
     /// outbound origination from local extensions (worker-only inbound mode).
@@ -106,6 +112,7 @@ impl Default for WorkerConfig {
             heartbeat_secs: default_heartbeat_secs(),
             metrics_addr: None,
             trusted_edges: Vec::new(),
+            stun_servers: default_stun_servers(),
             edge_sip_addr: None,
             edge_worker_addr: None,
             sip_contact: None,
@@ -157,6 +164,13 @@ fn default_database_url() -> String {
 fn default_recording_path() -> String {
     "./recordings".to_string()
 }
+fn default_stun_servers() -> Vec<String> {
+    vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+    ]
+}
+
 fn default_heartbeat_secs() -> u64 {
     10
 }

@@ -13,6 +13,8 @@ path = "src/main.rs"
 rustpbx-core = { path = "../rustpbx-core" }
 # Shared protobuf/gRPC definitions (compiled once in rustpbx-proto).
 rustpbx-proto = { path = "../rustpbx-proto" }
+# Public-IP / NAT-type detection (STUN).
+rustpbx-netprobe = { path = "../rustpbx-netprobe" }
 
 # Main rustpbx crate — Worker reuses SipServer + full media stack
 rustpbx = { path = "../.." }

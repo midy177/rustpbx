@@ -226,6 +226,8 @@ message WorkerInfo {
   // EdgeWorker gRPC address (host:port) for AllocateCall. Empty if the worker
   // doesn't serve AllocateCall (Edge then selects without reservation).
   string edge_worker_addr = 9;
+  // Detected NAT type (open/cone/symmetric/nat/blocked/unknown), from STUN.
+  string nat_type = 10;
 }
 
 message RegisterAck    { bool accepted = 1; }
@@ -249,6 +251,7 @@ message EdgeInfo {
   string region           = 5;
   string version          = 6;
   uint32 active_calls     = 7;   // in-flight proxied dialogs (best-effort)
+  string nat_type         = 8;   // detected NAT type (STUN), see WorkerInfo
 }
 message EdgeHeartbeatRequest {
   string edge_id      = 1;

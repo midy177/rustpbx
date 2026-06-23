@@ -14,6 +14,13 @@ const { t } = useI18n();
 const workers = ref<Worker[]>([]);
 const loading = ref(true);
 
+function natVariant(n: string) {
+  if (n === "open" || n === "cone") return "success" as const;
+  if (n === "symmetric") return "destructive" as const;
+  if (n === "blocked") return "destructive" as const;
+  return "muted" as const; // nat / unknown
+}
+
 async function load() {
   loading.value = true;
   try {
@@ -44,6 +51,7 @@ onMounted(load);
             <TableHead>{{ t("workers.workerId") }}</TableHead>
             <TableHead>{{ t("workers.sipAddr") }}</TableHead>
             <TableHead>{{ t("workers.rtpIp") }}</TableHead>
+            <TableHead>{{ t("workers.nat") }}</TableHead>
             <TableHead>{{ t("workers.load") }}</TableHead>
             <TableHead>{{ t("workers.cpu") }}</TableHead>
             <TableHead>{{ t("workers.lastHeartbeat") }}</TableHead>
@@ -51,12 +59,16 @@ onMounted(load);
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="7">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="workers.length === 0" :colspan="7">{{ t("workers.noWorkers") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="8">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="workers.length === 0" :colspan="8">{{ t("workers.noWorkers") }}</TableEmpty>
           <TableRow v-for="w in workers" :key="w.worker_id">
             <TableCell class="font-medium">{{ w.worker_id }}</TableCell>
             <TableCell class="font-mono text-xs">{{ w.sip_addr }}</TableCell>
             <TableCell class="font-mono text-xs">{{ w.rtp_external_ip }}</TableCell>
+            <TableCell>
+              <Badge v-if="w.nat_type" :variant="natVariant(w.nat_type)">{{ w.nat_type }}</Badge>
+              <span v-else class="text-muted-foreground">—</span>
+            </TableCell>
             <TableCell>{{ w.active_calls }} / {{ w.max_concurrent }}</TableCell>
             <TableCell>{{ w.cpu_usage.toFixed(1) }}%</TableCell>
             <TableCell class="text-muted-foreground">

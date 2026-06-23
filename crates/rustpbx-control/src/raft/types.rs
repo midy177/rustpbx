@@ -55,6 +55,9 @@ pub struct WorkerRecord {
     /// EdgeWorker gRPC address (host:port) for AllocateCall; empty if absent.
     #[serde(default)]
     pub edge_worker_addr: String,
+    /// Detected NAT type (STUN): open/cone/symmetric/nat/blocked/unknown.
+    #[serde(default)]
+    pub nat_type: String,
     /// Unix-millis when the worker first registered.
     pub registered_at_ms: i64,
     /// Unix-millis of the last heartbeat (or registration).
@@ -84,6 +87,9 @@ pub struct EdgeRecord {
     pub region: String,
     pub version: String,
     pub active_calls: u32,
+    /// Detected NAT type (STUN): open/cone/symmetric/nat/blocked/unknown.
+    #[serde(default)]
+    pub nat_type: String,
     pub registered_at_ms: i64,
     pub last_heartbeat_ms: i64,
 }

@@ -141,6 +141,7 @@ export default {
     load: "负载",
     capacity: "容量",
     cpu: "CPU",
+    nat: "NAT 类型",
     lastHeartbeat: "最近心跳",
     healthy: "健康",
     unhealthy: "离线",

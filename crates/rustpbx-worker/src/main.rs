@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "rustpbx-worker.toml".to_string());
 
-    let cfg = if std::path::Path::new(&config_path).exists() {
+    let mut cfg = if std::path::Path::new(&config_path).exists() {
         WorkerConfig::load(&config_path)?
     } else {
         WorkerConfig::default()
@@ -100,8 +100,21 @@ async fn main() -> Result<()> {
     }
     let worker_metrics = Arc::new(WorkerMetrics::new());
 
+    // ── Detect public IP + NAT type (STUN) ────────────────────────────────────
+    // Fills rtp_external_ip when it wasn't configured (so media advertises the
+    // real public IP), and reports the NAT classification to the control plane.
+    let nat = rustpbx_netprobe::probe(&cfg.stun_servers, std::time::Duration::from_secs(3)).await;
+    info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
+    if cfg.rtp_external_ip.is_none()
+        && let Some(ip) = nat.public_ip.clone()
+    {
+        info!(%ip, "using STUN-detected public IP as rtp_external_ip");
+        cfg.rtp_external_ip = Some(ip);
+    }
+
     // ── Connect to Control Plane & register ──────────────────────────────────
     let mut cp_client = ControlClient::connect(&cfg).await?;
+    cp_client.nat_type = nat.nat_type.clone();
     let active_calls = Arc::clone(&cp_client.active_calls);
 
     let ack = cp_client.register().await?;

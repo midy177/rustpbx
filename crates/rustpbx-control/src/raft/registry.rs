@@ -373,6 +373,7 @@ mod tests {
             active_calls: 0,
             cpu_usage: 0.0,
             edge_worker_addr: String::new(),
+            nat_type: String::new(),
             registered_at_ms: 0,
             last_heartbeat_ms: 0,
             draining: false,
@@ -388,6 +389,7 @@ mod tests {
             region: "us-east".to_string(),
             version: "0.1.0".to_string(),
             active_calls: 0,
+            nat_type: "cone".to_string(),
             registered_at_ms: 0,
             last_heartbeat_ms: 0,
         }

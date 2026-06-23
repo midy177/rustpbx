@@ -1,0 +1,13 @@
+[package]
+name = "rustpbx-netprobe"
+version = "0.1.0"
+edition = "2024"
+description = "STUN-based public-IP and NAT-type detection for RustPBX edge/worker nodes"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.52", features = ["net", "time", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["net", "time", "rt", "macros", "rt-multi-thread"] }

@@ -31,6 +31,8 @@ pub struct ControlClient {
     max_concurrent: u32,
     /// EdgeWorker gRPC addr advertised for AllocateCall (empty if disabled).
     edge_worker_addr: String,
+    /// Detected NAT type (STUN), reported at registration. Set by main.
+    pub nat_type: String,
     /// Shared counter updated by call sessions
     pub active_calls: Arc<AtomicU32>,
 }
@@ -57,6 +59,7 @@ impl ControlClient {
             rtp_end_port: cfg.rtp_end_port as u32,
             max_concurrent: cfg.max_concurrent,
             edge_worker_addr: cfg.edge_worker_addr.clone().unwrap_or_default(),
+            nat_type: String::new(),
             active_calls: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -75,6 +78,7 @@ impl ControlClient {
                 active_calls: self.active_calls.load(Ordering::Relaxed),
                 labels: Default::default(),
                 edge_worker_addr: self.edge_worker_addr.clone(),
+                nat_type: self.nat_type.clone(),
             })
             .await?;
         Ok(resp.into_inner())

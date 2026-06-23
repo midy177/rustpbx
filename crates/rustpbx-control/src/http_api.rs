@@ -948,6 +948,7 @@ struct WorkerView {
     max_concurrent: u32,
     available_capacity: u32,
     cpu_usage: f32,
+    nat_type: String,
     registered_at: String,
     last_heartbeat_secs_ago: u64,
     healthy: bool,
@@ -979,6 +980,7 @@ async fn list_workers(
             active_calls: w.active_calls,
             max_concurrent: w.max_concurrent,
             cpu_usage: w.cpu_usage,
+            nat_type: w.nat_type,
             draining: w.draining,
         })
         .collect();
@@ -996,6 +998,7 @@ struct EdgeView {
     region: String,
     version: String,
     active_calls: u32,
+    nat_type: String,
     registered_at: String,
     last_heartbeat_secs_ago: u64,
     healthy: bool,
@@ -1026,6 +1029,7 @@ async fn list_edges_admin(
             region: e.region,
             version: e.version,
             active_calls: e.active_calls,
+            nat_type: e.nat_type,
         })
         .collect();
     Ok(Json(views))

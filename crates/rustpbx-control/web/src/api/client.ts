@@ -339,6 +339,7 @@ export interface Edge {
   region: string;
   version: string;
   active_calls: number;
+  nat_type: string;
   registered_at: string;
   last_heartbeat_secs_ago: number;
   healthy: boolean;
@@ -352,6 +353,7 @@ export interface Worker {
   max_concurrent: number;
   available_capacity: number;
   cpu_usage: number;
+  nat_type: string;
   registered_at: string;
   last_heartbeat_secs_ago: number;
   healthy: boolean;

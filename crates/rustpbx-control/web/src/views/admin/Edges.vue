@@ -14,6 +14,12 @@ const { t } = useI18n();
 const edges = ref<Edge[]>([]);
 const loading = ref(true);
 
+function natVariant(n: string) {
+  if (n === "open" || n === "cone") return "success" as const;
+  if (n === "symmetric" || n === "blocked") return "destructive" as const;
+  return "muted" as const;
+}
+
 async function load() {
   loading.value = true;
   try {
@@ -46,20 +52,25 @@ onMounted(load);
             <TableHead>{{ t("edges.transports") }}</TableHead>
             <TableHead>{{ t("edges.region") }}</TableHead>
             <TableHead>{{ t("edges.version") }}</TableHead>
+            <TableHead>{{ t("workers.nat") }}</TableHead>
             <TableHead>{{ t("edges.activeCalls") }}</TableHead>
             <TableHead>{{ t("edges.lastHeartbeat") }}</TableHead>
             <TableHead>{{ t("common.status") }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="8">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="edges.length === 0" :colspan="8">{{ t("edges.noEdges") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="9">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="edges.length === 0" :colspan="9">{{ t("edges.noEdges") }}</TableEmpty>
           <TableRow v-for="e in edges" :key="e.edge_id">
             <TableCell class="font-medium">{{ e.edge_id }}</TableCell>
             <TableCell class="font-mono text-xs">{{ e.sip_addr }}</TableCell>
             <TableCell class="uppercase text-xs">{{ e.transports.join(", ") || "—" }}</TableCell>
             <TableCell>{{ e.region || "—" }}</TableCell>
             <TableCell class="font-mono text-xs">{{ e.version || "—" }}</TableCell>
+            <TableCell>
+              <Badge v-if="e.nat_type" :variant="natVariant(e.nat_type)">{{ e.nat_type }}</Badge>
+              <span v-else class="text-muted-foreground">—</span>
+            </TableCell>
             <TableCell>{{ e.active_calls }}</TableCell>
             <TableCell class="text-muted-foreground">
               {{ t("edges.secondsAgo", { n: e.last_heartbeat_secs_ago }) }}

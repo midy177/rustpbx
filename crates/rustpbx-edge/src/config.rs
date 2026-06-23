@@ -52,6 +52,11 @@ pub struct EdgeConfig {
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
 
+    /// STUN servers (`host:port`) for public-IP + NAT-type detection on startup.
+    /// Two different servers enable cone-vs-symmetric classification.
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
+
     /// Log filter
     #[serde(default = "default_log")]
     pub log: String,
@@ -82,6 +87,7 @@ impl Default for EdgeConfig {
             region: String::new(),
             config_poll_secs: default_config_poll_secs(),
             heartbeat_secs: default_heartbeat_secs(),
+            stun_servers: default_stun_servers(),
             log: default_log(),
             trusted_workers: Vec::new(),
             edge_worker_addr: None,
@@ -119,6 +125,12 @@ fn default_config_poll_secs() -> u64 {
 }
 fn default_heartbeat_secs() -> u64 {
     10
+}
+fn default_stun_servers() -> Vec<String> {
+    vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+    ]
 }
 fn default_log() -> String {
     "info".to_string()

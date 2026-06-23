@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/rustpbx-core", "crates/rustpbx-proto", "crates/rustpbx-control", "crates/rustpbx-edge", "crates/rustpbx-worker"]
+members = [".", "crates/rustpbx-core", "crates/rustpbx-proto", "crates/rustpbx-control", "crates/rustpbx-edge", "crates/rustpbx-worker", "crates/rustpbx-netprobe"]
 
 [package]
 name = "rustpbx"
