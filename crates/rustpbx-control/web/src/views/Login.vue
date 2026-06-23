@@ -54,8 +54,15 @@ async function onSubmit() {
     const redirect = (route.query.redirect as string) || auth.homeRoute();
     router.push(redirect);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) error.value = t("auth.invalidCredentials");
-    else error.value = e instanceof Error ? e.message : t("auth.loginFailed");
+    if (e instanceof ApiError && e.status === 401) {
+      // Distinguish "the domain doesn't resolve to a tenant" from "wrong
+      // user/password" — otherwise an unknown domain looks like a bad password.
+      error.value = /domain/i.test(e.message)
+        ? t("auth.unknownDomain")
+        : t("auth.invalidCredentials");
+    } else {
+      error.value = e instanceof Error ? e.message : t("auth.loginFailed");
+    }
   } finally {
     loading.value = false;
   }

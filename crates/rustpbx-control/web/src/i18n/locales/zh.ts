@@ -39,6 +39,7 @@ export default {
     switchToRoot: "切换到平台管理员登录",
     switchToIam: "切换到租户账号登录",
     domainRequired: "请输入租户域名",
+    unknownDomain: "租户域名不存在或未启用。请在租户页面核对域名，或先让平台管理员在「平台设置」里配置泛域名。",
     username: "用户名",
     password: "密码",
     domain: "租户域名",

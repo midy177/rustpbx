@@ -40,6 +40,7 @@ export default {
     switchToRoot: "Sign in as platform administrator",
     switchToIam: "Sign in to a tenant account",
     domainRequired: "Tenant domain is required",
+    unknownDomain: "Unknown tenant domain. Check it on the tenant's page, or have the platform admin set the wildcard base domain first.",
     username: "Username",
     password: "Password",
     domain: "Tenant domain",
