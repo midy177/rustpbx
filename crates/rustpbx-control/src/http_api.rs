@@ -39,11 +39,15 @@ use dashmap::DashMap;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tower_http::{
-    cors::CorsLayer,
-    services::{ServeDir, ServeFile},
-};
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
+
+/// The built Vue admin SPA, embedded into the binary at compile time from
+/// `web/dist` (produced by build.rs). Makes the control binary self-contained —
+/// no external web directory to ship or path to configure.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+struct WebAssets;
 
 const SESSION_TTL_HOURS: i64 = 12;
 
@@ -251,8 +255,33 @@ fn affected_or_404(n: u64) -> ApiResult<StatusCode> {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-/// Build the full HTTP router: SPA static files + JSON API.
-pub fn build_router(state: HttpState, web_dir: &str) -> Router {
+/// Serve an embedded SPA asset by path, falling back to `index.html` for
+/// client-side routes (anything that isn't a real file). Returns 404 only if
+/// the SPA itself wasn't embedded.
+async fn spa_fallback(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if !path.is_empty() {
+        if let Some(asset) = WebAssets::get(path) {
+            let mime = asset.metadata.mimetype().to_string();
+            return (
+                [(axum::http::header::CONTENT_TYPE, mime)],
+                asset.data.into_owned(),
+            )
+                .into_response();
+        }
+    }
+    match WebAssets::get("index.html") {
+        Some(index) => (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            index.data.into_owned(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "web assets not embedded").into_response(),
+    }
+}
+
+/// Build the full HTTP router: embedded SPA + JSON API.
+pub fn build_router(state: HttpState) -> Router {
     let api = Router::new()
         // public
         .route("/auth/login", post(login))
@@ -298,15 +327,12 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let index = format!("{web_dir}/index.html");
-    let spa = ServeDir::new(web_dir).fallback(ServeFile::new(index));
-
     // Liveness/readiness probes — unauthenticated, outside /api (for k8s etc.).
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .nest("/api", api)
-        .fallback_service(spa)
+        .fallback(spa_fallback)
         .with_state(state)
 }
 

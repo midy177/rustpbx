@@ -20,8 +20,8 @@ database_url = "sqlite://rustpbx-control.sqlite3?mode=rwc"
 admin_username = "admin"
 admin_password = "admin"
 
-# Built SPA directory (served at the HTTP root). `cargo build` builds it here.
-web_dir = "crates/rustpbx-control/web/dist"
+# The admin SPA is embedded into the binary at build time (from web/dist), so
+# there's no web directory to configure or ship — the binary is self-contained.
 
 # Log filter (tracing EnvFilter syntax). `debug` also shows per-query SQL.
 log = "info"

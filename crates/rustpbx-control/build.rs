@@ -19,6 +19,12 @@ fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let web = Path::new(&manifest_dir).join("web");
 
+    // `rust-embed` embeds `web/dist` at compile time and fails if the folder is
+    // missing. Guarantee it exists with at least a stub index.html so a
+    // backend-only build (no `bun`/`npm`, or RUSTPBX_SKIP_WEB_BUILD=1 on a clean
+    // checkout) still compiles. A real `bun run build` below overwrites it.
+    ensure_dist_stub(&web.join("dist"));
+
     // The build script itself only needs to re-run when the web project changes
     // (or this script does). Without a web project, there's nothing to do.
     println!("cargo:rerun-if-changed=build.rs");
@@ -75,6 +81,27 @@ fn main() {
     // Build the SPA. A failure here fails the cargo build — a broken frontend
     // shouldn't ship silently.
     run(pm, &["run", "build"], &web);
+}
+
+/// Ensure `dist` exists with at least an `index.html` so `rust-embed` always
+/// has a folder to embed. Only writes a stub when `index.html` is absent — a
+/// real SPA build is never clobbered.
+fn ensure_dist_stub(dist: &Path) {
+    let index = dist.join("index.html");
+    if index.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dist) {
+        println!("cargo:warning=could not create {}: {e}", dist.display());
+        return;
+    }
+    let stub = "<!doctype html><html><head><meta charset=\"utf-8\">\
+        <title>rustpbx-control</title></head><body>\
+        <p>Web console not built. Run the SPA build (bun run build) or build \
+        without RUSTPBX_SKIP_WEB_BUILD.</p></body></html>";
+    if let Err(e) = std::fs::write(&index, stub) {
+        println!("cargo:warning=could not write {}: {e}", index.display());
+    }
 }
 
 /// Recursively emit `rerun-if-changed` for every file under `dir`.

@@ -22,10 +22,6 @@ pub struct ControlConfig {
     #[serde(default = "default_admin_password")]
     pub admin_password: String,
 
-    /// Directory containing the built SPA (`web/dist`).
-    #[serde(default = "default_web_dir")]
-    pub web_dir: String,
-
     /// Log level / filter
     #[serde(default = "default_log")]
     pub log: String,
@@ -190,7 +186,6 @@ impl Default for ControlConfig {
             database_url: default_database_url(),
             admin_username: default_admin_username(),
             admin_password: default_admin_password(),
-            web_dir: default_web_dir(),
             log: default_log(),
             base_domain: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
@@ -227,10 +222,6 @@ fn default_admin_username() -> String {
 
 fn default_admin_password() -> String {
     "admin".to_string()
-}
-
-fn default_web_dir() -> String {
-    "crates/rustpbx-control/web/dist".to_string()
 }
 
 fn default_log() -> String {

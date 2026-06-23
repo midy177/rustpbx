@@ -180,13 +180,13 @@ async fn main() -> Result<()> {
         admin_username: cfg.admin_username.clone(),
         admin_password: cfg.admin_password.clone(),
     };
-    let http_router = http_api::build_router(http_state, &cfg.web_dir);
+    let http_router = http_api::build_router(http_state);
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;
 
     // ── gRPC Server ───────────────────────────────────────────────────────────
     let grpc_addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
 
-    info!(%grpc_addr, %http_addr, web_dir = %cfg.web_dir, tls = cfg.tls.is_enabled(), mutual_tls = cfg.tls.is_mutual(), "control plane listening");
+    info!(%grpc_addr, %http_addr, tls = cfg.tls.is_enabled(), mutual_tls = cfg.tls.is_mutual(), "control plane listening");
 
     let mut grpc_builder = tonic::transport::Server::builder();
     if cfg.tls.is_enabled() {
