@@ -10,10 +10,16 @@ import {
 } from "@/components/ui/table";
 import { RefreshCw, Pause, Trash2 } from "lucide-vue-next";
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 const workers = ref<Worker[]>([]);
 const loading = ref(true);
 const error = ref("");
+
+/** Localized NAT-type label, falling back to the raw value if unmapped. */
+function natLabel(n: string) {
+  const key = `workers.natTypes.${n}`;
+  return te(key) ? t(key) : n;
+}
 
 async function drainWorker(w: Worker) {
   if (!confirm(t("workers.drainConfirm", { id: w.worker_id }))) return;
@@ -93,7 +99,7 @@ onMounted(load);
             <TableCell class="font-mono text-xs">{{ w.sip_addr }}</TableCell>
             <TableCell class="font-mono text-xs">{{ w.rtp_external_ip }}</TableCell>
             <TableCell>
-              <Badge v-if="w.nat_type" :variant="natVariant(w.nat_type)">{{ w.nat_type }}</Badge>
+              <Badge v-if="w.nat_type" :variant="natVariant(w.nat_type)" :title="w.nat_type">{{ natLabel(w.nat_type) }}</Badge>
               <span v-else class="text-muted-foreground">—</span>
             </TableCell>
             <TableCell>{{ w.active_calls }} / {{ w.max_concurrent }}</TableCell>

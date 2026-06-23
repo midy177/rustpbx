@@ -10,9 +10,14 @@ import {
 } from "@/components/ui/table";
 import { RefreshCw } from "lucide-vue-next";
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 const edges = ref<Edge[]>([]);
 const loading = ref(true);
+
+function natLabel(n: string) {
+  const key = `workers.natTypes.${n}`;
+  return te(key) ? t(key) : n;
+}
 
 function natVariant(n: string) {
   if (n === "symmetric" || n === "firewall" || n === "blocked") return "destructive" as const;
@@ -68,7 +73,7 @@ onMounted(load);
             <TableCell>{{ e.region || "—" }}</TableCell>
             <TableCell class="font-mono text-xs">{{ e.version || "—" }}</TableCell>
             <TableCell>
-              <Badge v-if="e.nat_type" :variant="natVariant(e.nat_type)">{{ e.nat_type }}</Badge>
+              <Badge v-if="e.nat_type" :variant="natVariant(e.nat_type)" :title="e.nat_type">{{ natLabel(e.nat_type) }}</Badge>
               <span v-else class="text-muted-foreground">—</span>
             </TableCell>
             <TableCell>{{ e.active_calls }}</TableCell>
