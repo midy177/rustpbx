@@ -21,7 +21,9 @@ use openraft::EntryPayload;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use super::types::{NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord};
+use super::types::{
+    EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
+};
 
 /// The data captured in a snapshot: the full state machine contents.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -30,6 +32,9 @@ pub struct StoredSnapshot {
     pub last_membership: StoredMembership<NodeId, openraft::BasicNode>,
     /// Serialized worker map.
     pub workers: BTreeMap<String, WorkerRecord>,
+    /// Serialized edge map (defaulted for snapshots written before edges existed).
+    #[serde(default)]
+    pub edges: BTreeMap<String, EdgeRecord>,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -39,6 +44,8 @@ struct StateMachineData {
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
     /// worker_id -> record
     workers: BTreeMap<String, WorkerRecord>,
+    /// edge_id -> record
+    edges: BTreeMap<String, EdgeRecord>,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -62,11 +69,17 @@ impl StateMachineStore {
     pub async fn list_workers(&self) -> Vec<WorkerRecord> {
         self.data.lock().await.workers.values().cloned().collect()
     }
+
+    /// Read-only snapshot of the current edge map.
+    pub async fn list_edges(&self) -> Vec<EdgeRecord> {
+        self.data.lock().await.edges.values().cloned().collect()
+    }
 }
 
-/// Apply one command to the worker map. Pure function of (map, command) so the
-/// result is identical on every replica.
-fn apply_command(workers: &mut BTreeMap<String, WorkerRecord>, cmd: RegistryCommand) -> RegistryResponse {
+/// Apply one command to the registry maps. Pure function of (data, command) so
+/// the result is identical on every replica.
+fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryResponse {
+    let workers = &mut data.workers;
     match cmd {
         RegistryCommand::Register { record } => {
             workers.insert(record.worker_id.clone(), record);
@@ -101,14 +114,43 @@ fn apply_command(workers: &mut BTreeMap<String, WorkerRecord>, cmd: RegistryComm
             let removed = (before - workers.len()) as u32;
             RegistryResponse { known: true, removed }
         }
+        // ── Edge registry ──────────────────────────────────────────────────────
+        RegistryCommand::RegisterEdge { record } => {
+            data.edges.insert(record.edge_id.clone(), record);
+            RegistryResponse { known: true, removed: 0 }
+        }
+        RegistryCommand::EdgeHeartbeat { edge_id, active_calls, at_ms } => {
+            if let Some(e) = data.edges.get_mut(&edge_id) {
+                e.active_calls = active_calls;
+                e.last_heartbeat_ms = at_ms;
+                RegistryResponse { known: true, removed: 0 }
+            } else {
+                RegistryResponse { known: false, removed: 0 }
+            }
+        }
+        RegistryCommand::RemoveEdge { edge_id } => {
+            let removed = data.edges.remove(&edge_id).is_some() as u32;
+            RegistryResponse { known: removed > 0, removed }
+        }
+        RegistryCommand::ReapStaleEdges { before_ms } => {
+            let before = data.edges.len();
+            data.edges.retain(|_, e| e.last_heartbeat_ms >= before_ms);
+            let removed = (before - data.edges.len()) as u32;
+            RegistryResponse { known: true, removed }
+        }
     }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (last_applied, last_membership, workers) = {
+        let (last_applied, last_membership, workers, edges) = {
             let data = self.data.lock().await;
-            (data.last_applied, data.last_membership.clone(), data.workers.clone())
+            (
+                data.last_applied,
+                data.last_membership.clone(),
+                data.workers.clone(),
+                data.edges.clone(),
+            )
         };
 
         let snapshot_id = {
@@ -124,6 +166,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             last_applied,
             last_membership: last_membership.clone(),
             workers,
+            edges,
         };
         let bytes = serde_json::to_vec(&stored)
             .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -170,7 +213,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                     responses.push(RegistryResponse { known: false, removed: 0 });
                 }
                 EntryPayload::Normal(cmd) => {
-                    let resp = apply_command(&mut data.workers, cmd);
+                    let resp = apply_command(&mut data, cmd);
                     responses.push(resp);
                 }
                 EntryPayload::Membership(mem) => {
@@ -205,6 +248,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.last_applied = stored.last_applied;
         data.last_membership = stored.last_membership;
         data.workers = stored.workers;
+        data.edges = stored.edges;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {

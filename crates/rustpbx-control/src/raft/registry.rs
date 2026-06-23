@@ -18,7 +18,9 @@ use tracing::info;
 use super::log_store::LogStore;
 use super::network::NetworkFactory;
 use super::state_machine::StateMachineStore;
-use super::types::{node_addr, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord};
+use super::types::{
+    node_addr, EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
+};
 
 /// Current wall-clock in unix-millis. Used by the leader to stamp commands so
 /// state-machine application stays deterministic across replicas.
@@ -301,6 +303,45 @@ impl RaftRegistry {
         self.sm.list_workers().await
     }
 
+    // ── Edge registry ──────────────────────────────────────────────────────────
+
+    /// Register (or replace) an edge. Timestamps are stamped here if zero.
+    pub async fn register_edge(&self, mut record: EdgeRecord) -> Result<()> {
+        let now = now_ms();
+        if record.registered_at_ms == 0 {
+            record.registered_at_ms = now;
+        }
+        record.last_heartbeat_ms = now;
+        self.propose(RegistryCommand::RegisterEdge { record }).await?;
+        Ok(())
+    }
+
+    /// Record an edge heartbeat. Returns whether the edge was known.
+    pub async fn edge_heartbeat(&self, edge_id: &str, active_calls: u32) -> Result<bool> {
+        let resp = self
+            .propose(RegistryCommand::EdgeHeartbeat {
+                edge_id: edge_id.to_string(),
+                active_calls,
+                at_ms: now_ms(),
+            })
+            .await?;
+        Ok(resp.known)
+    }
+
+    /// Remove edges whose heartbeat is stale past 2× the timeout. Returns the
+    /// number reaped (leader commits; followers forward).
+    pub async fn reap_stale_edges(&self) -> Result<u32> {
+        let threshold_ms = (self.heartbeat_timeout.as_millis() as i64) * 2;
+        let before_ms = now_ms() - threshold_ms;
+        let resp = self.propose(RegistryCommand::ReapStaleEdges { before_ms }).await?;
+        Ok(resp.removed)
+    }
+
+    /// All registered edges (healthy or not) — for the admin API.
+    pub async fn all_edges(&self) -> Vec<EdgeRecord> {
+        self.sm.list_edges().await
+    }
+
     /// Healthy workers with spare capacity, most-available first.
     pub async fn available(&self) -> Vec<WorkerRecord> {
         let now = now_ms();
@@ -338,8 +379,52 @@ mod tests {
         }
     }
 
+    fn edge_rec(id: &str) -> EdgeRecord {
+        EdgeRecord {
+            edge_id: id.to_string(),
+            public_ip: "203.0.113.7".to_string(),
+            sip_addr: "203.0.113.7:5060".to_string(),
+            transports: vec!["udp".to_string()],
+            region: "us-east".to_string(),
+            version: "0.1.0".to_string(),
+            active_calls: 0,
+            registered_at_ms: 0,
+            last_heartbeat_ms: 0,
+        }
+    }
+
     async fn start() -> RaftRegistry {
         RaftRegistry::start(1, Duration::from_secs(30)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn edge_register_heartbeat_and_reap() {
+        let reg = start().await;
+        reg.register_edge(edge_rec("edge-1")).await.unwrap();
+        reg.register_edge(edge_rec("edge-2")).await.unwrap();
+        assert_eq!(reg.all_edges().await.len(), 2, "both edges committed");
+
+        // Heartbeat updates load and is known; unknown edge reports not-known.
+        assert!(reg.edge_heartbeat("edge-1", 5).await.unwrap());
+        assert!(!reg.edge_heartbeat("ghost", 1).await.unwrap());
+        let e1 = reg.all_edges().await.into_iter().find(|e| e.edge_id == "edge-1").unwrap();
+        assert_eq!(e1.active_calls, 5);
+
+        // Force edge-2 stale, then reap.
+        reg.raft()
+            .client_write(RegistryCommand::EdgeHeartbeat {
+                edge_id: "edge-2".to_string(),
+                active_calls: 0,
+                at_ms: 1,
+            })
+            .await
+            .unwrap();
+        let removed = reg.reap_stale_edges().await.unwrap();
+        assert_eq!(removed, 1, "only the stale edge is reaped");
+        let ids: Vec<String> = reg.all_edges().await.into_iter().map(|e| e.edge_id).collect();
+        assert_eq!(ids, vec!["edge-1".to_string()]);
+        // Worker registry is unaffected by edge commands.
+        assert!(reg.all().await.is_empty());
     }
 
     #[tokio::test]

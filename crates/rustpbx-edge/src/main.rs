@@ -100,6 +100,42 @@ async fn main() -> Result<()> {
     // ── CancellationToken ─────────────────────────────────────────────────────
     let cancel = CancellationToken::new();
 
+    // ── Register with Control Plane + heartbeat (observability only) ──────────
+    // Edges aren't load-selected; this just lets the admin console see which
+    // edges are alive, their address/version/region, and health.
+    {
+        let mut reg_client =
+            GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone()).await?;
+        let info = build_edge_info(&cfg);
+        match reg_client.register_edge(info.clone()).await {
+            Ok(_) => info!(edge_id = %cfg.edge_id, "registered with control plane"),
+            Err(e) => warn!(error = %e, "edge registration failed (will retry via heartbeat)"),
+        }
+        // Heartbeat loop: refresh liveness, re-register if the control plane
+        // forgot us (e.g. it restarted).
+        let hb_secs = cfg.heartbeat_secs.max(1);
+        let ct = cancel.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hb_secs));
+            loop {
+                tokio::select! {
+                    _ = ct.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match reg_client.edge_heartbeat(0).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(e) = reg_client.register_edge(info.clone()).await {
+                                    warn!(error = %e, "edge re-register failed");
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "edge heartbeat failed"),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ── ProxyDataContext (shared by SipServer + EdgeCallRouter) ───────────────
     let proxy_config = Arc::new(build_proxy_config(&cfg));
     let data_context = Arc::new(
@@ -169,6 +205,27 @@ async fn main() -> Result<()> {
     info!("shutdown");
     cancel.cancel();
     Ok(())
+}
+
+/// Build the EdgeInfo reported to the Control Plane (for the admin console).
+fn build_edge_info(cfg: &EdgeConfig) -> crate::proto::control::EdgeInfo {
+    let host = cfg.public_ip.clone().unwrap_or_else(|| cfg.sip_addr.clone());
+    let mut transports = vec!["udp".to_string()];
+    if cfg.tcp_port > 0 {
+        transports.push("tcp".to_string());
+    }
+    if cfg.tls_port > 0 {
+        transports.push("tls".to_string());
+    }
+    crate::proto::control::EdgeInfo {
+        edge_id: cfg.edge_id.clone(),
+        public_ip: cfg.public_ip.clone().unwrap_or_default(),
+        sip_addr: format!("{host}:{}", cfg.udp_port),
+        transports,
+        region: cfg.region.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        active_calls: 0, // not yet wired (edge SIP session tracking is a follow-up)
+    }
 }
 
 fn build_proxy_config(cfg: &EdgeConfig) -> ProxyConfig {

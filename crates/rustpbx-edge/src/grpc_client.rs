@@ -1,12 +1,12 @@
 /// gRPC client wrapper for communicating with the Control Plane.
 use crate::proto::control::{
-    control_plane_client::ControlPlaneClient, AclRuleList, GetAclRulesRequest,
-    GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest, RouteRuleList,
-    TrunkConfigList, WatchRequest, WorkerList,
+    control_plane_client::ControlPlaneClient, AclRuleList, EdgeHeartbeatRequest, EdgeInfo,
+    GetAclRulesRequest, GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest,
+    RegisterAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerList,
 };
 use anyhow::{Context, Result};
 use tonic::transport::Channel;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct GrpcControlClient {
@@ -62,6 +62,29 @@ impl GrpcControlClient {
             .get_available_workers(GetWorkersRequest { tenant_id })
             .await?;
         Ok(resp.into_inner())
+    }
+
+    /// Register this edge with the Control Plane (observability only).
+    pub async fn register_edge(&mut self, info: EdgeInfo) -> Result<RegisterAck> {
+        let resp = self.client.register_edge(info).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Send one heartbeat. Returns false if the control plane asked us to
+    /// re-register (it doesn't know this edge — e.g. it restarted).
+    pub async fn edge_heartbeat(&mut self, active_calls: u32) -> Result<bool> {
+        let resp = self
+            .client
+            .edge_heartbeat(EdgeHeartbeatRequest {
+                edge_id: self.edge_id.clone(),
+                active_calls,
+            })
+            .await?;
+        let drain = resp.into_inner().drain;
+        if drain {
+            warn!("control plane doesn't know this edge — will re-register");
+        }
+        Ok(!drain)
     }
 
     pub async fn watch_config_changes(

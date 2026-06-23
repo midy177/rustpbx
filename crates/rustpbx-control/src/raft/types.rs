@@ -73,6 +73,28 @@ impl WorkerRecord {
     }
 }
 
+/// A serializable snapshot of one registered Edge gateway. Edges aren't
+/// load-selected (so no capacity fields); this is purely for observability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EdgeRecord {
+    pub edge_id: String,
+    pub public_ip: String,
+    pub sip_addr: String,
+    pub transports: Vec<String>,
+    pub region: String,
+    pub version: String,
+    pub active_calls: u32,
+    pub registered_at_ms: i64,
+    pub last_heartbeat_ms: i64,
+}
+
+impl EdgeRecord {
+    /// Healthy = heartbeat within `timeout_ms` of `now_ms`.
+    pub fn is_healthy(&self, now_ms: i64, timeout_ms: i64) -> bool {
+        now_ms.saturating_sub(self.last_heartbeat_ms) < timeout_ms
+    }
+}
+
 /// Commands applied to the replicated worker registry (the Raft `AppData`).
 ///
 /// Every mutation of the registry goes through `Raft::client_write` with one of
@@ -96,6 +118,16 @@ pub enum RegistryCommand {
     Remove { worker_id: String },
     /// Remove every worker whose heartbeat is older than `before_ms`.
     ReapStale { before_ms: i64 },
+
+    // ── Edge registry ──────────────────────────────────────────────────────────
+    /// Insert or replace an edge (register / re-register).
+    RegisterEdge { record: EdgeRecord },
+    /// Refresh an edge's load + heartbeat timestamp.
+    EdgeHeartbeat { edge_id: String, active_calls: u32, at_ms: i64 },
+    /// Remove an edge outright.
+    RemoveEdge { edge_id: String },
+    /// Remove every edge whose heartbeat is older than `before_ms`.
+    ReapStaleEdges { before_ms: i64 },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any

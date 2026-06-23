@@ -226,6 +226,7 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/dids", get(list_dids).post(create_did))
         .route("/dids/{id}", post(update_did).delete(delete_did))
         .route("/workers", get(list_workers))
+        .route("/edges", get(list_edges_admin))
         // Raft cluster admin (dynamic membership)
         .route("/raft/metrics", get(raft_metrics))
         .route("/raft/add-learner", post(raft_add_learner))
@@ -882,6 +883,52 @@ async fn list_workers(
             max_concurrent: w.max_concurrent,
             cpu_usage: w.cpu_usage,
             draining: w.draining,
+        })
+        .collect();
+    Ok(Json(views))
+}
+
+// ── Edges ─────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct EdgeView {
+    edge_id: String,
+    public_ip: String,
+    sip_addr: String,
+    transports: Vec<String>,
+    region: String,
+    version: String,
+    active_calls: u32,
+    registered_at: String,
+    last_heartbeat_secs_ago: u64,
+    healthy: bool,
+}
+
+async fn list_edges_admin(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<Vec<EdgeView>>> {
+    require_superadmin(&user)?;
+    let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let views = state
+        .workers
+        .all_edges()
+        .await
+        .into_iter()
+        .map(|e| EdgeView {
+            healthy: e.is_healthy(now_ms, timeout_ms),
+            last_heartbeat_secs_ago: now_ms.saturating_sub(e.last_heartbeat_ms).max(0) as u64 / 1000,
+            registered_at: chrono::DateTime::from_timestamp_millis(e.registered_at_ms)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
+            edge_id: e.edge_id,
+            public_ip: e.public_ip,
+            sip_addr: e.sip_addr,
+            transports: e.transports,
+            region: e.region,
+            version: e.version,
+            active_calls: e.active_calls,
         })
         .collect();
     Ok(Json(views))

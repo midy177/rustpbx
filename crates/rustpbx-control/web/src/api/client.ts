@@ -307,6 +307,19 @@ export interface Route {
   tenant_id: number | null;
 }
 
+export interface Edge {
+  edge_id: string;
+  public_ip: string;
+  sip_addr: string;
+  transports: string[];
+  region: string;
+  version: string;
+  active_calls: number;
+  registered_at: string;
+  last_heartbeat_secs_ago: number;
+  healthy: boolean;
+}
+
 export interface Worker {
   worker_id: string;
   sip_addr: string;

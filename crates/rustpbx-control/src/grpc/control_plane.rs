@@ -1,9 +1,9 @@
 use crate::{
     grpc::proto::control::{
-        AclRuleList, CallRecordReport, ConfigChangeEvent, GetAclRulesRequest,
-        GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest,
-        HeartbeatResponse, RegisterAck, ReportAck, RouteRuleList, TrunkConfigList, WatchRequest,
-        WorkerInfo, WorkerList,
+        AclRuleList, CallRecordReport, ConfigChangeEvent, EdgeHeartbeatRequest, EdgeInfo,
+        GetAclRulesRequest, GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest,
+        HeartbeatRequest, HeartbeatResponse, RegisterAck, ReportAck, RouteRuleList, TrunkConfigList,
+        WatchRequest, WorkerInfo, WorkerList,
         control_plane_server::ControlPlane,
     },
     raft::registry::RaftRegistry,
@@ -196,6 +196,48 @@ impl ControlPlane for ControlPlaneService {
             .heartbeat(&hb.worker_id, hb.active_calls, hb.cpu_usage)
             .await
             .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+        Ok(Response::new(HeartbeatResponse { drain: !known }))
+    }
+
+    // ── Edge lifecycle ────────────────────────────────────────────────────────
+
+    async fn register_edge(
+        &self,
+        request: Request<EdgeInfo>,
+    ) -> Result<Response<RegisterAck>, Status> {
+        use crate::raft::types::EdgeRecord;
+        let info = request.into_inner();
+        info!(edge_id = %info.edge_id, sip_addr = %info.sip_addr, version = %info.version, "edge register");
+
+        self.workers
+            .register_edge(EdgeRecord {
+                edge_id: info.edge_id,
+                public_ip: info.public_ip,
+                sip_addr: info.sip_addr,
+                transports: info.transports,
+                region: info.region,
+                version: info.version,
+                active_calls: info.active_calls,
+                registered_at_ms: 0,
+                last_heartbeat_ms: 0,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+
+        Ok(Response::new(RegisterAck { accepted: true }))
+    }
+
+    async fn edge_heartbeat(
+        &self,
+        request: Request<EdgeHeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let hb = request.into_inner();
+        let known = self
+            .workers
+            .edge_heartbeat(&hb.edge_id, hb.active_calls)
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+        // Unknown edge (e.g. control restarted) → tell it to re-register.
         Ok(Response::new(HeartbeatResponse { drain: !known }))
     }
 

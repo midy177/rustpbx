@@ -39,9 +39,18 @@ pub struct EdgeConfig {
     #[serde(default = "default_edge_id")]
     pub edge_id: String,
 
+    /// Region/zone label reported to the Control Plane (for the admin console).
+    #[serde(default)]
+    pub region: String,
+
     /// How often (seconds) to re-pull config from Control Plane
     #[serde(default = "default_config_poll_secs")]
     pub config_poll_secs: u64,
+
+    /// How often (seconds) to heartbeat to the Control Plane so it can track
+    /// this edge's liveness.
+    #[serde(default = "default_heartbeat_secs")]
+    pub heartbeat_secs: u64,
 
     /// Log filter
     #[serde(default = "default_log")]
@@ -70,7 +79,9 @@ impl Default for EdgeConfig {
             rtp_start_port: default_rtp_start(),
             rtp_end_port: default_rtp_end(),
             edge_id: default_edge_id(),
+            region: String::new(),
             config_poll_secs: default_config_poll_secs(),
+            heartbeat_secs: default_heartbeat_secs(),
             log: default_log(),
             trusted_workers: Vec::new(),
             edge_worker_addr: None,
@@ -105,6 +116,9 @@ fn default_edge_id() -> String {
 }
 fn default_config_poll_secs() -> u64 {
     30
+}
+fn default_heartbeat_secs() -> u64 {
+    10
 }
 fn default_log() -> String {
     "info".to_string()

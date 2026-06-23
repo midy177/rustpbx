@@ -153,6 +153,9 @@ async fn main() -> Result<()> {
             if let Err(e) = reap_registry.reap_stale().await {
                 tracing::warn!(error = %e, "worker reap failed");
             }
+            if let Err(e) = reap_registry.reap_stale_edges().await {
+                tracing::warn!(error = %e, "edge reap failed");
+            }
         }
     });
 

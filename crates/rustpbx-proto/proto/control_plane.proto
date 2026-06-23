@@ -18,6 +18,13 @@ service ControlPlane {
   rpc RegisterWorker(WorkerInfo)        returns (RegisterAck);
   rpc WorkerHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
+  // ── Edge lifecycle (observability) ────────────────────────────────────────
+  // Edges aren't load-selected by the control plane (carriers reach them by
+  // fixed IP/DNS); registering is purely so the admin console can see which
+  // edges are alive, their address/version, and health.
+  rpc RegisterEdge(EdgeInfo)            returns (RegisterAck);
+  rpc EdgeHeartbeat(EdgeHeartbeatRequest) returns (HeartbeatResponse);
+
   // ── Worker discovery ──────────────────────────────────────────────────────
   rpc GetAvailableWorkers(GetWorkersRequest) returns (WorkerList);
 
@@ -231,3 +238,19 @@ message HeartbeatRequest {
 message HeartbeatResponse  { bool drain = 1; }
 message GetWorkersRequest  { optional int64 tenant_id = 1; }
 message WorkerList         { repeated WorkerInfo workers = 1; }
+
+// ─── Edge lifecycle ────────────────────────────────────────────────────────────
+
+message EdgeInfo {
+  string edge_id          = 1;
+  string public_ip        = 2;   // fixed public IP advertised to carriers
+  string sip_addr         = 3;   // e.g. "1.2.3.4:5060"
+  repeated string transports = 4; // udp / tcp / tls
+  string region           = 5;
+  string version          = 6;
+  uint32 active_calls     = 7;   // in-flight proxied dialogs (best-effort)
+}
+message EdgeHeartbeatRequest {
+  string edge_id      = 1;
+  uint32 active_calls = 2;
+}
