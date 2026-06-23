@@ -176,6 +176,10 @@ export default {
     baseDomainHint:
       "租户将获得 {id}.{base} 形式的默认域名。请将泛解析 DNS 记录（*.基础域名）指向平台。",
     baseDomainPlaceholder: "例如：pbx.example.com",
+    stun: "STUN 服务器",
+    stunPlaceholder: "stun.l.google.com:19302\nstun1.l.google.com:19302",
+    stunHint:
+      "下发给所有 edge/worker 做 NAT 探测（每行一个 host:port）。留空则各节点用本地默认。完整四种类型探测需要有两个 IP 且支持 CHANGE-REQUEST 的服务器（RFC 5780）。",
     savedOk: "设置已保存",
   },
   iam: {

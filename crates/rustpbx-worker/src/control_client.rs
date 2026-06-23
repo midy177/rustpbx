@@ -147,6 +147,26 @@ pub async fn run_heartbeat(
     }
 }
 
+/// Fetch the centrally-managed STUN list from the control plane (superadmin →
+/// platform settings). Returns empty on any error — the caller falls back to
+/// the node's local `stun_servers` config.
+pub async fn fetch_platform_stun(control_plane_addr: &str) -> Vec<String> {
+    use crate::proto::control::{PlatformConfigRequest, control_plane_client::ControlPlaneClient};
+    let Ok(ep) = tonic::transport::Channel::from_shared(control_plane_addr.to_string()) else {
+        return Vec::new();
+    };
+    let Ok(channel) = ep.connect().await else {
+        return Vec::new();
+    };
+    match ControlPlaneClient::new(channel)
+        .get_platform_config(PlatformConfigRequest {})
+        .await
+    {
+        Ok(r) => r.into_inner().stun_servers,
+        Err(_) => Vec::new(),
+    }
+}
+
 fn cpu_usage_approx() -> f32 {
     use sysinfo::System;
     use std::sync::Mutex;

@@ -110,7 +110,11 @@ async fn main() -> Result<()> {
     let active_calls = Arc::new(AtomicU32::new(0));
 
     // ── Detect public IP + NAT type (STUN) ────────────────────────────────────
-    let nat = rustpbx_netprobe::probe(&cfg.stun_servers, std::time::Duration::from_secs(3)).await;
+    // Prefer the centrally-managed STUN list (superadmin → platform settings);
+    // fall back to the node's local config when none is configured/reachable.
+    let central_stun = grpc_client::fetch_platform_stun(&cfg.control_plane_addr).await;
+    let stun = if central_stun.is_empty() { cfg.stun_servers.clone() } else { central_stun };
+    let nat = rustpbx_netprobe::probe(&stun, std::time::Duration::from_secs(3)).await;
     info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
     if cfg.public_ip.is_none()
         && let Some(ip) = nat.public_ip.clone()

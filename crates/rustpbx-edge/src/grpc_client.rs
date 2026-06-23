@@ -102,3 +102,23 @@ impl GrpcControlClient {
         Ok(resp.into_inner())
     }
 }
+
+/// Fetch the centrally-managed STUN list from the control plane (superadmin →
+/// platform settings). Returns empty on any error — the caller then falls back
+/// to the node's local `stun_servers` config.
+pub async fn fetch_platform_stun(control_plane_addr: &str) -> Vec<String> {
+    use crate::proto::control::{PlatformConfigRequest, control_plane_client::ControlPlaneClient};
+    let Ok(ep) = tonic::transport::Channel::from_shared(control_plane_addr.to_string()) else {
+        return Vec::new();
+    };
+    let Ok(channel) = ep.connect().await else {
+        return Vec::new();
+    };
+    match ControlPlaneClient::new(channel)
+        .get_platform_config(PlatformConfigRequest {})
+        .await
+    {
+        Ok(r) => r.into_inner().stun_servers,
+        Err(_) => Vec::new(),
+    }
+}

@@ -104,6 +104,7 @@ export interface UpdateTenant {
 
 export interface PlatformSettings {
   base_domain: string;
+  stun_servers: string[];
 }
 
 // ── Tenant IAM users ─────────────────────────────────────────────────────────

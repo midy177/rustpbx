@@ -6,6 +6,7 @@ use anyhow::Result;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
 
 pub const KEY_BASE_DOMAIN: &str = "base_domain";
+pub const KEY_STUN_SERVERS: &str = "stun_servers";
 
 pub struct PlatformSettings<'a> {
     db: &'a DatabaseConnection,
@@ -51,6 +52,23 @@ impl<'a> PlatformSettings<'a> {
     /// Convenience: the configured wildcard base domain (empty string if unset).
     pub async fn base_domain(&self) -> String {
         self.get(KEY_BASE_DOMAIN).await.ok().flatten().unwrap_or_default()
+    }
+
+    /// Centrally-managed STUN server list (`host:port`), stored as a JSON array.
+    /// Empty when unset — nodes then fall back to their own local config.
+    pub async fn stun_servers(&self) -> Vec<String> {
+        self.get(KEY_STUN_SERVERS)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the STUN server list (as a JSON array).
+    pub async fn set_stun_servers(&self, servers: &[String]) -> Result<()> {
+        let json = serde_json::to_string(servers)?;
+        self.set(KEY_STUN_SERVERS, &json).await
     }
 
     /// Seed `base_domain` from the config file on startup *only if* it has never

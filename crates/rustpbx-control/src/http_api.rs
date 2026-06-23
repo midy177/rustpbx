@@ -408,6 +408,8 @@ async fn list_permissions(Extension(user): Extension<UserInfo>) -> ApiResult<Jso
 #[derive(Serialize, Deserialize)]
 struct PlatformSettingsBody {
     base_domain: String,
+    #[serde(default)]
+    stun_servers: Vec<String>,
 }
 
 async fn get_platform_settings(
@@ -415,7 +417,11 @@ async fn get_platform_settings(
     Extension(user): Extension<UserInfo>,
 ) -> ApiResult<Json<PlatformSettingsBody>> {
     require_superadmin(&user)?;
-    Ok(Json(PlatformSettingsBody { base_domain: state.base_domain().await }))
+    let s = PlatformSettings::new(&state.db);
+    Ok(Json(PlatformSettingsBody {
+        base_domain: s.base_domain().await,
+        stun_servers: s.stun_servers().await,
+    }))
 }
 
 async fn put_platform_settings(
@@ -424,11 +430,21 @@ async fn put_platform_settings(
     Json(body): Json<PlatformSettingsBody>,
 ) -> ApiResult<Json<PlatformSettingsBody>> {
     require_superadmin(&user)?;
-    PlatformSettings::new(&state.db)
-        .set(KEY_BASE_DOMAIN, body.base_domain.trim())
+    let s = PlatformSettings::new(&state.db);
+    s.set(KEY_BASE_DOMAIN, body.base_domain.trim())
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(PlatformSettingsBody { base_domain: state.base_domain().await }))
+    let stun: Vec<String> = body
+        .stun_servers
+        .iter()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    s.set_stun_servers(&stun).await.map_err(ApiError::internal)?;
+    Ok(Json(PlatformSettingsBody {
+        base_domain: s.base_domain().await,
+        stun_servers: s.stun_servers().await,
+    }))
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────

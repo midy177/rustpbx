@@ -28,6 +28,11 @@ service ControlPlane {
   // ── Worker discovery ──────────────────────────────────────────────────────
   rpc GetAvailableWorkers(GetWorkersRequest) returns (WorkerList);
 
+  // ── Platform config (centrally-managed node settings) ─────────────────────
+  // Nodes fetch this on startup (e.g. the STUN server list for NAT detection),
+  // falling back to their local config when empty/unreachable.
+  rpc GetPlatformConfig(PlatformConfigRequest) returns (PlatformConfig);
+
   // ── Internal: write-forwarding ────────────────────────────────────────────
   // A follower that receives a registry mutation forwards the serialized
   // RegistryCommand here, to the current Raft leader, which applies it.
@@ -240,6 +245,13 @@ message HeartbeatRequest {
 message HeartbeatResponse  { bool drain = 1; }
 message GetWorkersRequest  { optional int64 tenant_id = 1; }
 message WorkerList         { repeated WorkerInfo workers = 1; }
+
+message PlatformConfigRequest {}
+message PlatformConfig {
+  // STUN servers (host:port) for node NAT detection. Empty → node uses its
+  // own local default.
+  repeated string stun_servers = 1;
+}
 
 // ─── Edge lifecycle ────────────────────────────────────────────────────────────
 

@@ -177,6 +177,10 @@ export default {
     baseDomainHint:
       "Tenants get a default domain of {id}.{base}. Point a wildcard DNS record (*.base) at the platform.",
     baseDomainPlaceholder: "e.g. pbx.example.com",
+    stun: "STUN servers",
+    stunPlaceholder: "stun.l.google.com:19302\nstun1.l.google.com:19302",
+    stunHint:
+      "Pushed to all edges/workers for NAT detection (one host:port per line). Empty → nodes use their local default. Full four-type detection needs a server with two IPs that supports CHANGE-REQUEST (RFC 5780).",
     savedOk: "Settings saved",
   },
   iam: {

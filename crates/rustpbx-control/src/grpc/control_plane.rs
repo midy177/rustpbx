@@ -274,6 +274,20 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(WorkerList { workers }))
     }
 
+    // ── Platform config ───────────────────────────────────────────────────────
+
+    async fn get_platform_config(
+        &self,
+        _request: Request<crate::grpc::proto::control::PlatformConfigRequest>,
+    ) -> Result<Response<crate::grpc::proto::control::PlatformConfig>, Status> {
+        let stun_servers = crate::settings::PlatformSettings::new(&self.store.db)
+            .stun_servers()
+            .await;
+        Ok(Response::new(crate::grpc::proto::control::PlatformConfig {
+            stun_servers,
+        }))
+    }
+
     // ── Internal: write-forwarding ────────────────────────────────────────────
 
     async fn propose_write(
