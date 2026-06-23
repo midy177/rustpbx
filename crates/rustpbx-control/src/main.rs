@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
         store: Arc::clone(&store),
         workers: workers.clone(),
         sessions: Arc::new(DashMap::new()),
+        login_gate: Arc::new(DashMap::new()),
         admin_username: cfg.admin_username.clone(),
         admin_password: cfg.admin_password.clone(),
     };
@@ -187,7 +188,12 @@ async fn main() -> Result<()> {
 
     let http_server = async move {
         let listener = tokio::net::TcpListener::bind(http_addr).await?;
-        axum::serve(listener, http_router).await?;
+        // ConnectInfo (peer addr) is needed for the login rate-limiter.
+        axum::serve(
+            listener,
+            http_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
         Ok::<(), anyhow::Error>(())
     };
 

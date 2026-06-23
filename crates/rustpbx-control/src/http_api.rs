@@ -27,12 +27,13 @@ use crate::tenant_user_service::{
 };
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use std::net::SocketAddr;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use sea_orm::DatabaseConnection;
@@ -46,6 +47,17 @@ use tracing::{info, warn};
 
 const SESSION_TTL_HOURS: i64 = 12;
 
+// Login brute-force throttle: after this many failures from one client within
+// the window, further attempts are rejected with 429 until the window elapses.
+const LOGIN_MAX_FAILS: u32 = 5;
+const LOGIN_WINDOW_SECS: i64 = 60;
+
+#[derive(Clone)]
+pub struct LoginGate {
+    fails: u32,
+    window_start: DateTime<Utc>,
+}
+
 // ── Shared state ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -54,6 +66,8 @@ pub struct HttpState {
     pub store: Arc<Store>,
     pub workers: RaftRegistry,
     pub sessions: Arc<DashMap<String, Session>>,
+    /// Per-client failed-login counters for brute-force throttling.
+    pub login_gate: Arc<DashMap<String, LoginGate>>,
     pub admin_username: String,
     pub admin_password: String,
 }
@@ -282,12 +296,31 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/raft/change-membership", post(raft_change_membership))
         .layer(middleware::from_fn_with_state(state.clone(), auth_guard))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let index = format!("{web_dir}/index.html");
     let spa = ServeDir::new(web_dir).fallback(ServeFile::new(index));
 
-    Router::new().nest("/api", api).fallback_service(spa)
+    // Liveness/readiness probes — unauthenticated, outside /api (for k8s etc.).
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .nest("/api", api)
+        .fallback_service(spa)
+        .with_state(state)
+}
+
+/// Liveness: the process is up and serving.
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Readiness: the process is up *and* its database is reachable.
+async fn readyz(State(state): State<HttpState>) -> StatusCode {
+    match state.db.ping().await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -343,48 +376,106 @@ struct LoginResp {
     user: UserInfo,
 }
 
-async fn login(State(state): State<HttpState>, Json(req): Json<LoginReq>) -> ApiResult<Json<LoginResp>> {
+/// Client key for login throttling — the real client IP behind a proxy
+/// (first X-Forwarded-For hop) or the direct peer address.
+fn client_key(headers: &HeaderMap, peer: SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| peer.ip().to_string())
+}
+
+/// 429 if this client has exceeded the failed-login budget within the window.
+fn check_login_gate(state: &HttpState, key: &str) -> ApiResult<()> {
+    if let Some(g) = state.login_gate.get(key) {
+        let fresh = (Utc::now() - g.window_start).num_seconds() < LOGIN_WINDOW_SECS;
+        if fresh && g.fails >= LOGIN_MAX_FAILS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed login attempts; try again shortly",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn record_login_fail(state: &HttpState, key: &str) {
+    let now = Utc::now();
+    let mut g = state.login_gate.entry(key.to_string()).or_insert(LoginGate {
+        fails: 0,
+        window_start: now,
+    });
+    if (now - g.window_start).num_seconds() >= LOGIN_WINDOW_SECS {
+        g.fails = 0;
+        g.window_start = now;
+    }
+    g.fails += 1;
+}
+
+async fn login(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> ApiResult<Json<LoginResp>> {
+    let key = client_key(&headers, peer);
+    check_login_gate(&state, &key)?;
+
     let domain = req.domain.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let user = match domain {
-        // Superadmin: no domain, config-backed credentials.
-        None => {
-            if req.username != state.admin_username || req.password != state.admin_password {
-                warn!(username = %req.username, "failed superadmin login");
-                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"));
+    // Resolve the principal; any failure here is a throttled attempt.
+    let auth: ApiResult<UserInfo> = async {
+        match domain {
+            None => {
+                if req.username != state.admin_username || req.password != state.admin_password {
+                    warn!(username = %req.username, "failed superadmin login");
+                    return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"));
+                }
+                Ok(UserInfo {
+                    username: state.admin_username.clone(),
+                    role: roles::SUPERADMIN.to_string(),
+                    tenant_id: None,
+                    permissions: vec![],
+                })
             }
-            UserInfo {
-                username: state.admin_username.clone(),
-                role: roles::SUPERADMIN.to_string(),
-                tenant_id: None,
-                permissions: vec![],
+            Some(domain) => {
+                let tenant = state
+                    .tenants()
+                    .await
+                    .resolve_by_domain(domain)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unknown domain"))?;
+                let principal = TenantUserService::new(&state.db)
+                    .authenticate(tenant.id, req.username.trim(), &req.password)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| {
+                        warn!(domain, username = %req.username, "failed tenant login");
+                        ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials")
+                    })?;
+                Ok(UserInfo {
+                    username: principal.username,
+                    role: principal.session_role,
+                    tenant_id: Some(principal.tenant_id),
+                    permissions: principal.permissions,
+                })
             }
         }
-        // Tenant user: resolve domain → tenant, then authenticate within it.
-        Some(domain) => {
-            let tenant = state
-                .tenants()
-                .await
-                .resolve_by_domain(domain)
-                .await
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unknown domain"))?;
+    }
+    .await;
 
-            let principal = TenantUserService::new(&state.db)
-                .authenticate(tenant.id, req.username.trim(), &req.password)
-                .await
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| {
-                    warn!(domain, username = %req.username, "failed tenant login");
-                    ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials")
-                })?;
-
-            UserInfo {
-                username: principal.username,
-                role: principal.session_role,
-                tenant_id: Some(principal.tenant_id),
-                permissions: principal.permissions,
-            }
+    let user = match auth {
+        Ok(u) => {
+            state.login_gate.remove(&key); // success clears the counter
+            u
+        }
+        Err(e) => {
+            record_login_fail(&state, &key);
+            return Err(e);
         }
     };
 
