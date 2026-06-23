@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
     }
 
     // ── SIP Server ────────────────────────────────────────────────────────────
-    let _sip_server = SipServerBuilder::new(proxy_config)
+    let sip_server = SipServerBuilder::new(proxy_config)
         .with_cancel_token(cancel.clone())
         .with_skip_migrate(true)
         .with_callrecord_sender(Some(cdr_sender))
@@ -236,9 +236,20 @@ async fn main() -> Result<()> {
 
     info!("SIP edge ready on {}:{}", cfg.sip_addr, cfg.udp_port);
 
-    signal::ctrl_c().await?;
-    info!("shutdown");
-    cancel.cancel();
+    // Cancel on Ctrl-C; serving returns when the token is cancelled.
+    let shutdown = cancel.clone();
+    tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        info!("shutdown signal received");
+        shutdown.cancel();
+    });
+
+    // Serve the SIP endpoint: this drives the transport listeners (binding the
+    // TCP listener so the Edge accepts Worker connections) and processes
+    // incoming SIP. Without this the server only binds UDP and never runs.
+    if let Err(e) = sip_server.serve().await {
+        tracing::error!(error = %e, "sip server exited with error");
+    }
     Ok(())
 }
 
@@ -268,7 +279,10 @@ fn build_proxy_config(cfg: &EdgeConfig) -> ProxyConfig {
     ProxyConfig {
         addr: cfg.sip_addr.clone(),
         udp_port: Some(cfg.udp_port),
-        tcp_port: if cfg.tcp_port > 0 { Some(cfg.tcp_port) } else { None },
+        // Always listen on TCP so Workers can reach the Edge over a persistent
+        // TCP connection (worker→edge outbound + in-dialog). Defaults to the
+        // main SIP port unless an explicit tcp_port is configured.
+        tcp_port: Some(if cfg.tcp_port > 0 { cfg.tcp_port } else { cfg.udp_port }),
         tls_port: if cfg.tls_port > 0 { Some(cfg.tls_port) } else { None },
         modules: Some(vec!["internal-peer".into(), "acl".into(), "auth".into(), "call".into()]),
         ..Default::default()

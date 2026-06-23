@@ -28,6 +28,7 @@ use rsipstack::dialog::authenticate::Credential;
 use rustpbx_core::internal::{InternalCallContext, InternalDirection, RouteAction};
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Uri;
+use rsipstack::sip::Transport;
 use rsipstack::sip::prelude::HeadersExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -350,6 +351,11 @@ impl EdgeCallRouter {
         let worker_location = Location {
             aor: worker_uri,
             headers: Some(x_headers),
+            // Always reach the Worker over TCP, regardless of the carrier-side
+            // transport (ws/wss/udp/tcp/tls): Edge↔Worker is a persistent TCP
+            // link, so SDP-heavy re-INVITEs don't fragment and worker-originated
+            // in-dialog requests (NOTIFY/BYE) have a stable path back.
+            transport: Some(Transport::Tcp),
             ..Default::default()
         };
 

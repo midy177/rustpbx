@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Uri;
+use rsipstack::sip::Transport;
 use rsipstack::sip::prelude::HeadersExt;
 use rustpbx::call::{
     DialDirection, DialStrategy, Dialplan, Location, RouteInvite,
@@ -334,6 +335,9 @@ impl WorkerCallRouter {
         let edge_location = Location {
             aor: edge_uri,
             headers: Some(encode_headers(&internal_ctx)),
+            // Reach the Edge over TCP — the Edge↔Worker link is a persistent TCP
+            // connection in both directions (mirrors the Edge→Worker path).
+            transport: Some(Transport::Tcp),
             ..Default::default()
         };
 

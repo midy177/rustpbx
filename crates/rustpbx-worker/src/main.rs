@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
     // Uses the main crate's CallModule (full B2BUA/IVR/Queue) with WorkerCallRouter
     // that decodes Edge-encoded routing decisions into Dialplan objects.
     // Media mode is Anchored (MediaProxyMode::All).
-    let _sip_server = SipServerBuilder::new(proxy_config)
+    let sip_server = SipServerBuilder::new(proxy_config)
         .with_cancel_token(cancel.clone())
         .with_rtp_config(rtp_config)
         .with_callrecord_sender(Some(cdr_sender))
@@ -266,12 +266,23 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
+    // Serve the SIP endpoint: drives the transport listeners (binds the TCP
+    // listener so the Edge reaches the Worker over a persistent TCP connection)
+    // and processes incoming SIP. Without this the server only binds UDP and
+    // never actually serves. Runs until the cancel token fires.
+    let serve_handle = tokio::spawn(async move {
+        if let Err(e) = sip_server.serve().await {
+            tracing::error!(error = %e, "sip server exited with error");
+        }
+    });
+
     info!("media worker ready — SIP on {}:{}", cfg.sip_addr, cfg.sip_port);
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     signal::ctrl_c().await?;
     info!("shutdown signal received — draining calls");
     cancel.cancel();
+    let _ = serve_handle.await;
 
     let _ = tokio::time::timeout(
         tokio::time::Duration::from_secs(30),
@@ -284,9 +295,14 @@ async fn main() -> Result<()> {
 }
 
 fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
+    // Listen on TCP as well as UDP (same port): the Edge forwards all internal
+    // SIP to the Worker over a persistent TCP connection (avoids UDP
+    // fragmentation of SDP and keeps a stable bidirectional path for in-dialog
+    // requests like NOTIFY/re-INVITE/BYE).
     let mut config = ProxyConfig {
         addr: cfg.sip_addr.clone(),
         udp_port: Some(cfg.sip_port),
+        tcp_port: Some(cfg.sip_port),
         ..Default::default()
     };
     config.modules = Some(vec![
