@@ -633,6 +633,10 @@ struct Stats {
     workers_total: usize,
     workers_healthy: usize,
     active_calls: u32,
+    /// Authoritative reserved per-tenant call slots across the platform
+    /// (from the Raft state machine), vs `active_calls` which is the sum of
+    /// worker-reported in-flight counts.
+    call_slots: u32,
 }
 
 async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
@@ -642,11 +646,13 @@ async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let workers_healthy = all.iter().filter(|w| w.is_healthy(now_ms, timeout_ms)).count();
     let active_calls = all.iter().map(|w| w.active_calls).sum();
+    let call_slots = state.workers.total_call_slots().await;
     Ok(Json(Stats {
         tenants,
         workers_total: all.len(),
         workers_healthy,
         active_calls,
+        call_slots,
     }))
 }
 
@@ -658,6 +664,10 @@ struct TenantStats {
     extensions: usize,
     dids: u64,
     recent_calls: usize,
+    /// This tenant's currently-reserved call slots (live concurrency).
+    active_calls: u32,
+    /// The tenant's configured max_concurrent_calls (None = unlimited).
+    max_concurrent_calls: Option<u32>,
 }
 
 async fn tenant_stats(
@@ -677,7 +687,13 @@ async fn tenant_stats(
         .await
         .map_err(ApiError::internal)?
         .1 as usize;
-    Ok(Json(TenantStats { trunks, extensions, dids, recent_calls }))
+    let active_calls = state.workers.tenant_active_calls(tid).await;
+    let max_concurrent_calls = state
+        .store
+        .tenant_max_concurrent(tid)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(TenantStats { trunks, extensions, dids, recent_calls, active_calls, max_concurrent_calls }))
 }
 
 // ── Tenant handlers (superadmin) ───────────────────────────────────────────────

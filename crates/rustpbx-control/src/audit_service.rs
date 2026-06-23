@@ -30,29 +30,6 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
-    /// Convenience constructor so handler call-sites stay terse.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        actor_username: impl Into<String>,
-        actor_role: impl Into<String>,
-        actor_tenant_id: Option<i64>,
-        action: impl Into<String>,
-        target_type: impl Into<String>,
-        target_id: Option<i64>,
-        summary: impl Into<String>,
-    ) -> Self {
-        Self {
-            actor_username: actor_username.into(),
-            actor_role: actor_role.into(),
-            actor_tenant_id,
-            action: action.into(),
-            target_type: target_type.into(),
-            target_id,
-            summary: summary.into(),
-            payload: None,
-        }
-    }
-
     /// Build an entry without actor identity — the HTTP layer fills the actor
     /// from the session (`HttpState::audit`). This is the form handlers use.
     pub fn action(
@@ -71,11 +48,6 @@ impl AuditEntry {
             summary: summary.into(),
             payload: None,
         }
-    }
-
-    pub fn with_payload(mut self, payload: Value) -> Self {
-        self.payload = Some(payload);
-        self
     }
 }
 
@@ -188,16 +160,16 @@ mod tests {
     }
 
     fn entry(tenant: Option<i64>, action: &str, target: &str) -> AuditEntry {
-        AuditEntry::new(
-            "alice",
-            "tenant_admin",
-            tenant,
-            action,
-            target,
-            Some(42),
-            format!("{action} {target}"),
-        )
-        .with_payload(serde_json::json!({ "name": "acme" }))
+        AuditEntry {
+            actor_username: "alice".into(),
+            actor_role: "tenant_admin".into(),
+            actor_tenant_id: tenant,
+            action: action.into(),
+            target_type: target.into(),
+            target_id: Some(42),
+            summary: format!("{action} {target}"),
+            payload: Some(serde_json::json!({ "name": "acme" })),
+        }
     }
 
     #[tokio::test]
