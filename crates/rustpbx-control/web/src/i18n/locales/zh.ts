@@ -119,6 +119,10 @@ export default {
     adminUsername: "管理员用户名",
     adminPassword: "管理员密码",
     adminPasswordTooShort: "管理员密码至少 6 位",
+    accounts: "账号",
+    noAdmin: "无账号",
+    addAdmin: "添加管理员",
+    addAdminFor: "为 {name} 添加管理员",
   },
   workers: {
     title: "媒体节点",

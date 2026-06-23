@@ -211,6 +211,7 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/tenants", get(list_tenants).post(create_tenant))
         .route("/tenants/{id}", get(get_tenant).put(update_tenant).delete(delete_tenant))
         // tenant IAM users
+        .route("/tenant-user-counts", get(tenant_user_counts))
         .route("/tenant-users", get(list_tenant_users).post(create_tenant_user))
         .route("/tenant-users/{id}", post(update_tenant_user).delete(delete_tenant_user))
         // tenant domain self-service
@@ -549,6 +550,19 @@ async fn delete_tenant(
 }
 
 // ── Tenant IAM users ───────────────────────────────────────────────────────────
+
+/// Per-tenant account counts (superadmin) — surfaces tenants with no users.
+async fn tenant_user_counts(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<std::collections::HashMap<i64, i64>>> {
+    require_superadmin(&user)?;
+    let counts = TenantUserService::new(&state.db)
+        .count_by_tenant()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(counts))
+}
 
 async fn list_tenant_users(
     State(state): State<HttpState>,

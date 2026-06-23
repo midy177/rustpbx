@@ -14,7 +14,7 @@ import { Card } from "@/components/ui/card";
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmpty,
 } from "@/components/ui/table";
-import { Plus, Pencil, Trash2, LogIn, RefreshCw } from "lucide-vue-next";
+import { Plus, Pencil, Trash2, LogIn, RefreshCw, UserPlus } from "lucide-vue-next";
 
 const { t } = useI18n();
 const router = useRouter();
@@ -23,6 +23,49 @@ const auth = useAuthStore();
 const tenants = ref<Tenant[]>([]);
 const loading = ref(true);
 const error = ref("");
+// tenant_id -> account count, so orphan tenants (no account) are obvious.
+const counts = ref<Record<string, number>>({});
+
+// Quick "add admin" dialog — recovers a tenant that has no account to log in with.
+const adminDialogOpen = ref(false);
+const adminTenant = ref<Tenant | null>(null);
+const adminForm = reactive({ username: "admin", password: "" });
+const adminSaving = ref(false);
+const adminError = ref("");
+const adminInvalid = computed(
+  () => !adminForm.username.trim() || adminForm.password.length < 6,
+);
+
+function userCount(id: number): number {
+  return counts.value[String(id)] ?? 0;
+}
+
+function openAddAdmin(tn: Tenant) {
+  adminTenant.value = tn;
+  adminForm.username = "admin";
+  adminForm.password = "";
+  adminError.value = "";
+  adminDialogOpen.value = true;
+}
+
+async function saveAdmin() {
+  if (adminInvalid.value || !adminTenant.value) return;
+  adminSaving.value = true;
+  adminError.value = "";
+  try {
+    await api.post(`/tenant-users?tenant_id=${adminTenant.value.id}`, {
+      username: adminForm.username.trim(),
+      password: adminForm.password,
+      role: "admin",
+    });
+    adminDialogOpen.value = false;
+    await load();
+  } catch (e) {
+    adminError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    adminSaving.value = false;
+  }
+}
 
 const dialogOpen = ref(false);
 const editingId = ref<number | null>(null);
@@ -40,7 +83,12 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    tenants.value = await api.get<Tenant[]>("/tenants");
+    const [list, c] = await Promise.all([
+      api.get<Tenant[]>("/tenants"),
+      api.get<Record<string, number>>("/tenant-user-counts"),
+    ]);
+    tenants.value = list;
+    counts.value = c;
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -190,6 +238,7 @@ function statusLabel(s: string) {
             <TableHead>{{ t("common.name") }}</TableHead>
             <TableHead>{{ t("tenants.domain") }}</TableHead>
             <TableHead>{{ t("common.status") }}</TableHead>
+            <TableHead>{{ t("tenants.accounts") }}</TableHead>
             <TableHead>{{ t("tenants.maxConcurrentCalls") }}</TableHead>
             <TableHead>{{ t("tenants.maxTrunks") }}</TableHead>
             <TableHead>{{ t("tenants.maxDids") }}</TableHead>
@@ -198,8 +247,8 @@ function statusLabel(s: string) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="9">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="tenants.length === 0" :colspan="9">{{ t("common.empty") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="10">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="tenants.length === 0" :colspan="10">{{ t("common.empty") }}</TableEmpty>
           <TableRow v-for="tn in tenants" :key="tn.id">
             <TableCell class="text-muted-foreground">{{ tn.id }}</TableCell>
             <TableCell class="font-medium">{{ tn.name }}</TableCell>
@@ -208,6 +257,10 @@ function statusLabel(s: string) {
               <Badge v-if="tn.custom_domain_enabled" variant="secondary" class="ml-1">custom</Badge>
             </TableCell>
             <TableCell><Badge :variant="statusVariant(tn.status)">{{ statusLabel(tn.status) }}</Badge></TableCell>
+            <TableCell>
+              <Badge v-if="userCount(tn.id) === 0" variant="warning">{{ t("tenants.noAdmin") }}</Badge>
+              <span v-else>{{ userCount(tn.id) }}</span>
+            </TableCell>
             <TableCell>{{ tn.max_concurrent_calls ?? t("common.unlimited") }}</TableCell>
             <TableCell>{{ tn.max_trunks ?? t("common.unlimited") }}</TableCell>
             <TableCell>{{ tn.max_dids ?? t("common.unlimited") }}</TableCell>
@@ -216,6 +269,9 @@ function statusLabel(s: string) {
               <div class="flex justify-end gap-1">
                 <Button variant="ghost" size="sm" @click="enter(tn)">
                   <LogIn class="size-4" /> {{ t("tenants.enter") }}
+                </Button>
+                <Button variant="ghost" size="icon" @click="openAddAdmin(tn)" :aria-label="t('tenants.addAdmin')">
+                  <UserPlus class="size-4" />
                 </Button>
                 <Button variant="ghost" size="icon" @click="openEdit(tn)" :aria-label="t('common.edit')">
                   <Pencil class="size-4" />
@@ -313,6 +369,39 @@ function statusLabel(s: string) {
       <template #footer>
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.cancel") }}</Button>
         <Button :disabled="saving || !canSave" @click="save">{{ t("common.save") }}</Button>
+      </template>
+    </Dialog>
+
+    <!-- Quick add-admin dialog (recovers a tenant with no account) -->
+    <Dialog
+      v-model:open="adminDialogOpen"
+      :title="t('tenants.addAdminFor', { name: adminTenant?.name ?? '' })"
+    >
+      <form class="grid gap-4" @submit.prevent="saveAdmin">
+        <div class="grid gap-2">
+          <Label for="aa-user">{{ t("tenants.adminUsername") }}</Label>
+          <Input id="aa-user" v-model="adminForm.username" autocomplete="off" />
+        </div>
+        <div class="grid gap-2">
+          <Label for="aa-pass">{{ t("tenants.adminPassword") }}</Label>
+          <Input
+            id="aa-pass"
+            v-model="adminForm.password"
+            type="password"
+            autocomplete="new-password"
+            :class="{ 'border-destructive': adminForm.password.length > 0 && adminForm.password.length < 6 }"
+          />
+          <p v-if="adminForm.password.length > 0 && adminForm.password.length < 6" class="text-xs text-destructive">
+            {{ t("tenants.adminPasswordTooShort") }}
+          </p>
+        </div>
+      </form>
+
+      <p v-if="adminError" class="text-sm text-destructive">{{ adminError }}</p>
+
+      <template #footer>
+        <Button variant="outline" @click="adminDialogOpen = false">{{ t("common.cancel") }}</Button>
+        <Button :disabled="adminSaving || adminInvalid" @click="saveAdmin">{{ t("common.save") }}</Button>
       </template>
     </Dialog>
   </div>

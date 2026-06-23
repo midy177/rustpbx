@@ -110,6 +110,26 @@ impl<'a> TenantUserService<'a> {
         Self { db }
     }
 
+    /// Count users per tenant: `tenant_id -> count`. For the superadmin tenant
+    /// list (so orphan tenants with no account are obvious).
+    pub async fn count_by_tenant(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                self.db.get_database_backend(),
+                "SELECT tenant_id, COUNT(*) AS cnt FROM rustpbx_tenant_users GROUP BY tenant_id",
+            ))
+            .await?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let tid: i64 = r.try_get("", "tenant_id")?;
+            let cnt: i64 = r.try_get("", "cnt")?;
+            map.insert(tid, cnt);
+        }
+        Ok(map)
+    }
+
     pub async fn list(&self, tenant_id: i64) -> Result<Vec<TenantUserResponse>> {
         let rows = Entity::find()
             .filter(tenant_user::Column::TenantId.eq(tenant_id))

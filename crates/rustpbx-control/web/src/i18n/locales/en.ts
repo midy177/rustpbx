@@ -120,6 +120,10 @@ export default {
     adminUsername: "Admin username",
     adminPassword: "Admin password",
     adminPasswordTooShort: "Admin password must be at least 6 characters",
+    accounts: "Accounts",
+    noAdmin: "No account",
+    addAdmin: "Add admin",
+    addAdminFor: "Add an admin to {name}",
   },
   workers: {
     title: "Media Workers",
