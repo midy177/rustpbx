@@ -286,6 +286,20 @@ export interface CdrPage {
   offset: number;
 }
 
+/** One audit-log entry (`GET /audit`). */
+export interface AuditEntry {
+  id: number;
+  actor_username: string;
+  actor_role: string;
+  actor_tenant_id: number | null;
+  action: string;
+  target_type: string;
+  target_id: number | null;
+  summary: string;
+  payload: unknown | null;
+  created_at: string;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",

@@ -13,6 +13,7 @@
 //! the checks but every principal is confined to its own tenant by the scoping
 //! helpers below.
 
+use crate::audit_service::{AuditEntry, AuditFilter, AuditService};
 use crate::auth::permissions::{self, roles};
 use crate::did_service::{CreateDidRequest, DidService, UpdateDidRequest};
 use crate::raft::registry::RaftRegistry;
@@ -84,6 +85,22 @@ impl HttpState {
 
     async fn tenants(&self) -> TenantService<'_> {
         TenantService::new(&self.db, self.base_domain().await)
+    }
+
+    /// Best-effort, fire-and-forget audit record. Fills the actor from the
+    /// session, then writes on a detached task so it never blocks the response
+    /// and never fails the request — a flaky audit insert must not roll back a
+    /// successful mutation.
+    pub fn audit(&self, user: &UserInfo, mut entry: AuditEntry) {
+        entry.actor_username = user.username.clone();
+        entry.actor_role = user.role.clone();
+        entry.actor_tenant_id = user.tenant_id;
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = AuditService::new(&db).record(entry).await {
+                warn!(error = %e, "audit record failed");
+            }
+        });
     }
 }
 
@@ -315,6 +332,7 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/call-records", get(list_call_records))
         .route("/dids", get(list_dids).post(create_did))
         .route("/dids/{id}", post(update_did).delete(delete_did))
+        .route("/audit", get(list_audit))
         .route("/workers", get(list_workers))
         .route("/workers/{id}/drain", post(drain_worker))
         .route("/workers/{id}", axum::routing::delete(remove_worker))
@@ -707,6 +725,7 @@ async fn create_tenant(
     };
 
     let tenant = state.tenants().await.create(&req).await.map_err(ApiError::bad)?;
+    audit_tenant(&state, &user, "create", tenant.id, &tenant.name);
 
     // Provision the tenant's first admin account (creds already validated).
     let mut provisioned_admin = None;
@@ -732,6 +751,16 @@ async fn create_tenant(
         .into_response())
 }
 
+/// Audit helper for tenant mutations (superadmin actor).
+fn audit_tenant(state: &HttpState, user: &UserInfo, action: &str, id: i64, name: &str) {
+    let summary = if name.is_empty() {
+        format!("{action} tenant (id {id})")
+    } else {
+        format!("{action} tenant '{name}' (id {id})")
+    };
+    state.audit(user, AuditEntry::action(action, "tenant", Some(id), summary));
+}
+
 async fn update_tenant(
     State(state): State<HttpState>,
     Extension(user): Extension<UserInfo>,
@@ -740,6 +769,7 @@ async fn update_tenant(
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
     let tenant = state.tenants().await.update(id, req).await.map_err(ApiError::bad)?;
+    audit_tenant(&state, &user, "update", tenant.id, &tenant.name);
     Ok(Json(tenant).into_response())
 }
 
@@ -750,6 +780,7 @@ async fn delete_tenant(
 ) -> ApiResult<StatusCode> {
     require_superadmin(&user)?;
     state.tenants().await.delete(id).await.map_err(ApiError::not_found)?;
+    audit_tenant(&state, &user, "delete", id, "");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -795,6 +826,10 @@ async fn create_tenant_user(
         .create(tid, &req)
         .await
         .map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action("create", "tenant_user", Some(created.id), format!("created user '{}'", created.username)),
+    );
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
 
@@ -811,6 +846,10 @@ async fn update_tenant_user(
         return Err(ApiError::forbidden());
     }
     let updated = svc.update(id, req).await.map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action("update", "tenant_user", Some(id), format!("updated user '{}' (id {id})", updated.username)),
+    );
     Ok(Json(updated).into_response())
 }
 
@@ -826,6 +865,10 @@ async fn delete_tenant_user(
         return Err(ApiError::forbidden());
     }
     svc.delete(id).await.map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action("delete", "tenant_user", Some(id), format!("deleted user '{}' (id {id})", target.username)),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -851,6 +894,10 @@ async fn put_tenant_domain(
     require_perm(&user, permissions::DOMAIN_WRITE)?;
     let tid = required_tenant(&user, q.tenant_id)?;
     let tenant = state.tenants().await.update_domain(tid, req).await.map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action("update", "domain", Some(tid), format!("updated domain for tenant '{name}'", name = tenant.name)),
+    );
     Ok(Json(tenant).into_response())
 }
 
@@ -884,6 +931,7 @@ async fn create_trunk(
         enforce_trunk_quota(&state, tid).await?;
     }
     state.store.create_trunk(&input, row_tenant).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "trunk", None, format!("created trunk '{}'", input.name)));
     Ok(StatusCode::CREATED)
 }
 
@@ -895,6 +943,9 @@ async fn update_trunk(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::TRUNKS_WRITE)?;
     let n = state.store.update_trunk(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("update", "trunk", Some(id), format!("updated trunk '{}' (id {id})", input.name)));
+    }
     affected_or_404(n)
 }
 
@@ -905,6 +956,9 @@ async fn delete_trunk(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::TRUNKS_WRITE)?;
     let n = state.store.delete_trunk(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("delete", "trunk", Some(id), format!("deleted trunk (id {id})")));
+    }
     affected_or_404(n)
 }
 
@@ -930,6 +984,7 @@ async fn create_route(
     require_perm(&user, permissions::ROUTING_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
     state.store.create_route(&input, row_tenant).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "route", None, format!("created route '{}'", input.name)));
     Ok(StatusCode::CREATED)
 }
 
@@ -941,6 +996,9 @@ async fn update_route(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ROUTING_WRITE)?;
     let n = state.store.update_route(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("update", "route", Some(id), format!("updated route '{}' (id {id})", input.name)));
+    }
     affected_or_404(n)
 }
 
@@ -951,6 +1009,9 @@ async fn delete_route(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ROUTING_WRITE)?;
     let n = state.store.delete_route(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("delete", "route", Some(id), format!("deleted route (id {id})")));
+    }
     affected_or_404(n)
 }
 
@@ -976,6 +1037,7 @@ async fn create_extension(
     require_perm(&user, permissions::EXTENSIONS_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
     state.store.create_extension(&input, row_tenant).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "extension", None, format!("created extension '{}'", input.extension)));
     Ok(StatusCode::CREATED)
 }
 
@@ -991,6 +1053,9 @@ async fn update_extension(
         .update_extension(id, &input, mutate_scope(&user))
         .await
         .map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("update", "extension", Some(id), format!("updated extension '{}' (id {id})", input.extension)));
+    }
     affected_or_404(n)
 }
 
@@ -1001,6 +1066,9 @@ async fn delete_extension(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::EXTENSIONS_WRITE)?;
     let n = state.store.delete_extension(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("delete", "extension", Some(id), format!("deleted extension (id {id})")));
+    }
     affected_or_404(n)
 }
 
@@ -1026,6 +1094,7 @@ async fn create_acl(
     require_perm(&user, permissions::ACL_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
     state.store.create_acl(&input, row_tenant).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "acl", None, format!("created ACL rule: {} {}", input.action, input.target)));
     Ok(StatusCode::CREATED)
 }
 
@@ -1037,6 +1106,9 @@ async fn update_acl(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ACL_WRITE)?;
     let n = state.store.update_acl(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("update", "acl", Some(id), format!("updated ACL rule (id {id}): {} {}", input.action, input.target)));
+    }
     affected_or_404(n)
 }
 
@@ -1047,6 +1119,9 @@ async fn delete_acl(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ACL_WRITE)?;
     let n = state.store.delete_acl(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("delete", "acl", Some(id), format!("deleted ACL rule (id {id})")));
+    }
     affected_or_404(n)
 }
 
@@ -1109,6 +1184,40 @@ async fn list_call_records(
     Ok(Json(CdrPage { records, total, limit, offset }).into_response())
 }
 
+// ── Audit trail ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    tenant_id: Option<i64>,
+    limit: Option<u64>,
+    action: Option<String>,
+    target_type: Option<String>,
+}
+
+/// List audit entries. Tenant admins see only their own tenant's entries; the
+/// superadmin sees all. A plain tenant user (no admin role) is denied.
+async fn list_audit(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::AUDIT_READ)?;
+    // Tenant admins are locked to their own tenant; only superadmin may cross
+    // tenants (and only then is tenant_id=None meaningful → all entries).
+    let scope = if is_superadmin(&user) { q.tenant_id } else { user.tenant_id };
+    let filter = AuditFilter {
+        tenant_id: scope,
+        action: q.action,
+        target_type: q.target_type,
+        limit: q.limit.unwrap_or(100),
+    };
+    let rows = AuditService::new(&state.db)
+        .list(&filter)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
 // ── DIDs (phone number inventory) ──────────────────────────────────────────────
 
 async fn list_dids(
@@ -1134,6 +1243,7 @@ async fn create_did(
         enforce_did_quota(&state, tid).await?;
     }
     let did = DidService::new(&state.db).create(&req).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "did", Some(did.id), format!("created DID '{}'", did.number)));
     Ok((StatusCode::CREATED, Json(did)).into_response())
 }
 
@@ -1145,6 +1255,7 @@ async fn update_did(
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
     let did = DidService::new(&state.db).update(id, req).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("update", "did", Some(id), format!("updated DID '{}' (id {id})", did.number)));
     Ok(Json(did).into_response())
 }
 
@@ -1155,6 +1266,7 @@ async fn delete_did(
 ) -> ApiResult<StatusCode> {
     require_superadmin(&user)?;
     DidService::new(&state.db).delete(id).await.map_err(ApiError::not_found)?;
+    state.audit(&user, AuditEntry::action("delete", "did", Some(id), format!("deleted DID (id {id})")));
     Ok(StatusCode::NO_CONTENT)
 }
 

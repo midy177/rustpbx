@@ -1,3 +1,4 @@
+mod audit_service;
 mod auth;
 mod config;
 mod did_service;

@@ -22,6 +22,7 @@ impl MigratorTrait for ControlMigrator {
             Box::new(crate::models::tenant::Migration),
             Box::new(crate::models::did_number::Migration),
             Box::new(crate::models::tenant_user::Migration),
+            Box::new(crate::models::audit_log::Migration),
             Box::new(create_platform_settings::Migration),
             // Base tables (self-contained copy of the main binary's schema, so
             // control can run against a fresh DB without the monolith). Must

@@ -48,6 +48,9 @@ pub const USERS_READ: &str = "users:read";
 pub const USERS_WRITE: &str = "users:write";
 pub const DOMAIN_READ: &str = "domain:read";
 pub const DOMAIN_WRITE: &str = "domain:write";
+/// View the audit trail (who changed what). Tenant admins see their own
+/// tenant's entries; the superadmin sees all. Not granularly delegable.
+pub const AUDIT_READ: &str = "audit:read";
 
 /// Every permission a tenant admin can grant to a sub-user. Surfaced to the UI
 /// so the permission editor stays in sync with the backend.
