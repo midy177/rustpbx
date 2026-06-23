@@ -267,19 +267,33 @@ pub async fn probe(stun_servers: &[String], timeout: Duration) -> NatInfo {
     };
     let local = local_ip().await;
 
-    // Test 1: plain Binding Request to the primary server.
-    let Some(primary) = resolve(&stun_servers[0]).await else {
-        return NatInfo::unknown();
+    // Test 1: plain Binding Request. Try each server in order and use the first
+    // that answers as the primary. This makes an unstable RFC-5780 server
+    // listed first non-fatal — if it's down we fall through to the next entry
+    // and still learn the mapped address instead of reporting "blocked".
+    let mut primary_addr: Option<SocketAddr> = None;
+    let mut primary_idx = 0usize;
+    let mut t1 = None;
+    for (i, s) in stun_servers.iter().enumerate() {
+        let Some(dst) = resolve(s).await else { continue };
+        if let Some(r) = stun_test(&sock, dst, false, false, timeout).await {
+            primary_addr = Some(dst);
+            primary_idx = i;
+            t1 = Some(r);
+            break;
+        }
+    }
+    let Some(primary) = primary_addr else {
+        return NatInfo::from(None, NAT_BLOCKED); // no server answered at all
     };
-    let Some(t1) = stun_test(&sock, primary, false, false, timeout).await else {
-        return NatInfo::from(None, NAT_BLOCKED);
-    };
+    let t1 = t1.unwrap();
     let behind_nat = local != Some(t1.mapped.ip());
 
     // Without a server-advertised alternate address we can't run the filtering
     // tests → fall back to the mapping-only test (cone vs symmetric).
     let Some(other) = t1.other else {
-        return fallback_mapping(&sock, stun_servers, t1.mapped, behind_nat, timeout).await;
+        return fallback_mapping(&sock, stun_servers, primary_idx, t1.mapped, behind_nat, timeout)
+            .await;
     };
 
     // Test 2: ask the server to reply from a different IP *and* port.
@@ -305,10 +319,11 @@ pub async fn probe(stun_servers: &[String], timeout: Duration) -> NatInfo {
 }
 
 /// Mapping-only fallback for basic STUN servers (no CHANGE-REQUEST): compare the
-/// reflexive mapping seen from a second server.
+/// reflexive mapping seen from a *different* server than the primary.
 async fn fallback_mapping(
     sock: &UdpSocket,
     stun_servers: &[String],
+    primary_idx: usize,
     mapped1: SocketAddr,
     behind_nat: bool,
     timeout: Duration,
@@ -316,7 +331,13 @@ async fn fallback_mapping(
     if !behind_nat {
         return NatInfo::from(Some(mapped1), NAT_OPEN);
     }
-    let mapped2 = match stun_servers.get(1) {
+    // Pick the first server that isn't the primary for an independent mapping.
+    let other = stun_servers
+        .iter()
+        .enumerate()
+        .find(|(i, _)| *i != primary_idx)
+        .map(|(_, s)| s);
+    let mapped2 = match other {
         Some(s) => match resolve(s).await {
             Some(dst) => stun_test(sock, dst, false, false, timeout).await.map(|r| r.mapped),
             None => None,
@@ -324,9 +345,9 @@ async fn fallback_mapping(
         None => None,
     };
     let nat = match mapped2 {
-        Some(m2) if m2 == mapped1 => NAT_CONE,      // endpoint-independent mapping
-        Some(_) => NAT_SYMMETRIC,                   // endpoint-dependent
-        None => NAT_NAT,                            // only one server → undetermined
+        Some(m2) if m2 == mapped1 => NAT_CONE, // endpoint-independent mapping
+        Some(_) => NAT_SYMMETRIC,              // endpoint-dependent
+        None => NAT_NAT,                       // only one usable server → undetermined
     };
     NatInfo::from(Some(mapped1), nat)
 }
@@ -434,5 +455,19 @@ mod tests {
         let s1 = mock_stun("203.0.113.9:6000".parse().unwrap(), None).await;
         let info = probe(&[s1], Duration::from_millis(500)).await;
         assert_eq!(info.nat_type, NAT_NAT);
+    }
+
+    /// A dead/unreachable server listed first must NOT fail the whole probe —
+    /// it falls through to the next entry and still returns a mapped address.
+    #[tokio::test]
+    async fn dead_primary_falls_through_to_next_server() {
+        // Binds but never replies (simulates a down STUN server) as servers[0].
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap().to_string();
+        // Live mock server as servers[1].
+        let live = mock_stun("203.0.113.7:30000".parse().unwrap(), None).await;
+        let info = probe(&[silent_addr, live], Duration::from_millis(300)).await;
+        assert_ne!(info.nat_type, NAT_BLOCKED, "must not report blocked when a later server is reachable");
+        assert_eq!(info.public_ip.as_deref(), Some("203.0.113.7"), "fell through and got the mapping");
     }
 }

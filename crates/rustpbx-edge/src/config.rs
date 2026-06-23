@@ -188,10 +188,7 @@ fn default_heartbeat_secs() -> u64 {
     10
 }
 fn default_stun_servers() -> Vec<String> {
-    vec![
-        "stun.l.google.com:19302".to_string(),
-        "stun1.l.google.com:19302".to_string(),
-    ]
+    rustpbx_core::stun::default_stun_servers()
 }
 fn default_log() -> String {
     "info".to_string()

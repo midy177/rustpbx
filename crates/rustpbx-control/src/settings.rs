@@ -55,14 +55,34 @@ impl<'a> PlatformSettings<'a> {
     }
 
     /// Centrally-managed STUN server list (`host:port`), stored as a JSON array.
-    /// Empty when unset — nodes then fall back to their own local config.
+    /// Returns the shared defaults when unset — so the platform-settings UI
+    /// shows a sensible list out of the box, and nodes pulling via gRPC always
+    /// get a usable list (the node-local config is only a last-resort fallback
+    /// if the control plane is unreachable).
     pub async fn stun_servers(&self) -> Vec<String> {
+        let stored = self
+            .get(KEY_STUN_SERVERS)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+        if stored.iter().any(|s| !s.trim().is_empty()) {
+            stored
+        } else {
+            rustpbx_core::stun::default_stun_servers()
+        }
+    }
+
+    /// Whether a custom STUN list is configured (vs. the built-in defaults).
+    pub async fn has_custom_stun(&self) -> bool {
         self.get(KEY_STUN_SERVERS)
             .await
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .unwrap_or_default()
+            .map(|v| v.iter().any(|s| !s.trim().is_empty()))
+            .unwrap_or(false)
     }
 
     /// Persist the STUN server list (as a JSON array).
