@@ -30,6 +30,13 @@ pub struct ControlConfig {
     #[serde(default = "default_log")]
     pub log: String,
 
+    /// Wildcard base domain for auto-assigning each tenant a default SIP/PBX
+    /// domain `{tenant_id}.{base_domain}`. Empty → no default domains until the
+    /// superadmin sets one. Seeded into `platform_settings` on first start;
+    /// later superadmin edits via the API take precedence over this value.
+    #[serde(default)]
+    pub base_domain: String,
+
     /// Worker heartbeat timeout in seconds. A Media Worker is marked unhealthy
     /// (excluded from routing) once its heartbeat is older than this, and is
     /// reaped from the registry after twice this duration.
@@ -160,6 +167,7 @@ impl Default for ControlConfig {
             admin_password: default_admin_password(),
             web_dir: default_web_dir(),
             log: default_log(),
+            base_domain: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
             raft: RaftConfig::default(),
             tls: TlsConfig::default(),

@@ -1,18 +1,32 @@
 //! HTTP/REST API for the Control Plane admin console.
 //!
-//! Serves the Vue3 single-page app (`web/dist`) plus a JSON API consumed by it:
-//! authentication, tenant CRUD, worker status and dashboard stats.
+//! Serves the Vue3 single-page app (`web/dist`) plus a JSON API consumed by it.
 //!
-//! Authentication is intentionally lightweight: a single super-admin account
-//! (from config) logs in and receives an opaque bearer token tracked in an
-//! in-memory session map. Tenant-scoped accounts are a future enhancement —
-//! for now the super-admin can scope views to a tenant from the UI.
+//! ## Principals
+//! - **superadmin** — the config-backed platform operator (`tenant_id = None`).
+//!   Logs in with just username + password (no domain).
+//! - **tenant_admin / tenant_user** — DB-backed IAM accounts under a tenant.
+//!   Log in with their tenant's domain + username + password. The domain
+//!   resolves to a `tenant_id`; the username is matched within that tenant.
+//!
+//! Permissions (`auth::permissions`) gate tenant-scoped routes; admins bypass
+//! the checks but every principal is confined to its own tenant by the scoping
+//! helpers below.
 
+use crate::auth::permissions::{self, roles};
+use crate::did_service::{CreateDidRequest, DidService, UpdateDidRequest};
 use crate::raft::registry::RaftRegistry;
+use crate::settings::{KEY_BASE_DOMAIN, PlatformSettings};
 use crate::store::Store;
-use crate::tenant_service::{CreateTenantRequest, TenantService, UpdateTenantRequest};
+use crate::store::crud::{ExtensionInput, RouteInput, TrunkInput};
+use crate::tenant_service::{
+    CreateTenantRequest, TenantService, UpdateDomainRequest, UpdateTenantRequest,
+};
+use crate::tenant_user_service::{
+    CreateTenantUserRequest, TenantUserService, UpdateTenantUserRequest,
+};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
@@ -44,11 +58,24 @@ pub struct HttpState {
     pub admin_password: String,
 }
 
+impl HttpState {
+    /// Current platform wildcard base domain (empty if unset).
+    async fn base_domain(&self) -> String {
+        PlatformSettings::new(&self.db).base_domain().await
+    }
+
+    async fn tenants(&self) -> TenantService<'_> {
+        TenantService::new(&self.db, self.base_domain().await)
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct UserInfo {
     pub username: String,
     pub role: String,
     pub tenant_id: Option<i64>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -71,6 +98,15 @@ impl ApiError {
     fn internal(e: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     }
+    fn bad(e: impl std::fmt::Display) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, e.to_string())
+    }
+    fn forbidden() -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden")
+    }
+    fn not_found(e: impl std::fmt::Display) -> Self {
+        Self::new(StatusCode::NOT_FOUND, e.to_string())
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -80,6 +116,81 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+// ── Authorization helpers ─────────────────────────────────────────────────────
+
+fn is_superadmin(u: &UserInfo) -> bool {
+    u.role == roles::SUPERADMIN
+}
+
+fn require_perm(u: &UserInfo, perm: &str) -> ApiResult<()> {
+    if permissions::has_permission(&u.role, &u.permissions, perm) {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::FORBIDDEN, format!("missing permission: {perm}")))
+    }
+}
+
+fn require_superadmin(u: &UserInfo) -> ApiResult<()> {
+    is_superadmin(u).then_some(()).ok_or_else(ApiError::forbidden)
+}
+
+/// Resolve the tenant scope for a *read*. Superadmin may filter by an explicit
+/// `tenant_id` (or `None` = all tenants); tenant principals are pinned to their
+/// own tenant and may not query another.
+fn read_scope(u: &UserInfo, q: Option<i64>) -> ApiResult<Option<i64>> {
+    if is_superadmin(u) {
+        return Ok(q);
+    }
+    let tid = u.tenant_id.ok_or_else(ApiError::forbidden)?;
+    if matches!(q, Some(other) if other != tid) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(Some(tid))
+}
+
+/// Tenant a *newly created* row belongs to. Superadmin uses the explicit
+/// `tenant_id` (may be `None` = a global/shared row); tenant principals always
+/// create within their own tenant.
+fn create_tenant_scope(u: &UserInfo, q: Option<i64>) -> ApiResult<Option<i64>> {
+    if is_superadmin(u) {
+        return Ok(q);
+    }
+    let tid = u.tenant_id.ok_or_else(ApiError::forbidden)?;
+    if matches!(q, Some(other) if other != tid) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(Some(tid))
+}
+
+/// Tenant restriction applied to *update/delete*. Superadmin → `None` (may touch
+/// any row by id); tenant principals → `Some(their tenant)` so they can only
+/// mutate their own rows.
+fn mutate_scope(u: &UserInfo) -> Option<i64> {
+    if is_superadmin(u) { None } else { u.tenant_id }
+}
+
+/// The single tenant a tenant-admin self-service action applies to. Superadmin
+/// must name it explicitly; tenant principals use their own.
+fn required_tenant(u: &UserInfo, q: Option<i64>) -> ApiResult<i64> {
+    if is_superadmin(u) {
+        return q.ok_or_else(|| ApiError::bad("tenant_id is required"));
+    }
+    let tid = u.tenant_id.ok_or_else(ApiError::forbidden)?;
+    if matches!(q, Some(other) if other != tid) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(tid)
+}
+
+/// 0 rows affected → 404.
+fn affected_or_404(n: u64) -> ApiResult<StatusCode> {
+    if n == 0 {
+        Err(ApiError::not_found("not found or not in your tenant"))
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
@@ -92,14 +203,29 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
         .route("/stats", get(stats))
+        .route("/tenant-stats", get(tenant_stats))
+        // platform (superadmin)
+        .route("/platform/settings", get(get_platform_settings).put(put_platform_settings))
+        .route("/permissions", get(list_permissions))
+        // tenants (superadmin)
         .route("/tenants", get(list_tenants).post(create_tenant))
-        .route(
-            "/tenants/{id}",
-            get(get_tenant).put(update_tenant).delete(delete_tenant),
-        )
+        .route("/tenants/{id}", get(get_tenant).put(update_tenant).delete(delete_tenant))
+        // tenant IAM users
+        .route("/tenant-users", get(list_tenant_users).post(create_tenant_user))
+        .route("/tenant-users/{id}", post(update_tenant_user).delete(delete_tenant_user))
+        // tenant domain self-service
+        .route("/tenant-domain", get(get_tenant_domain).put(put_tenant_domain))
+        // PBX config
+        .route("/trunks", get(list_trunks).post(create_trunk))
+        .route("/trunks/{id}", post(update_trunk).delete(delete_trunk))
+        .route("/routes", get(list_routes).post(create_route))
+        .route("/routes/{id}", post(update_route).delete(delete_route))
+        .route("/extensions", get(list_extensions).post(create_extension))
+        .route("/extensions/{id}", post(update_extension).delete(delete_extension))
+        .route("/call-records", get(list_call_records))
+        .route("/dids", get(list_dids).post(create_did))
+        .route("/dids/{id}", post(update_did).delete(delete_did))
         .route("/workers", get(list_workers))
-        .route("/trunks", get(list_trunks))
-        .route("/routes", get(list_routes))
         // Raft cluster admin (dynamic membership)
         .route("/raft/metrics", get(raft_metrics))
         .route("/raft/add-learner", post(raft_add_learner))
@@ -123,8 +249,6 @@ async fn auth_guard(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // Login is the only unauthenticated endpoint. The middleware runs inside the
-    // `/api`-nested router, so the path here is prefix-stripped (`/auth/login`).
     if req.uri().path() == "/auth/login" {
         return Ok(next.run(req).await);
     }
@@ -158,6 +282,9 @@ async fn auth_guard(
 struct LoginReq {
     username: String,
     password: String,
+    /// Tenant domain (custom or `{id}.{base_domain}`). Omit for superadmin.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -167,16 +294,50 @@ struct LoginResp {
 }
 
 async fn login(State(state): State<HttpState>, Json(req): Json<LoginReq>) -> ApiResult<Json<LoginResp>> {
-    if req.username != state.admin_username || req.password != state.admin_password {
-        warn!(username = %req.username, "failed login attempt");
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"));
-    }
+    let domain = req.domain.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let user = UserInfo {
-        username: state.admin_username.clone(),
-        role: "superadmin".to_string(),
-        tenant_id: None,
+    let user = match domain {
+        // Superadmin: no domain, config-backed credentials.
+        None => {
+            if req.username != state.admin_username || req.password != state.admin_password {
+                warn!(username = %req.username, "failed superadmin login");
+                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"));
+            }
+            UserInfo {
+                username: state.admin_username.clone(),
+                role: roles::SUPERADMIN.to_string(),
+                tenant_id: None,
+                permissions: vec![],
+            }
+        }
+        // Tenant user: resolve domain → tenant, then authenticate within it.
+        Some(domain) => {
+            let tenant = state
+                .tenants()
+                .await
+                .resolve_by_domain(domain)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unknown domain"))?;
+
+            let principal = TenantUserService::new(&state.db)
+                .authenticate(tenant.id, req.username.trim(), &req.password)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    warn!(domain, username = %req.username, "failed tenant login");
+                    ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials")
+                })?;
+
+            UserInfo {
+                username: principal.username,
+                role: principal.session_role,
+                tenant_id: Some(principal.tenant_id),
+                permissions: principal.permissions,
+            }
+        }
     };
+
     let token = uuid::Uuid::new_v4().to_string();
     state.sessions.insert(
         token.clone(),
@@ -185,7 +346,7 @@ async fn login(State(state): State<HttpState>, Json(req): Json<LoginReq>) -> Api
             expires: Utc::now() + ChronoDuration::hours(SESSION_TTL_HOURS),
         },
     );
-    info!(username = %user.username, "login ok");
+    info!(username = %user.username, role = %user.role, tenant_id = ?user.tenant_id, "login ok");
     Ok(Json(LoginResp { token, user }))
 }
 
@@ -201,12 +362,43 @@ async fn logout(State(state): State<HttpState>, req: Request) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn me(req: Request) -> ApiResult<Json<UserInfo>> {
-    req.extensions()
-        .get::<UserInfo>()
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "no session"))
+async fn me(Extension(user): Extension<UserInfo>) -> Json<UserInfo> {
+    Json(user)
+}
+
+/// The permission catalogue, for the tenant-admin user editor.
+async fn list_permissions(Extension(user): Extension<UserInfo>) -> ApiResult<Json<Vec<&'static str>>> {
+    // Any authenticated principal that can manage users may read the catalogue.
+    require_perm(&user, permissions::USERS_READ)?;
+    Ok(Json(permissions::ALL_PERMISSIONS.to_vec()))
+}
+
+// ── Platform settings (superadmin) ─────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct PlatformSettingsBody {
+    base_domain: String,
+}
+
+async fn get_platform_settings(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<PlatformSettingsBody>> {
+    require_superadmin(&user)?;
+    Ok(Json(PlatformSettingsBody { base_domain: state.base_domain().await }))
+}
+
+async fn put_platform_settings(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Json(body): Json<PlatformSettingsBody>,
+) -> ApiResult<Json<PlatformSettingsBody>> {
+    require_superadmin(&user)?;
+    PlatformSettings::new(&state.db)
+        .set(KEY_BASE_DOMAIN, body.base_domain.trim())
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(PlatformSettingsBody { base_domain: state.base_domain().await }))
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -220,18 +412,11 @@ struct Stats {
 }
 
 async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
-    let tenants = TenantService::new(&state.db)
-        .list()
-        .await
-        .map_err(ApiError::internal)?
-        .len();
+    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?.len();
     let all = state.workers.all().await;
     let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let workers_healthy = all
-        .iter()
-        .filter(|w| w.is_healthy(now_ms, timeout_ms))
-        .count();
+    let workers_healthy = all.iter().filter(|w| w.is_healthy(now_ms, timeout_ms)).count();
     let active_calls = all.iter().map(|w| w.active_calls).sum();
     Ok(Json(Stats {
         tenants,
@@ -241,52 +426,416 @@ async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
     }))
 }
 
-// ── Tenant handlers ─────────────────────────────────────────────────────────
+// ── Tenant-scoped dashboard stats ──────────────────────────────────────────────
 
-async fn list_tenants(State(state): State<HttpState>) -> ApiResult<Response> {
-    let tenants = TenantService::new(&state.db)
-        .list()
+#[derive(Serialize)]
+struct TenantStats {
+    trunks: usize,
+    extensions: usize,
+    dids: u64,
+    recent_calls: usize,
+}
+
+async fn tenant_stats(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Json<TenantStats>> {
+    let tid = required_tenant(&user, q.tenant_id)?;
+    let trunks = state.store.list_trunks(Some(tid)).await.map_err(ApiError::internal)?.len();
+    let extensions = state.store.list_extensions(Some(tid)).await.map_err(ApiError::internal)?.len();
+    let dids = DidService::new(&state.db).count_for_tenant(tid).await.map_err(ApiError::internal)?;
+    let recent_calls = state
+        .store
+        .list_call_records(Some(tid), 1000)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .len();
+    Ok(Json(TenantStats { trunks, extensions, dids, recent_calls }))
+}
+
+// ── Tenant handlers (superadmin) ───────────────────────────────────────────────
+
+async fn list_tenants(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Response> {
+    require_superadmin(&user)?;
+    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?;
     Ok(Json(tenants).into_response())
 }
 
-async fn get_tenant(State(state): State<HttpState>, Path(id): Path<i64>) -> ApiResult<Response> {
-    let tenant = TenantService::new(&state.db)
-        .get(id)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::NOT_FOUND, e.to_string()))?;
+async fn get_tenant(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    // Superadmin (any) or a tenant principal reading its own tenant.
+    if !is_superadmin(&user) && user.tenant_id != Some(id) {
+        return Err(ApiError::forbidden());
+    }
+    let tenant = state.tenants().await.get(id).await.map_err(ApiError::not_found)?;
     Ok(Json(tenant).into_response())
 }
 
 async fn create_tenant(
     State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
     Json(req): Json<CreateTenantRequest>,
 ) -> ApiResult<Response> {
-    let tenant = TenantService::new(&state.db)
-        .create(req)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(tenant)).into_response())
+    require_superadmin(&user)?;
+    let tenant = state.tenants().await.create(&req).await.map_err(ApiError::bad)?;
+
+    // Optionally provision the tenant's first admin account.
+    let mut provisioned_admin = None;
+    if let (Some(u), Some(p)) = (req.admin_username.as_deref(), req.admin_password.as_deref())
+        && !u.trim().is_empty()
+    {
+        match TenantUserService::new(&state.db)
+            .create_initial_admin(tenant.id, u.trim(), p)
+            .await
+        {
+            Ok(admin) => provisioned_admin = Some(admin),
+            Err(e) => {
+                // Tenant exists but admin failed — surface a clear partial error.
+                return Err(ApiError::bad(format!(
+                    "tenant created (id {}) but admin account failed: {e}",
+                    tenant.id
+                )));
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "tenant": tenant, "admin": provisioned_admin })),
+    )
+        .into_response())
 }
 
 async fn update_tenant(
     State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateTenantRequest>,
 ) -> ApiResult<Response> {
-    let tenant = TenantService::new(&state.db)
-        .update(id, req)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    require_superadmin(&user)?;
+    let tenant = state.tenants().await.update(id, req).await.map_err(ApiError::bad)?;
     Ok(Json(tenant).into_response())
 }
 
-async fn delete_tenant(State(state): State<HttpState>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    TenantService::new(&state.db)
-        .delete(id)
+async fn delete_tenant(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_superadmin(&user)?;
+    state.tenants().await.delete(id).await.map_err(ApiError::not_found)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Tenant IAM users ───────────────────────────────────────────────────────────
+
+async fn list_tenant_users(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::USERS_READ)?;
+    let tid = required_tenant(&user, q.tenant_id)?;
+    let users = TenantUserService::new(&state.db).list(tid).await.map_err(ApiError::internal)?;
+    Ok(Json(users).into_response())
+}
+
+async fn create_tenant_user(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(req): Json<CreateTenantUserRequest>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::USERS_WRITE)?;
+    let tid = required_tenant(&user, q.tenant_id)?;
+    // Only superadmin may mint another tenant admin; tenant admins create users.
+    if req.role.as_deref() == Some(permissions::db_role::ADMIN) && !is_superadmin(&user) {
+        return Err(ApiError::forbidden());
+    }
+    let created = TenantUserService::new(&state.db)
+        .create(tid, &req)
         .await
-        .map_err(|e| ApiError::new(StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(ApiError::bad)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+async fn update_tenant_user(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateTenantUserRequest>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::USERS_WRITE)?;
+    let svc = TenantUserService::new(&state.db);
+    let target = svc.get(id).await.map_err(ApiError::not_found)?;
+    if !is_superadmin(&user) && user.tenant_id != Some(target.tenant_id) {
+        return Err(ApiError::forbidden());
+    }
+    let updated = svc.update(id, req).await.map_err(ApiError::bad)?;
+    Ok(Json(updated).into_response())
+}
+
+async fn delete_tenant_user(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::USERS_WRITE)?;
+    let svc = TenantUserService::new(&state.db);
+    let target = svc.get(id).await.map_err(ApiError::not_found)?;
+    if !is_superadmin(&user) && user.tenant_id != Some(target.tenant_id) {
+        return Err(ApiError::forbidden());
+    }
+    svc.delete(id).await.map_err(ApiError::bad)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Tenant domain self-service ─────────────────────────────────────────────────
+
+async fn get_tenant_domain(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::DOMAIN_READ)?;
+    let tid = required_tenant(&user, q.tenant_id)?;
+    let tenant = state.tenants().await.get(tid).await.map_err(ApiError::not_found)?;
+    Ok(Json(tenant).into_response())
+}
+
+async fn put_tenant_domain(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(req): Json<UpdateDomainRequest>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::DOMAIN_WRITE)?;
+    let tid = required_tenant(&user, q.tenant_id)?;
+    let tenant = state.tenants().await.update_domain(tid, req).await.map_err(ApiError::bad)?;
+    Ok(Json(tenant).into_response())
+}
+
+// ── PBX config: trunks ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TenantQuery {
+    tenant_id: Option<i64>,
+}
+
+async fn list_trunks(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::TRUNKS_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let rows = state.store.list_trunks(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn create_trunk(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(input): Json<TrunkInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::TRUNKS_WRITE)?;
+    let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    state.store.create_trunk(&input, row_tenant).await.map_err(ApiError::bad)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_trunk(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(input): Json<TrunkInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::TRUNKS_WRITE)?;
+    let n = state.store.update_trunk(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+async fn delete_trunk(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::TRUNKS_WRITE)?;
+    let n = state.store.delete_trunk(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+// ── PBX config: routes ─────────────────────────────────────────────────────────
+
+async fn list_routes(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::ROUTING_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let rows = state.store.list_routes(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn create_route(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(input): Json<RouteInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ROUTING_WRITE)?;
+    let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    state.store.create_route(&input, row_tenant).await.map_err(ApiError::bad)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_route(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(input): Json<RouteInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ROUTING_WRITE)?;
+    let n = state.store.update_route(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+async fn delete_route(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ROUTING_WRITE)?;
+    let n = state.store.delete_route(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+// ── PBX config: extensions ─────────────────────────────────────────────────────
+
+async fn list_extensions(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::EXTENSIONS_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let rows = state.store.list_extensions(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn create_extension(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(input): Json<ExtensionInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::EXTENSIONS_WRITE)?;
+    let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    state.store.create_extension(&input, row_tenant).await.map_err(ApiError::bad)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_extension(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(input): Json<ExtensionInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::EXTENSIONS_WRITE)?;
+    let n = state
+        .store
+        .update_extension(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+async fn delete_extension(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::EXTENSIONS_WRITE)?;
+    let n = state.store.delete_extension(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+// ── Call records (CDR) ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CdrQuery {
+    tenant_id: Option<i64>,
+    limit: Option<u64>,
+}
+
+async fn list_call_records(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<CdrQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::CDR_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let rows = state
+        .store
+        .list_call_records(scope, limit)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+// ── DIDs (phone number inventory) ──────────────────────────────────────────────
+
+async fn list_dids(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::DIDS_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let dids = DidService::new(&state.db).list(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(dids).into_response())
+}
+
+/// DID inventory mutations are platform operations (superadmin allocates numbers
+/// and assigns them to tenants).
+async fn create_did(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Json(req): Json<CreateDidRequest>,
+) -> ApiResult<Response> {
+    require_superadmin(&user)?;
+    let did = DidService::new(&state.db).create(&req).await.map_err(ApiError::bad)?;
+    Ok((StatusCode::CREATED, Json(did)).into_response())
+}
+
+async fn update_did(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateDidRequest>,
+) -> ApiResult<Response> {
+    require_superadmin(&user)?;
+    let did = DidService::new(&state.db).update(id, req).await.map_err(ApiError::bad)?;
+    Ok(Json(did).into_response())
+}
+
+async fn delete_did(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_superadmin(&user)?;
+    DidService::new(&state.db).delete(id).await.map_err(ApiError::not_found)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -307,38 +856,11 @@ struct WorkerView {
     draining: bool,
 }
 
-// ── Trunks & Routes (read-only, secret-safe) ─────────────────────────────────
-
-#[derive(Deserialize)]
-struct TenantQuery {
-    tenant_id: Option<i64>,
-}
-
-async fn list_trunks(
+async fn list_workers(
     State(state): State<HttpState>,
-    Query(q): Query<TenantQuery>,
-) -> ApiResult<Response> {
-    let rows = state
-        .store
-        .list_trunks(q.tenant_id)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(rows).into_response())
-}
-
-async fn list_routes(
-    State(state): State<HttpState>,
-    Query(q): Query<TenantQuery>,
-) -> ApiResult<Response> {
-    let rows = state
-        .store
-        .list_routes(q.tenant_id)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(rows).into_response())
-}
-
-async fn list_workers(State(state): State<HttpState>) -> Json<Vec<WorkerView>> {
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<Vec<WorkerView>>> {
+    require_superadmin(&user)?;
     let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let views = state
@@ -362,32 +884,33 @@ async fn list_workers(State(state): State<HttpState>) -> Json<Vec<WorkerView>> {
             draining: w.draining,
         })
         .collect();
-    Json(views)
+    Ok(Json(views))
 }
 
 // ── Raft cluster admin ─────────────────────────────────────────────────────
 
-/// Current Raft state (term, leader, members, applied index).
-async fn raft_metrics(State(state): State<HttpState>) -> Json<crate::raft::registry::RaftMetricsSummary> {
-    Json(state.workers.metrics_summary())
+async fn raft_metrics(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<crate::raft::registry::RaftMetricsSummary>> {
+    require_superadmin(&user)?;
+    Ok(Json(state.workers.metrics_summary()))
 }
 
 #[derive(serde::Deserialize)]
 struct AddLearnerRequest {
     node_id: u64,
-    /// Address peers use to reach the new node's Raft transport server (host:port).
     addr: String,
-    /// The new node's business gRPC (`ControlPlane`) address, used for
-    /// write-forwarding. Defaults to `addr` if omitted.
     #[serde(default)]
     grpc_addr: String,
 }
 
-/// Add a node as a non-voting learner. Must be called on the current leader.
 async fn raft_add_learner(
     State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
     Json(req): Json<AddLearnerRequest>,
 ) -> ApiResult<Response> {
+    require_superadmin(&user)?;
     let grpc_addr = if req.grpc_addr.trim().is_empty() {
         req.addr.as_str()
     } else {
@@ -397,26 +920,21 @@ async fn raft_add_learner(
         .workers
         .add_learner(req.node_id, &req.addr, grpc_addr)
         .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(ApiError::bad)?;
     Ok((StatusCode::OK, Json(serde_json::json!({"added": req.node_id}))).into_response())
 }
 
 #[derive(serde::Deserialize)]
 struct ChangeMembershipRequest {
-    /// The complete set of voter node ids after the change.
     voters: std::collections::BTreeSet<u64>,
 }
 
-/// Set the cluster's voter membership. Promotes learners / removes voters.
-/// Must be called on the current leader.
 async fn raft_change_membership(
     State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
     Json(req): Json<ChangeMembershipRequest>,
 ) -> ApiResult<Response> {
-    state
-        .workers
-        .change_membership(req.voters)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    require_superadmin(&user)?;
+    state.workers.change_membership(req.voters).await.map_err(ApiError::bad)?;
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }

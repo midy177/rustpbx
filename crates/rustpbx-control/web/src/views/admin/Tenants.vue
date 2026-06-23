@@ -57,6 +57,9 @@ function openCreate() {
     max_trunks: null,
     max_dids: null,
     storage_prefix: null,
+    custom_domain: null,
+    admin_username: null,
+    admin_password: null,
     status: undefined,
   });
   dialogOpen.value = true;
@@ -70,6 +73,9 @@ function openEdit(tn: Tenant) {
     max_trunks: tn.max_trunks,
     max_dids: tn.max_dids,
     storage_prefix: tn.storage_prefix,
+    custom_domain: null,
+    admin_username: null,
+    admin_password: null,
     status: tn.status,
   });
   dialogOpen.value = true;
@@ -94,7 +100,13 @@ async function save() {
     max_trunks: num(form.max_trunks),
     max_dids: num(form.max_dids),
     storage_prefix: form.storage_prefix || null,
-    ...(editingId.value ? { status: form.status } : {}),
+    ...(editingId.value
+      ? { status: form.status }
+      : {
+          custom_domain: form.custom_domain || null,
+          admin_username: form.admin_username || null,
+          admin_password: form.admin_password || null,
+        }),
   };
   try {
     if (editingId.value) await api.put(`/tenants/${editingId.value}`, payload);
@@ -159,6 +171,7 @@ function statusLabel(s: string) {
           <TableRow>
             <TableHead class="w-12">{{ t("common.id") }}</TableHead>
             <TableHead>{{ t("common.name") }}</TableHead>
+            <TableHead>{{ t("tenants.domain") }}</TableHead>
             <TableHead>{{ t("common.status") }}</TableHead>
             <TableHead>{{ t("tenants.maxConcurrentCalls") }}</TableHead>
             <TableHead>{{ t("tenants.maxTrunks") }}</TableHead>
@@ -168,11 +181,15 @@ function statusLabel(s: string) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="8">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="tenants.length === 0" :colspan="8">{{ t("common.empty") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="9">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="tenants.length === 0" :colspan="9">{{ t("common.empty") }}</TableEmpty>
           <TableRow v-for="tn in tenants" :key="tn.id">
             <TableCell class="text-muted-foreground">{{ tn.id }}</TableCell>
             <TableCell class="font-medium">{{ tn.name }}</TableCell>
+            <TableCell class="font-mono text-xs">
+              {{ tn.active_domain || "—" }}
+              <Badge v-if="tn.custom_domain_enabled" variant="secondary" class="ml-1">custom</Badge>
+            </TableCell>
             <TableCell><Badge :variant="statusVariant(tn.status)">{{ statusLabel(tn.status) }}</Badge></TableCell>
             <TableCell>{{ tn.max_concurrent_calls ?? t("common.unlimited") }}</TableCell>
             <TableCell>{{ tn.max_trunks ?? t("common.unlimited") }}</TableCell>
@@ -223,6 +240,30 @@ function statusLabel(s: string) {
           <Label for="t-sp">{{ t("tenants.storagePrefix") }}</Label>
           <Input id="t-sp" v-model="form.storage_prefix" />
         </div>
+
+        <!-- Create-only: custom domain + initial admin account -->
+        <template v-if="!editingId">
+          <div class="grid gap-2">
+            <Label for="t-domain">{{ t("tenants.customDomainOptional") }}</Label>
+            <Input id="t-domain" v-model="form.custom_domain" :placeholder="t('tenants.customDomainPlaceholder')" />
+            <p class="text-xs text-muted-foreground">{{ t("tenants.defaultDomainNote", { id: "{id}", base: "base" }) }}</p>
+          </div>
+          <div class="rounded-md border p-3">
+            <p class="mb-1 text-sm font-medium">{{ t("tenants.adminSection") }}</p>
+            <p class="mb-3 text-xs text-muted-foreground">{{ t("tenants.adminHint") }}</p>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="grid gap-2">
+                <Label for="t-au">{{ t("tenants.adminUsername") }}</Label>
+                <Input id="t-au" v-model="form.admin_username" autocomplete="off" />
+              </div>
+              <div class="grid gap-2">
+                <Label for="t-ap">{{ t("tenants.adminPassword") }}</Label>
+                <Input id="t-ap" v-model="form.admin_password" type="password" autocomplete="new-password" />
+              </div>
+            </div>
+          </div>
+        </template>
+
         <div v-if="editingId" class="grid gap-2">
           <Label for="t-status">{{ t("common.status") }}</Label>
           <select

@@ -17,6 +17,7 @@ const route = useRoute();
 
 const username = ref("admin");
 const password = ref("");
+const domain = ref("");
 const error = ref("");
 const loading = ref(false);
 
@@ -28,8 +29,8 @@ async function onSubmit() {
   error.value = "";
   loading.value = true;
   try {
-    await auth.login(username.value, password.value);
-    const redirect = (route.query.redirect as string) || "/admin/dashboard";
+    await auth.login(username.value, password.value, domain.value);
+    const redirect = (route.query.redirect as string) || auth.homeRoute();
     router.push(redirect);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) error.value = t("auth.invalidCredentials");
@@ -67,6 +68,11 @@ async function onSubmit() {
           <div class="flex flex-col gap-2">
             <Label for="password">{{ t("auth.password") }}</Label>
             <Input id="password" v-model="password" type="password" autocomplete="current-password" />
+          </div>
+          <div class="flex flex-col gap-2">
+            <Label for="domain">{{ t("auth.domain") }}</Label>
+            <Input id="domain" v-model="domain" autocomplete="off" placeholder="acme.example.com" />
+            <p class="text-xs text-muted-foreground">{{ t("auth.domainHint") }}</p>
           </div>
           <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
           <Button type="submit" :disabled="loading" class="w-full">

@@ -18,6 +18,8 @@ const routes = [
       { path: "dashboard", name: "admin-dashboard", component: () => import("@/views/admin/Dashboard.vue") },
       { path: "tenants", name: "admin-tenants", component: () => import("@/views/admin/Tenants.vue") },
       { path: "workers", name: "admin-workers", component: () => import("@/views/admin/Workers.vue") },
+      { path: "dids", name: "admin-dids", component: () => import("@/views/admin/Dids.vue") },
+      { path: "settings", name: "admin-settings", component: () => import("@/views/admin/PlatformSettings.vue") },
     ],
   },
   // ── Tenant-admin area (scoped to the active tenant) ────────────────────────
@@ -32,6 +34,9 @@ const routes = [
       { path: "routing", name: "tadmin-routing", component: () => import("@/views/tadmin/Routing.vue") },
       { path: "extensions", name: "tadmin-extensions", component: () => import("@/views/tadmin/Extensions.vue") },
       { path: "call-records", name: "tadmin-cdr", component: () => import("@/views/tadmin/CallRecords.vue") },
+      { path: "dids", name: "tadmin-dids", component: () => import("@/views/tadmin/Dids.vue") },
+      { path: "users", name: "tadmin-users", component: () => import("@/views/tadmin/Users.vue") },
+      { path: "domain", name: "tadmin-domain", component: () => import("@/views/tadmin/Domain.vue") },
     ],
   },
   // ── Tenant end-user area ───────────────────────────────────────────────────
@@ -44,8 +49,8 @@ const routes = [
       { path: "profile", name: "tenant-profile", component: () => import("@/views/tenant/Profile.vue") },
     ],
   },
-  { path: "/", redirect: "/admin/dashboard" },
-  { path: "/:pathMatch(.*)*", redirect: "/admin/dashboard" },
+  { path: "/", redirect: "/login" },
+  { path: "/:pathMatch(.*)*", redirect: "/login" },
 ];
 
 export const router = createRouter({
@@ -59,11 +64,19 @@ router.beforeEach((to) => {
     return { name: "login", query: { redirect: to.fullPath } };
   }
   if (to.name === "login" && auth.isAuthenticated) {
-    return { path: "/admin/dashboard" };
+    return { path: auth.homeRoute() };
   }
-  // Tenant-admin / tenant areas require an active tenant to be selected.
-  if ((to.meta.area === "tenant-admin" || to.meta.area === "tenant") && !auth.activeTenantId) {
-    return { path: "/admin/tenants" };
+  // Platform area is super-admin only.
+  if (to.meta.area === "admin" && !auth.isSuperAdmin) {
+    return { path: "/t/admin/dashboard" };
+  }
+  // Tenant areas require a tenant scope. Tenant principals always have one;
+  // a super-admin must "enter" a tenant first.
+  if (
+    (to.meta.area === "tenant-admin" || to.meta.area === "tenant") &&
+    !auth.activeTenantId
+  ) {
+    return { path: auth.isSuperAdmin ? "/admin/tenants" : "/login" };
   }
   return true;
 });

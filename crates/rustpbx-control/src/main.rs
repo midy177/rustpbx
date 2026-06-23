@@ -1,11 +1,15 @@
+mod auth;
 mod config;
+mod did_service;
 mod grpc;
 mod http_api;
 mod migration;
 mod models;
 mod raft;
+mod settings;
 mod store;
 mod tenant_service;
+mod tenant_user_service;
 
 use crate::{
     grpc::{
@@ -49,7 +53,11 @@ async fn main() -> Result<()> {
     info!(grpc_addr = %cfg.grpc_addr, http_addr = %cfg.http_addr, "rustpbx-control starting");
 
     // ── Database + Migrations ─────────────────────────────────────────────────
-    let db = Database::connect(&cfg.database_url).await?;
+    // Demote SeaORM/sqlx statement logging to DEBUG so per-query lines don't
+    // spam the default `info` level (set `log=debug` to see them again).
+    let mut db_opt = sea_orm::ConnectOptions::new(&cfg.database_url);
+    db_opt.sqlx_logging_level(tracing::log::LevelFilter::Debug);
+    let db = Database::connect(db_opt).await?;
     info!(database_url = %cfg.database_url, "database connected");
 
     // Initialize schema directly, bypassing SeaORM's migration version tracking.
@@ -68,6 +76,12 @@ async fn main() -> Result<()> {
         m.up(&manager).await?;
     }
     info!("control plane schema initialized");
+
+    // Seed the wildcard base_domain from config on first start (superadmin edits
+    // via the API thereafter take precedence — see PlatformSettings::seed).
+    settings::PlatformSettings::new(&db)
+        .seed_base_domain(&cfg.base_domain)
+        .await?;
 
     // ── Services ──────────────────────────────────────────────────────────────
     // `DatabaseConnection` is cheaply clonable (Arc inside) — keep a handle for

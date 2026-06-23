@@ -9,6 +9,13 @@ license = "MIT"
 name = "rustpbx-control"
 path = "src/main.rs"
 
+[features]
+# Build the Vue admin SPA (`web/`) into `web/dist` as part of `cargo build`.
+# On by default; opt out with `--no-default-features` or `RUSTPBX_SKIP_WEB_BUILD=1`
+# (the latter is handy for rust-analyzer / backend-only iteration).
+default = ["build-web"]
+build-web = []
+
 [dependencies]
 rustpbx-core = { path = "../rustpbx-core" }
 # Shared protobuf/gRPC definitions (compiled once in rustpbx-proto).
@@ -55,6 +62,8 @@ async-trait = "0.1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+# Password hashing for tenant IAM accounts (self-salting, no RNG feature fiddling).
+bcrypt = "0.15"
 dashmap = "6"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"

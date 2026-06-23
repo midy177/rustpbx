@@ -19,10 +19,14 @@ impl Store {
         // `answer_time` / `sip_trunk_name` columns. The Worker reports a trunk
         // *name* (not the main schema's `sip_trunk_id`) and an answer time that
         // the base schema doesn't model, so both are folded into `metadata`.
+        // tenant_id is written to its own column (for clean per-tenant CDR
+        // filtering) as well as kept in metadata. 0 / unset = no tenant.
+        let tenant_id = rec.tenant_id.filter(|&t| t != 0);
+
         let sql = "INSERT INTO rustpbx_call_records \
             (call_id, from_number, to_number, direction, status, \
-             started_at, ended_at, duration_secs, metadata) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             started_at, ended_at, duration_secs, tenant_id, recording_url, metadata) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
             ON CONFLICT (call_id) DO NOTHING";
 
         let meta = serde_json::json!({
@@ -34,6 +38,7 @@ impl Store {
             "sip_trunk_name": rec.trunk_name,
             "answer_time_unix_ms": (rec.answer_time_unix_ms > 0).then_some(rec.answer_time_unix_ms),
         });
+        let recording_url = rec.recording_path.clone().filter(|s| !s.is_empty());
 
         self.db
             .execute(Statement::from_sql_and_values(
@@ -48,6 +53,8 @@ impl Store {
                     Value::ChronoDateTimeUtc(start.map(Box::new)),
                     Value::ChronoDateTimeUtc(end.map(Box::new)),
                     Value::Int(Some(rec.duration_secs)),
+                    Value::BigInt(tenant_id),
+                    Value::String(recording_url.map(Box::new)),
                     Value::Json(Some(Box::new(meta))),
                 ],
             ))
@@ -231,6 +238,45 @@ impl Store {
         rows.iter().map(row_to_route_view).collect()
     }
 
+    /// List recent CDRs for the admin console, newest first, optionally scoped
+    /// to a tenant. `limit` caps the result set.
+    pub async fn list_call_records(
+        &self,
+        tenant_id: Option<i64>,
+        limit: u64,
+    ) -> Result<Vec<crate::store::CdrView>> {
+        use sea_orm::Statement;
+
+        let cols = "id, call_id, tenant_id, direction, status, from_number, to_number, \
+            started_at, ended_at, duration_secs, recording_url";
+        let (sql, values) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_call_records WHERE tenant_id = $1 \
+                     ORDER BY started_at DESC LIMIT {limit}"
+                ),
+                vec![sea_orm::Value::BigInt(Some(tid))],
+            ),
+            None => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_call_records \
+                     ORDER BY started_at DESC LIMIT {limit}"
+                ),
+                vec![],
+            ),
+        };
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                values,
+            ))
+            .await?;
+        rows.iter().map(row_to_cdr_view).collect()
+    }
+
     /// Load active ACL rules as `"<action> <target>"` strings, optionally scoped
     /// to a tenant (matches the tenant plus global/NULL-tenant rows), ordered by
     /// priority ascending. Format matches the main binary's `acl_rules` config.
@@ -334,6 +380,24 @@ fn row_to_route_view(row: &sea_orm::QueryResult) -> Result<crate::store::RouteVi
         target_trunks,
         is_active: row.try_get("", "is_active").unwrap_or(true),
         tenant_id: row.try_get("", "tenant_id").ok(),
+    })
+}
+
+fn row_to_cdr_view(row: &sea_orm::QueryResult) -> Result<crate::store::CdrView> {
+    let started_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("", "started_at").ok();
+    let ended_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("", "ended_at").ok();
+    Ok(crate::store::CdrView {
+        id: row.try_get("", "id")?,
+        call_id: row.try_get("", "call_id")?,
+        tenant_id: row.try_get("", "tenant_id").ok(),
+        direction: row.try_get("", "direction").unwrap_or_default(),
+        status: row.try_get("", "status").unwrap_or_default(),
+        from_number: row.try_get("", "from_number").ok(),
+        to_number: row.try_get("", "to_number").ok(),
+        started_at: started_at.map(|t| t.to_rfc3339()),
+        ended_at: ended_at.map(|t| t.to_rfc3339()),
+        duration_secs: row.try_get("", "duration_secs").unwrap_or(0),
+        recording_url: row.try_get("", "recording_url").ok(),
     })
 }
 
@@ -562,6 +626,40 @@ mod tests {
         let rules = store.load_acl_rules(None).await.unwrap();
         // priority ascending → allow (100) before deny (200), formatted "action target".
         assert_eq!(rules, vec!["allow 10.0.0.0/8".to_string(), "deny all".to_string()]);
+    }
+
+    async fn insert_cdr(store: &Store, call_id: &str, tenant: Option<i64>) {
+        let sql = "INSERT INTO rustpbx_call_records \
+            (call_id, direction, status, duration_secs, tenant_id, from_number, to_number) \
+            VALUES ($1,'inbound','completed',42,$2,'1001','1002')";
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                sql,
+                vec![
+                    sea_orm::Value::String(Some(Box::new(call_id.into()))),
+                    sea_orm::Value::BigInt(tenant),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_call_records_scopes_by_tenant() {
+        let store = fresh_store().await;
+        insert_cdr(&store, "c-t1", Some(1)).await;
+        insert_cdr(&store, "c-t2", Some(2)).await;
+        insert_cdr(&store, "c-global", None).await;
+
+        let t1 = store.list_call_records(Some(1), 100).await.unwrap();
+        assert_eq!(t1.len(), 1, "tenant 1 sees only its own CDR");
+        assert_eq!(t1[0].call_id, "c-t1");
+        assert_eq!(t1[0].duration_secs, 42);
+
+        let all = store.list_call_records(None, 100).await.unwrap();
+        assert_eq!(all.len(), 3, "no scope → all CDRs");
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+pub mod crud;
 pub mod db_queries;
 
 use sea_orm::DatabaseConnection;
@@ -50,6 +51,22 @@ pub struct RouteView {
     pub target_trunks: Vec<String>,
     pub is_active: bool,
     pub tenant_id: Option<i64>,
+}
+
+/// CDR row for the admin console (secret-safe projection).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CdrView {
+    pub id: i64,
+    pub call_id: String,
+    pub tenant_id: Option<i64>,
+    pub direction: String,
+    pub status: String,
+    pub from_number: Option<String>,
+    pub to_number: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub duration_secs: i32,
+    pub recording_url: Option<String>,
 }
 
 /// CDR record to persist.

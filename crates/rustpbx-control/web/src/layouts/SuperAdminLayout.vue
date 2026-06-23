@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import AppShell, { type NavItem } from "@/components/AppShell.vue";
-import { LayoutDashboard, Building2, Server } from "lucide-vue-next";
+import { LayoutDashboard, Building2, Server, Settings, Hash } from "lucide-vue-next";
 
 const nav: NavItem[] = [
   { to: "/admin/dashboard", labelKey: "nav.dashboard", icon: LayoutDashboard },
   { to: "/admin/tenants", labelKey: "nav.tenants", icon: Building2 },
+  { to: "/admin/dids", labelKey: "nav.dids", icon: Hash },
   { to: "/admin/workers", labelKey: "nav.workers", icon: Server },
+  { to: "/admin/settings", labelKey: "nav.settings", icon: Settings },
 ];
 </script>
 
