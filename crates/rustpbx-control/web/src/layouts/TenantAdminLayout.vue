@@ -9,6 +9,7 @@ import {
   PhoneCall,
   ScrollText,
   Hash,
+  ShieldCheck,
   Users,
   Globe,
 } from "lucide-vue-next";
@@ -24,6 +25,7 @@ const allNav: (NavItem & { perm?: string })[] = [
   { to: "/t/admin/routing", labelKey: "nav.routing", icon: Route, perm: "routing:read" },
   { to: "/t/admin/extensions", labelKey: "nav.extensions", icon: PhoneCall, perm: "extensions:read" },
   { to: "/t/admin/dids", labelKey: "nav.dids", icon: Hash, perm: "dids:read" },
+  { to: "/t/admin/acl", labelKey: "nav.acl", icon: ShieldCheck, perm: "acl:read" },
   { to: "/t/admin/call-records", labelKey: "nav.callRecords", icon: ScrollText, perm: "cdr:read" },
   { to: "/t/admin/users", labelKey: "nav.users", icon: Users, perm: "users:read" },
   { to: "/t/admin/domain", labelKey: "nav.domain", icon: Globe, perm: "domain:read" },

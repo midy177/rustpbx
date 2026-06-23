@@ -38,6 +38,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const data = text ? JSON.parse(text) : null;
 
   if (!res.ok) {
+    // An expired/invalid session on any authenticated call → notify the app so
+    // it can reset state and bounce to login. The login call handles its own
+    // 401 (bad credentials) inline, so it's excluded.
+    if (res.status === 401 && path !== "/auth/login") {
+      window.dispatchEvent(new Event("rustpbx:unauthorized"));
+    }
     const msg = (data && (data.error as string)) || res.statusText;
     throw new ApiError(res.status, msg);
   }
@@ -241,6 +247,22 @@ export interface TenantStats {
   recent_calls: number;
 }
 
+export interface AclRule {
+  id: number;
+  tenant_id: number | null;
+  action: string; // allow | deny
+  target: string; // CIDR or "all"
+  priority: number;
+  is_active: boolean;
+}
+
+export interface AclInput {
+  action: string;
+  target: string;
+  priority?: number;
+  is_active?: boolean;
+}
+
 export interface CallRecord {
   id: number;
   call_id: string;
@@ -266,6 +288,8 @@ export const ALL_PERMISSIONS = [
   "cdr:read",
   "dids:read",
   "dids:write",
+  "acl:read",
+  "acl:write",
   "users:read",
   "users:write",
   "domain:read",

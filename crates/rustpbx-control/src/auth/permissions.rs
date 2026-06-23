@@ -42,6 +42,8 @@ pub const EXTENSIONS_WRITE: &str = "extensions:write";
 pub const CDR_READ: &str = "cdr:read";
 pub const DIDS_READ: &str = "dids:read";
 pub const DIDS_WRITE: &str = "dids:write";
+pub const ACL_READ: &str = "acl:read";
+pub const ACL_WRITE: &str = "acl:write";
 pub const USERS_READ: &str = "users:read";
 pub const USERS_WRITE: &str = "users:write";
 pub const DOMAIN_READ: &str = "domain:read";
@@ -59,6 +61,8 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     CDR_READ,
     DIDS_READ,
     DIDS_WRITE,
+    ACL_READ,
+    ACL_WRITE,
     USERS_READ,
     USERS_WRITE,
     DOMAIN_READ,

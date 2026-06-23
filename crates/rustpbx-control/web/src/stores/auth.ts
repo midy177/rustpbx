@@ -62,17 +62,22 @@ export const useAuthStore = defineStore("auth", () => {
     if (resp.user.tenant_id) setActiveTenant(resp.user.tenant_id);
   }
 
+  /** Reset all auth state locally (no API call). */
+  function clearSession() {
+    token.value = null;
+    user.value = null;
+    setToken(null);
+    localStorage.removeItem(USER_KEY);
+    setActiveTenant(null);
+  }
+
   async function logout() {
     try {
       await api.post("/auth/logout");
     } catch {
       /* ignore */
     }
-    token.value = null;
-    user.value = null;
-    setToken(null);
-    localStorage.removeItem(USER_KEY);
-    setActiveTenant(null);
+    clearSession();
   }
 
   return {
@@ -89,5 +94,6 @@ export const useAuthStore = defineStore("auth", () => {
     homeRoute,
     login,
     logout,
+    clearSession,
   };
 });

@@ -34,6 +34,7 @@ const routes = [
       { path: "trunks", name: "tadmin-trunks", component: () => import("@/views/tadmin/Trunks.vue") },
       { path: "routing", name: "tadmin-routing", component: () => import("@/views/tadmin/Routing.vue") },
       { path: "extensions", name: "tadmin-extensions", component: () => import("@/views/tadmin/Extensions.vue") },
+      { path: "acl", name: "tadmin-acl", component: () => import("@/views/tadmin/Acl.vue") },
       { path: "call-records", name: "tadmin-cdr", component: () => import("@/views/tadmin/CallRecords.vue") },
       { path: "dids", name: "tadmin-dids", component: () => import("@/views/tadmin/Dids.vue") },
       { path: "users", name: "tadmin-users", component: () => import("@/views/tadmin/Users.vue") },

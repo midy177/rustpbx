@@ -18,7 +18,7 @@ use crate::did_service::{CreateDidRequest, DidService, UpdateDidRequest};
 use crate::raft::registry::RaftRegistry;
 use crate::settings::{KEY_BASE_DOMAIN, PlatformSettings};
 use crate::store::Store;
-use crate::store::crud::{ExtensionInput, RouteInput, TrunkInput};
+use crate::store::crud::{AclInput, ExtensionInput, RouteInput, TrunkInput};
 use crate::tenant_service::{
     CreateTenantRequest, TenantService, UpdateDomainRequest, UpdateTenantRequest,
 };
@@ -222,6 +222,8 @@ pub fn build_router(state: HttpState, web_dir: &str) -> Router {
         .route("/routes/{id}", post(update_route).delete(delete_route))
         .route("/extensions", get(list_extensions).post(create_extension))
         .route("/extensions/{id}", post(update_extension).delete(delete_extension))
+        .route("/acl", get(list_acl).post(create_acl))
+        .route("/acl/{id}", post(update_acl).delete(delete_acl))
         .route("/call-records", get(list_call_records))
         .route("/dids", get(list_dids).post(create_did))
         .route("/dids/{id}", post(update_did).delete(delete_did))
@@ -767,6 +769,52 @@ async fn delete_extension(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::EXTENSIONS_WRITE)?;
     let n = state.store.delete_extension(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+// ── PBX config: ACL rules ──────────────────────────────────────────────────────
+
+async fn list_acl(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::ACL_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let rows = state.store.list_acl_admin(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn create_acl(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(input): Json<AclInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ACL_WRITE)?;
+    let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    state.store.create_acl(&input, row_tenant).await.map_err(ApiError::bad)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_acl(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(input): Json<AclInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ACL_WRITE)?;
+    let n = state.store.update_acl(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    affected_or_404(n)
+}
+
+async fn delete_acl(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::ACL_WRITE)?;
+    let n = state.store.delete_acl(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
     affected_or_404(n)
 }
 

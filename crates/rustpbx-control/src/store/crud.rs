@@ -313,6 +313,72 @@ impl Store {
         self.delete_scoped("rustpbx_extensions", id, scope_tenant).await
     }
 
+    // ── ACL rules ───────────────────────────────────────────────────────────────
+
+    pub async fn list_acl_admin(&self, tenant_id: Option<i64>) -> Result<Vec<AclView>> {
+        let cols = "id, tenant_id, action, target, priority, is_active";
+        let (sql, vals) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_acl_rules \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY priority ASC, id ASC"
+                ),
+                vec![Value::BigInt(Some(tid))],
+            ),
+            None => (
+                format!("SELECT {cols} FROM rustpbx_acl_rules ORDER BY priority ASC, id ASC"),
+                vec![],
+            ),
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                vals,
+            ))
+            .await?;
+        rows.iter().map(row_to_acl_view).collect()
+    }
+
+    pub async fn create_acl(&self, a: &AclInput, row_tenant: Option<i64>) -> Result<()> {
+        let sql = "INSERT INTO rustpbx_acl_rules (tenant_id, action, target, priority, is_active) \
+                   VALUES ($1,$2,$3,$4,$5)";
+        self.exec(
+            sql,
+            vec![
+                Value::BigInt(row_tenant),
+                Value::String(Some(Box::new(a.action.clone()))),
+                Value::String(Some(Box::new(a.target.clone()))),
+                Value::Int(Some(a.priority)),
+                Value::Bool(Some(a.is_active)),
+            ],
+        )
+        .await
+    }
+
+    pub async fn update_acl(&self, id: i64, a: &AclInput, scope_tenant: Option<i64>) -> Result<u64> {
+        let mut sql = String::from(
+            "UPDATE rustpbx_acl_rules SET action=$1, target=$2, priority=$3, is_active=$4 WHERE id=$5",
+        );
+        let mut vals = vec![
+            Value::String(Some(Box::new(a.action.clone()))),
+            Value::String(Some(Box::new(a.target.clone()))),
+            Value::Int(Some(a.priority)),
+            Value::Bool(Some(a.is_active)),
+            Value::BigInt(Some(id)),
+        ];
+        if let Some(tid) = scope_tenant {
+            sql.push_str(" AND tenant_id=$6");
+            vals.push(Value::BigInt(Some(tid)));
+        }
+        self.exec_affected(&sql, vals).await
+    }
+
+    pub async fn delete_acl(&self, id: i64, scope_tenant: Option<i64>) -> Result<u64> {
+        self.delete_scoped("rustpbx_acl_rules", id, scope_tenant).await
+    }
+
     // ── Shared helpers ──────────────────────────────────────────────────────────
 
     async fn exec(&self, sql: &str, vals: Vec<Value>) -> Result<()> {
@@ -421,6 +487,39 @@ pub struct ExtensionView {
     pub call_forwarding_timeout: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AclInput {
+    /// `allow` or `deny`.
+    pub action: String,
+    /// CIDR or the literal `all`.
+    pub target: String,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AclView {
+    pub id: i64,
+    pub tenant_id: Option<i64>,
+    pub action: String,
+    pub target: String,
+    pub priority: i32,
+    pub is_active: bool,
+}
+
+fn row_to_acl_view(row: &sea_orm::QueryResult) -> Result<AclView> {
+    Ok(AclView {
+        id: row.try_get("", "id")?,
+        tenant_id: row.try_get("", "tenant_id").ok(),
+        action: row.try_get("", "action").unwrap_or_default(),
+        target: row.try_get("", "target").unwrap_or_default(),
+        priority: row.try_get("", "priority").unwrap_or(100),
+        is_active: row.try_get("", "is_active").unwrap_or(true),
+    })
+}
+
 fn row_to_extension_view(row: &sea_orm::QueryResult) -> Result<ExtensionView> {
     Ok(ExtensionView {
         id: row.try_get("", "id")?,
@@ -515,6 +614,28 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].target_trunks, vec!["t1".to_string()]);
         assert_eq!(s.delete_route(listed[0].id, Some(1)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn acl_crud_scoped_and_priority_ordered() {
+        let s = fresh_store().await;
+        s.create_acl(&AclInput { action: "deny".into(), target: "all".into(), priority: 200, is_active: true }, Some(1)).await.unwrap();
+        s.create_acl(&AclInput { action: "allow".into(), target: "10.0.0.0/8".into(), priority: 100, is_active: true }, Some(1)).await.unwrap();
+        // A global rule (tenant NULL) is visible to the tenant too.
+        s.create_acl(&AclInput { action: "deny".into(), target: "1.2.3.4/32".into(), priority: 50, is_active: true }, None).await.unwrap();
+
+        let rows = s.list_acl_admin(Some(1)).await.unwrap();
+        assert_eq!(rows.len(), 3, "tenant sees its rules + globals");
+        // Ordered by priority ascending.
+        assert_eq!(rows[0].priority, 50);
+        assert_eq!(rows[0].tenant_id, None, "global rule");
+        assert_eq!(rows[1].target, "10.0.0.0/8");
+
+        // A tenant-scoped mutate can't touch the global rule.
+        let global_id = rows[0].id;
+        assert_eq!(s.delete_acl(global_id, Some(1)).await.unwrap(), 0, "tenant can't delete global rule");
+        // Superadmin (scope None) can.
+        assert_eq!(s.delete_acl(global_id, None).await.unwrap(), 1);
     }
 
     #[tokio::test]
