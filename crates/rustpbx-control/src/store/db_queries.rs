@@ -2,6 +2,28 @@ use crate::{grpc::proto::control::TrunkConfigProto, store::Store};
 use anyhow::Result;
 use sea_orm::ConnectionTrait;
 
+/// Filters + paging for the admin-console CDR listing. All filters are optional
+/// and combine with AND; empty/blank strings are ignored.
+#[derive(Debug, Default, Clone)]
+pub struct CdrListOpts {
+    /// Restrict to a tenant (None → all tenants, superadmin scope).
+    pub tenant_id: Option<i64>,
+    /// Substring match against `from_number` OR `to_number`.
+    pub search: Option<String>,
+    /// Exact `status` match (e.g. "answered", "no_answer", "busy").
+    pub status: Option<String>,
+    /// Exact `direction` match ("inbound" / "outbound").
+    pub direction: Option<String>,
+    /// `started_at >= since`.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// `started_at <= until`.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Page size (clamped to 1..=500).
+    pub limit: u64,
+    /// Rows to skip.
+    pub offset: u64,
+}
+
 impl Store {
     /// Persist a CDR report from a Worker into rustpbx_call_records.
     pub async fn persist_cdr(
@@ -246,43 +268,100 @@ impl Store {
         rows.iter().map(row_to_route_view).collect()
     }
 
-    /// List recent CDRs for the admin console, newest first, optionally scoped
-    /// to a tenant. `limit` caps the result set.
-    pub async fn list_call_records(
+    /// Paged + filtered CDR listing for the admin console. Returns the page of
+    /// rows (newest first) plus the total matching count for pagination.
+    pub async fn list_call_records_paged(
         &self,
-        tenant_id: Option<i64>,
-        limit: u64,
-    ) -> Result<Vec<crate::store::CdrView>> {
-        use sea_orm::Statement;
+        opts: &CdrListOpts,
+    ) -> Result<(Vec<crate::store::CdrView>, u64)> {
+        use sea_orm::{Statement, Value};
 
+        // Build the shared WHERE clause + positional values once; reuse for the
+        // COUNT and the page query. Placeholders are $1.. (sea-orm rewrites them
+        // to the backend's style); LIMIT/OFFSET are u64 so they inline safely.
+        let mut conds: Vec<String> = Vec::new();
+        let mut vals: Vec<Value> = Vec::new();
+        if let Some(tid) = opts.tenant_id {
+            vals.push(Value::BigInt(Some(tid)));
+            conds.push(format!("tenant_id = ${}", vals.len()));
+        }
+        if let Some(s) = opts
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let like = format!("%{s}%");
+            vals.push(Value::String(Some(Box::new(like.clone()))));
+            let a = vals.len();
+            vals.push(Value::String(Some(Box::new(like))));
+            let b = vals.len();
+            conds.push(format!("(from_number LIKE ${a} OR to_number LIKE ${b})"));
+        }
+        if let Some(st) = opts
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            vals.push(Value::String(Some(Box::new(st.to_string()))));
+            conds.push(format!("status = ${}", vals.len()));
+        }
+        if let Some(d) = opts
+            .direction
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            vals.push(Value::String(Some(Box::new(d.to_string()))));
+            conds.push(format!("direction = ${}", vals.len()));
+        }
+        if let Some(since) = opts.since {
+            vals.push(Value::ChronoDateTimeUtc(Some(Box::new(since))));
+            conds.push(format!("started_at >= ${}", vals.len()));
+        }
+        if let Some(until) = opts.until {
+            vals.push(Value::ChronoDateTimeUtc(Some(Box::new(until))));
+            conds.push(format!("started_at <= ${}", vals.len()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let backend = self.db.get_database_backend();
+
+        // Total count (filters only, no LIMIT/OFFSET).
+        let count_sql = format!("SELECT COUNT(*) AS cnt FROM rustpbx_call_records {where_clause}");
+        let total: u64 = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                &count_sql,
+                vals.clone(),
+            ))
+            .await?
+            .and_then(|r| r.try_get::<i64>("", "cnt").ok())
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let limit = opts.limit.clamp(1, 500);
         let cols = "id, call_id, tenant_id, direction, status, from_number, to_number, \
             started_at, ended_at, duration_secs, recording_url";
-        let (sql, values) = match tenant_id {
-            Some(tid) => (
-                format!(
-                    "SELECT {cols} FROM rustpbx_call_records WHERE tenant_id = $1 \
-                     ORDER BY started_at DESC LIMIT {limit}"
-                ),
-                vec![sea_orm::Value::BigInt(Some(tid))],
-            ),
-            None => (
-                format!(
-                    "SELECT {cols} FROM rustpbx_call_records \
-                     ORDER BY started_at DESC LIMIT {limit}"
-                ),
-                vec![],
-            ),
-        };
-
+        let page_sql = format!(
+            "SELECT {cols} FROM rustpbx_call_records {where_clause} \
+             ORDER BY started_at DESC LIMIT {limit} OFFSET {}",
+            opts.offset
+        );
         let rows = self
             .db
-            .query_all(Statement::from_sql_and_values(
-                self.db.get_database_backend(),
-                &sql,
-                values,
-            ))
+            .query_all(Statement::from_sql_and_values(backend, &page_sql, vals))
             .await?;
-        rows.iter().map(row_to_cdr_view).collect()
+        let records: Vec<_> = rows
+            .iter()
+            .map(row_to_cdr_view)
+            .collect::<Result<_>>()?;
+        Ok((records, total))
     }
 
     /// Load active ACL rules as `"<action> <target>"` strings, optionally scoped
@@ -721,13 +800,63 @@ mod tests {
         insert_cdr(&store, "c-t2", Some(2)).await;
         insert_cdr(&store, "c-global", None).await;
 
-        let t1 = store.list_call_records(Some(1), 100).await.unwrap();
+        let opts = CdrListOpts { tenant_id: Some(1), limit: 100, ..Default::default() };
+        let (t1, t1_total) = store.list_call_records_paged(&opts).await.unwrap();
         assert_eq!(t1.len(), 1, "tenant 1 sees only its own CDR");
+        assert_eq!(t1_total, 1, "total reflects the tenant scope");
         assert_eq!(t1[0].call_id, "c-t1");
         assert_eq!(t1[0].duration_secs, 42);
 
-        let all = store.list_call_records(None, 100).await.unwrap();
-        assert_eq!(all.len(), 3, "no scope → all CDRs");
+        let all = CdrListOpts { limit: 100, ..Default::default() };
+        let (all_rows, all_total) = store.list_call_records_paged(&all).await.unwrap();
+        assert_eq!(all_rows.len(), 3, "no scope → all CDRs");
+        assert_eq!(all_total, 3);
+    }
+
+    #[tokio::test]
+    async fn list_call_records_filters_and_pages() {
+        let store = fresh_store().await;
+        // All seeded CDRs share from=1001 to=1002 status=completed direction=inbound.
+        for i in 0..5 {
+            insert_cdr(&store, &format!("c-{i}"), Some(1)).await;
+        }
+
+        // Number search hits both legs (from_number/to_number).
+        let by_num = CdrListOpts {
+            tenant_id: Some(1),
+            search: Some("100".into()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert_eq!(store.list_call_records_paged(&by_num).await.unwrap().1, 5);
+
+        // A non-matching search yields nothing.
+        let miss = CdrListOpts {
+            tenant_id: Some(1),
+            search: Some("9999".into()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert_eq!(store.list_call_records_paged(&miss).await.unwrap().1, 0);
+
+        // Status filter matches; a wrong status excludes all.
+        let busy = CdrListOpts {
+            tenant_id: Some(1),
+            status: Some("busy".into()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert_eq!(store.list_call_records_paged(&busy).await.unwrap().1, 0);
+
+        // Pagination: page size 2 returns 2 rows but the full total (5).
+        let page = CdrListOpts { tenant_id: Some(1), limit: 2, offset: 0, ..Default::default() };
+        let (rows, total) = store.list_call_records_paged(&page).await.unwrap();
+        assert_eq!(rows.len(), 2, "page is limited");
+        assert_eq!(total, 5, "total counts all matches, not just the page");
+
+        // Last page (offset 4) has the single remaining row.
+        let last = CdrListOpts { tenant_id: Some(1), limit: 2, offset: 4, ..Default::default() };
+        assert_eq!(store.list_call_records_paged(&last).await.unwrap().0.len(), 1);
     }
 
     #[tokio::test]

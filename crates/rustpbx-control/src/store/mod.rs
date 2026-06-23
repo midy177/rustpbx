@@ -1,6 +1,8 @@
 pub mod crud;
 pub mod db_queries;
 
+pub use db_queries::CdrListOpts;
+
 use sea_orm::DatabaseConnection;
 
 /// Thin DB access layer for the Control Plane.

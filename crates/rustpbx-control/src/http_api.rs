@@ -625,12 +625,14 @@ async fn tenant_stats(
     let trunks = state.store.list_trunks(Some(tid)).await.map_err(ApiError::internal)?.len();
     let extensions = state.store.list_extensions(Some(tid)).await.map_err(ApiError::internal)?.len();
     let dids = DidService::new(&state.db).count_for_tenant(tid).await.map_err(ApiError::internal)?;
+    // Accurate total CDR count for the tenant (no 1000-row cap).
+    let opts = crate::store::CdrListOpts { tenant_id: Some(tid), limit: 1, ..Default::default() };
     let recent_calls = state
         .store
-        .list_call_records(Some(tid), 1000)
+        .list_call_records_paged(&opts)
         .await
         .map_err(ApiError::internal)?
-        .len();
+        .1 as usize;
     Ok(Json(TenantStats { trunks, extensions, dids, recent_calls }))
 }
 
@@ -1028,6 +1030,30 @@ async fn delete_acl(
 struct CdrQuery {
     tenant_id: Option<i64>,
     limit: Option<u64>,
+    offset: Option<u64>,
+    /// Substring match on caller or callee number.
+    search: Option<String>,
+    status: Option<String>,
+    direction: Option<String>,
+    /// RFC3339 timestamps (`started_at` >= since / <= until).
+    since: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CdrPage {
+    records: Vec<crate::store::CdrView>,
+    total: u64,
+    limit: u64,
+    offset: u64,
+}
+
+fn parse_rfc3339(s: &Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 async fn list_call_records(
@@ -1037,13 +1063,24 @@ async fn list_call_records(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::CDR_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let limit = q.limit.unwrap_or(200).min(1000);
-    let rows = state
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0);
+    let opts = crate::store::CdrListOpts {
+        tenant_id: scope,
+        search: q.search.clone(),
+        status: q.status.clone(),
+        direction: q.direction.clone(),
+        since: parse_rfc3339(&q.since),
+        until: parse_rfc3339(&q.until),
+        limit,
+        offset,
+    };
+    let (records, total) = state
         .store
-        .list_call_records(scope, limit)
+        .list_call_records_paged(&opts)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(rows).into_response())
+    Ok(Json(CdrPage { records, total, limit, offset }).into_response())
 }
 
 // ── DIDs (phone number inventory) ──────────────────────────────────────────────

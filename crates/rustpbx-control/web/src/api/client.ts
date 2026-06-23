@@ -278,6 +278,14 @@ export interface CallRecord {
   recording_url: string | null;
 }
 
+/** Paged + filtered CDR listing response (`GET /call-records`). */
+export interface CdrPage {
+  records: CallRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",
