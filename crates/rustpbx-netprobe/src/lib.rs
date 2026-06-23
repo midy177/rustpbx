@@ -331,23 +331,25 @@ async fn fallback_mapping(
     if !behind_nat {
         return NatInfo::from(Some(mapped1), NAT_OPEN);
     }
-    // Pick the first server that isn't the primary for an independent mapping.
-    let other = stun_servers
-        .iter()
-        .enumerate()
-        .find(|(i, _)| *i != primary_idx)
-        .map(|(_, s)| s);
-    let mapped2 = match other {
-        Some(s) => match resolve(s).await {
-            Some(dst) => stun_test(sock, dst, false, false, timeout).await.map(|r| r.mapped),
-            None => None,
-        },
-        None => None,
-    };
+    // Compare the mapping against the first *different* server that answers.
+    // Trying every non-primary entry (not just the first) means one dead
+    // server can't strand us at "undetermined" when a later one is reachable —
+    // important now that the default list leads with a sometimes-down server.
+    let mut mapped2 = None;
+    for (i, s) in stun_servers.iter().enumerate() {
+        if i == primary_idx {
+            continue;
+        }
+        let Some(dst) = resolve(s).await else { continue };
+        if let Some(r) = stun_test(sock, dst, false, false, timeout).await {
+            mapped2 = Some(r.mapped);
+            break;
+        }
+    }
     let nat = match mapped2 {
         Some(m2) if m2 == mapped1 => NAT_CONE, // endpoint-independent mapping
         Some(_) => NAT_SYMMETRIC,              // endpoint-dependent
-        None => NAT_NAT,                       // only one usable server → undetermined
+        None => NAT_NAT,                       // no second server answered → undetermined
     };
     NatInfo::from(Some(mapped1), nat)
 }
@@ -469,5 +471,25 @@ mod tests {
         let info = probe(&[silent_addr, live], Duration::from_millis(300)).await;
         assert_ne!(info.nat_type, NAT_BLOCKED, "must not report blocked when a later server is reachable");
         assert_eq!(info.public_ip.as_deref(), Some("203.0.113.7"), "fell through and got the mapping");
+    }
+
+    /// The mapping-comparison fallback must try EVERY non-primary server, not
+    /// just the first — so a dead entry earlier in the list can't strand us at
+    /// "undetermined" when a later entry is reachable.
+    #[tokio::test]
+    async fn fallback_skips_dead_entry_and_uses_a_later_one() {
+        // servers[0]: dead (the sometimes-down RFC 5780 server), [1]: live
+        // primary, [2]: live second opinion. Same mapping → cone.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead = silent.local_addr().unwrap().to_string();
+        let m: SocketAddr = "203.0.113.5:55000".parse().unwrap();
+        let primary = mock_stun(m, None).await;
+        let third = mock_stun(m, None).await;
+        let info = probe(&[dead, primary, third], Duration::from_millis(300)).await;
+        assert_eq!(
+            info.nat_type, NAT_CONE,
+            "must reach the third (live) server for a second opinion, not give up at 'undetermined'"
+        );
+        assert_eq!(info.public_ip.as_deref(), Some("203.0.113.5"));
     }
 }

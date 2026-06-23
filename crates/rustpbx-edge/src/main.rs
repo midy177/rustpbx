@@ -293,10 +293,10 @@ async fn main() -> Result<()> {
 /// Build the EdgeInfo reported to the Control Plane (for the admin console).
 fn build_edge_info(cfg: &EdgeConfig, nat_type: &str) -> crate::proto::control::EdgeInfo {
     let host = cfg.public_ip.clone().unwrap_or_else(|| cfg.sip_addr.clone());
-    let mut transports = vec!["udp".to_string()];
-    if cfg.tcp_port > 0 {
-        transports.push("tcp".to_string());
-    }
+    // The Edge always listens on TCP too (build_proxy_config sets tcp_port =
+    // tcp_port>0 ? tcp_port : udp_port), so it's always advertised. TLS is
+    // optional (only when tls_port > 0).
+    let mut transports = vec!["udp".to_string(), "tcp".to_string()];
     if cfg.tls_port > 0 {
         transports.push("tls".to_string());
     }
