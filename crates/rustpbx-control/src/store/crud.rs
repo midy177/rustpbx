@@ -65,6 +65,21 @@ fn default_true() -> bool {
 }
 
 impl Store {
+    /// Count of trunks owned by a tenant (exactly, excluding global rows) — for
+    /// quota enforcement.
+    pub async fn count_trunks_for_tenant(&self, tenant_id: i64) -> Result<u64> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "SELECT COUNT(*) AS cnt FROM rustpbx_sip_trunks WHERE tenant_id = $1",
+                vec![Value::BigInt(Some(tenant_id))],
+            ))
+            .await?;
+        let cnt: i64 = row.and_then(|r| r.try_get("", "cnt").ok()).unwrap_or(0);
+        Ok(cnt as u64)
+    }
+
     pub async fn create_trunk(&self, t: &TrunkInput, row_tenant: Option<i64>) -> Result<()> {
         let sql = "INSERT INTO rustpbx_sip_trunks \
             (name, display_name, carrier, status, direction, sip_server, sip_transport, \

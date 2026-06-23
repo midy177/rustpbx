@@ -183,6 +183,49 @@ fn required_tenant(u: &UserInfo, q: Option<i64>) -> ApiResult<i64> {
     Ok(tid)
 }
 
+/// Reject creating a trunk once the tenant is at its `max_trunks` quota.
+async fn enforce_trunk_quota(state: &HttpState, tenant_id: i64) -> ApiResult<()> {
+    let tenant = TenantService::new(&state.db, "")
+        .get_model(tenant_id)
+        .await
+        .map_err(ApiError::bad)?;
+    if let Some(max) = tenant.max_trunks {
+        let count = state
+            .store
+            .count_trunks_for_tenant(tenant_id)
+            .await
+            .map_err(ApiError::internal)?;
+        if count >= max as u64 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("trunk quota reached for this tenant ({count}/{max})"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject assigning a DID once the tenant is at its `max_dids` quota.
+async fn enforce_did_quota(state: &HttpState, tenant_id: i64) -> ApiResult<()> {
+    let tenant = TenantService::new(&state.db, "")
+        .get_model(tenant_id)
+        .await
+        .map_err(ApiError::bad)?;
+    if let Some(max) = tenant.max_dids {
+        let count = DidService::new(&state.db)
+            .count_for_tenant(tenant_id)
+            .await
+            .map_err(ApiError::internal)?;
+        if count >= max as u64 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("DID quota reached for this tenant ({count}/{max})"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 0 rows affected → 404.
 fn affected_or_404(n: u64) -> ApiResult<StatusCode> {
     if n == 0 {
@@ -718,6 +761,9 @@ async fn create_trunk(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::TRUNKS_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    if let Some(tid) = row_tenant {
+        enforce_trunk_quota(&state, tid).await?;
+    }
     state.store.create_trunk(&input, row_tenant).await.map_err(ApiError::bad)?;
     Ok(StatusCode::CREATED)
 }
@@ -930,6 +976,9 @@ async fn create_did(
     Json(req): Json<CreateDidRequest>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
+    if let Some(tid) = req.tenant_id {
+        enforce_did_quota(&state, tid).await?;
+    }
     let did = DidService::new(&state.db).create(&req).await.map_err(ApiError::bad)?;
     Ok((StatusCode::CREATED, Json(did)).into_response())
 }
