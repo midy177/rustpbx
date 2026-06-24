@@ -44,6 +44,11 @@ impl MigrationTrait for Migration {
                     .col(string_len_null(Alias::new("call_forwarding_mode"), 32))
                     .col(string_len_null(Alias::new("call_forwarding_destination"), 160))
                     .col(integer_null(Alias::new("call_forwarding_timeout")))
+                    .col(
+                        ColumnDef::new(Alias::new("registered_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
                     .col(text_null(Alias::new("notes")))
                     .col(
                         ColumnDef::new(Alias::new("created_at"))
