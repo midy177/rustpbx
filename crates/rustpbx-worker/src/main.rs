@@ -202,12 +202,22 @@ async fn main() -> Result<()> {
     };
 
     // ── ProxyDataContext + RoutingState ───────────────────────────────────────
-    let proxy_config = Arc::new(build_proxy_config(&cfg));
+    let mut proxy_config = build_proxy_config(&cfg);
+    // Pull call-queue configs from the control plane (the worker executes
+    // queues; the Edge only routes to them by name). Inject via ProxyConfig
+    // .queues + reload_queues, so resolve_queue_config finds them at runtime.
+    let queues = control_client::fetch_queues(&cfg.control_plane_addr, cp_tls.as_ref()).await;
+    if !queues.is_empty() {
+        info!(count = queues.len(), "loaded call queues from control plane");
+        proxy_config.queues = queues;
+    }
+    let proxy_config = Arc::new(proxy_config);
     let data_context = Arc::new(
         ProxyDataContext::new(proxy_config.clone(), None)
             .await
             .map_err(|e| anyhow::anyhow!("failed to init data context: {e}"))?,
     );
+    // data_context already ran reload_queues on the injected queues above.
     let routing_state = Arc::new(RoutingState::new());
 
     // Call reservations bridge AllocateCall (gRPC) and the INVITE arrival so a

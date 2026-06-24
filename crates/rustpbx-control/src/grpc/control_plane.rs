@@ -106,6 +106,24 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(AclRuleList { rules, version: version_now() }))
     }
 
+    async fn get_queues(
+        &self,
+        request: Request<crate::grpc::proto::control::GetQueuesRequest>,
+    ) -> Result<Response<crate::grpc::proto::control::QueueConfigList>, Status> {
+        let req = request.into_inner();
+        info!(tenant_id = ?req.tenant_id, "get_queues");
+        let pairs = self
+            .store
+            .load_queues(req.tenant_id)
+            .await
+            .map_err(|e| Status::internal(format!("load queues: {e}")))?;
+        let queues = pairs
+            .into_iter()
+            .map(|(name, spec_json)| crate::grpc::proto::control::QueueConfig { name, spec_json })
+            .collect();
+        Ok(Response::new(crate::grpc::proto::control::QueueConfigList { queues }))
+    }
+
     // ── Config push (server streaming) ────────────────────────────────────────
 
     type WatchConfigChangesStream = BoxStream<ConfigChangeEvent>;

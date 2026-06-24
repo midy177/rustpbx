@@ -7,6 +7,7 @@ service ControlPlane {
   rpc GetTrunkConfigs(GetTrunkConfigsRequest) returns (TrunkConfigList);
   rpc GetRouteRules(GetRouteRulesRequest)     returns (RouteRuleList);
   rpc GetAclRules(GetAclRulesRequest)         returns (AclRuleList);
+  rpc GetQueues(GetQueuesRequest)             returns (QueueConfigList);
 
   // ── Config push (server-streaming) ───────────────────────────────────────
   rpc WatchConfigChanges(WatchRequest) returns (stream ConfigChangeEvent);
@@ -55,6 +56,21 @@ message ProposeWriteResponse {
   // Carry the acquire-slot result back through the leader-forwarding path.
   bool granted = 3;
   uint32 count = 4;
+}
+
+// ─── Call queues ──────────────────────────────────────────────────────────────
+
+message GetQueuesRequest {
+  optional int64 tenant_id = 1;
+}
+// One queue's config. `spec_json` is a JSON-serialized RouteQueueConfig; the
+// control plane stores/forwards it opaquely, the worker deserializes it.
+message QueueConfig {
+  string name      = 1;
+  string spec_json = 2;
+}
+message QueueConfigList {
+  repeated QueueConfig queues = 1;
 }
 
 message AcquireSlotRequest {

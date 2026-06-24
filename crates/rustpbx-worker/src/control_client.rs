@@ -207,6 +207,40 @@ pub async fn fetch_platform_stun(
     }
 }
 
+/// Fetch the active call queues from the control plane and deserialize each
+/// `spec_json` into a `RouteQueueConfig`. Returns an empty map on any error —
+/// the worker then simply has no queues until the next pull. Worker serves all
+/// tenants, so this loads every active queue.
+pub async fn fetch_queues(
+    control_plane_addr: &str,
+    tls: Option<&rustpbx_proto::tls::ClientTls>,
+) -> std::collections::HashMap<String, rustpbx::proxy::routing::RouteQueueConfig> {
+    use crate::proto::control::{GetQueuesRequest, control_plane_client::ControlPlaneClient};
+    use rustpbx::proxy::routing::RouteQueueConfig;
+    let Ok(ep) = rustpbx_proto::tls::endpoint(control_plane_addr, tls) else {
+        return Default::default();
+    };
+    let Ok(channel) = ep.connect().await else {
+        return Default::default();
+    };
+    let Ok(resp) = ControlPlaneClient::new(channel)
+        .get_queues(GetQueuesRequest { tenant_id: None })
+        .await
+    else {
+        return Default::default();
+    };
+    let mut map = std::collections::HashMap::new();
+    for q in resp.into_inner().queues {
+        match serde_json::from_str::<RouteQueueConfig>(&q.spec_json) {
+            Ok(cfg) => {
+                map.insert(q.name, cfg);
+            }
+            Err(e) => tracing::warn!(name = %q.name, error = %e, "skipped queue: invalid spec_json"),
+        }
+    }
+    map
+}
+
 fn cpu_usage_approx() -> f32 {
     use sysinfo::System;
     use std::sync::Mutex;
