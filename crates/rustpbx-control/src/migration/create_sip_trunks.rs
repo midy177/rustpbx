@@ -52,6 +52,20 @@ impl MigrationTrait for Migration {
                     .col(json_null(Alias::new("register_extra_headers")))
                     .col(boolean(Alias::new("rewrite_hostport")).default(true))
                     .col(json_null(Alias::new("metadata")))
+                    // Columns the monolith's sip_trunk entity expects (reload_trunks
+                    // export queries them); kept nullable — the control CRUD doesn't
+                    // edit them, they default NULL.
+                    .col(string_len_null(Alias::new("description"), 255))
+                    .col(string_len_null(Alias::new("default_route_label"), 160))
+                    .col(ColumnDef::new(Alias::new("utilisation_percent")).double().null())
+                    .col(ColumnDef::new(Alias::new("warning_threshold_percent")).double().null())
+                    .col(json_null(Alias::new("billing_snapshot")))
+                    .col(json_null(Alias::new("analytics")))
+                    .col(
+                        ColumnDef::new(Alias::new("last_health_check_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
                     .col(
                         ColumnDef::new(Alias::new("created_at"))
                             .timestamp_with_time_zone()

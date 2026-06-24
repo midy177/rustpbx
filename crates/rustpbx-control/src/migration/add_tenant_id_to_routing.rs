@@ -1,13 +1,13 @@
 use sea_orm_migration::prelude::*;
 
-/// Adds tenant_id column to rustpbx_routing.
+/// Adds tenant_id column to rustpbx_routes.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        const TABLE: &str = "rustpbx_routing";
+        const TABLE: &str = "rustpbx_routes";
 
         // The base table is created by the main `rustpbx` binary; if this DB
         // hasn't been provisioned yet (control-only / fresh SQLite), skip the
@@ -25,7 +25,7 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(Alias::new("rustpbx_routing"))
+                        .table(Alias::new("rustpbx_routes"))
                         .add_column(
                             ColumnDef::new(Alias::new("tenant_id"))
                                 .big_integer()
@@ -39,7 +39,7 @@ impl MigrationTrait for Migration {
                 .create_index(
                     Index::create()
                         .if_not_exists()
-                        .table(Alias::new("rustpbx_routing"))
+                        .table(Alias::new("rustpbx_routes"))
                         .name("idx_routing_tenant_id")
                         .col(Alias::new("tenant_id"))
                         .to_owned(),

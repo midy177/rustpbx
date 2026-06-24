@@ -165,7 +165,7 @@ impl Store {
     // ── Routing ────────────────────────────────────────────────────────────────
 
     pub async fn create_route(&self, r: &RouteInput, row_tenant: Option<i64>) -> Result<()> {
-        let sql = "INSERT INTO rustpbx_routing \
+        let sql = "INSERT INTO rustpbx_routes \
             (name, description, direction, priority, is_active, selection_strategy, hash_key, \
              source_pattern, destination_pattern, target_trunks, tenant_id) \
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)";
@@ -195,7 +195,7 @@ impl Store {
         scope_tenant: Option<i64>,
     ) -> Result<u64> {
         let mut sql = String::from(
-            "UPDATE rustpbx_routing SET \
+            "UPDATE rustpbx_routes SET \
              name=$1, description=$2, direction=$3, priority=$4, is_active=$5, \
              selection_strategy=$6, hash_key=$7, source_pattern=$8, destination_pattern=$9, \
              target_trunks=$10, updated_at=CURRENT_TIMESTAMP WHERE id=$11",
@@ -221,7 +221,7 @@ impl Store {
     }
 
     pub async fn delete_route(&self, id: i64, scope_tenant: Option<i64>) -> Result<u64> {
-        self.delete_scoped("rustpbx_routing", id, scope_tenant).await
+        self.delete_scoped("rustpbx_routes", id, scope_tenant).await
     }
 
     // ── Extensions ──────────────────────────────────────────────────────────────

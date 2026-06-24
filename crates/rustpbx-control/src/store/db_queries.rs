@@ -155,7 +155,7 @@ impl Store {
                  source_pattern, destination_pattern, header_filters, \
                  rewrite_rules, target_trunks, selection_strategy, hash_key, \
                  source_trunk_id, metadata \
-                 FROM rustpbx_routing \
+                 FROM rustpbx_routes \
                  WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
                  AND (tenant_id IS NULL OR tenant_id NOT IN \
                  (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
@@ -168,7 +168,7 @@ impl Store {
                  source_pattern, destination_pattern, header_filters, \
                  rewrite_rules, target_trunks, selection_strategy, hash_key, \
                  source_trunk_id, metadata \
-                 FROM rustpbx_routing \
+                 FROM rustpbx_routes \
                  WHERE is_active = TRUE \
                  AND (tenant_id IS NULL OR tenant_id NOT IN \
                  (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
@@ -246,13 +246,13 @@ impl Store {
         let (sql, values) = match tenant_id {
             Some(tid) => (
                 format!(
-                    "SELECT {cols} FROM rustpbx_routing \
+                    "SELECT {cols} FROM rustpbx_routes \
                      WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY priority ASC"
                 ),
                 vec![sea_orm::Value::BigInt(Some(tid))],
             ),
             None => (
-                format!("SELECT {cols} FROM rustpbx_routing ORDER BY priority ASC"),
+                format!("SELECT {cols} FROM rustpbx_routes ORDER BY priority ASC"),
                 vec![],
             ),
         };

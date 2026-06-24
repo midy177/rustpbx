@@ -230,11 +230,34 @@ async fn main() -> Result<()> {
         info!(count = n, dir = %cfg.ivr_dir, "materialized IVR flows");
     }
     let proxy_config = Arc::new(proxy_config);
+    // Connect to the shared DB (control plane's database_url) so the monolith's
+    // reload logic can load trunks/routes and the registrar can authenticate
+    // extension registrations. Without this the worker can't accept calls
+    // (no trunk/route/extension config). Optional: a failed/empty connection
+    // still runs, just without DB-backed config.
+    let db = if !cfg.database_url.trim().is_empty() {
+        match rustpbx::models::connect_db(&cfg.database_url).await {
+            Ok(d) => {
+                info!("connected to shared DB for trunk/route/extension loading");
+                Some(d)
+            }
+            Err(e) => {
+                warn!(error = %e, "DB connect failed; running without DB-backed config (no trunks/routes/extensions)");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let data_context = Arc::new(
-        ProxyDataContext::new(proxy_config.clone(), None)
+        ProxyDataContext::new(proxy_config.clone(), db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to init data context: {e}"))?,
     );
+    // The DB connection lets the monolith's registrar authenticate extension
+    // registrations — the worker's core need for accepting internal calls.
+    // Trunk/route config lives at the Edge (it does routing); the worker
+    // executes calls, so it deliberately doesn't reload trunks/routes from DB.
     // data_context already ran reload_queues on the injected queues above.
     let routing_state = Arc::new(RoutingState::new());
 

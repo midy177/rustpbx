@@ -2,7 +2,7 @@ use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_query::Expr;
 use sea_orm_migration::schema::{boolean, integer, json_null, string_len, string_len_null};
 
-/// Create the `rustpbx_routing` base table.
+/// Create the `rustpbx_routes` base table.
 ///
 /// Self-contained copy of the main binary's schema (see `create_sip_trunks`
 /// for rationale). Idempotent; `tenant_id` is added later by
@@ -10,7 +10,7 @@ use sea_orm_migration::schema::{boolean, integer, json_null, string_len, string_
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-const TABLE: &str = "rustpbx_routing";
+const TABLE: &str = "rustpbx_routes";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
