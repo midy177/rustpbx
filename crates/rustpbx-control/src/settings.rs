@@ -7,6 +7,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
 
 pub const KEY_BASE_DOMAIN: &str = "base_domain";
 pub const KEY_STUN_SERVERS: &str = "stun_servers";
+pub const KEY_RECORDING_POLICY: &str = "recording_policy";
 
 pub struct PlatformSettings<'a> {
     db: &'a DatabaseConnection,
@@ -89,6 +90,21 @@ impl<'a> PlatformSettings<'a> {
     pub async fn set_stun_servers(&self, servers: &[String]) -> Result<()> {
         let json = serde_json::to_string(servers)?;
         self.set(KEY_STUN_SERVERS, &json).await
+    }
+
+    /// Global call-recording policy (a JSON-serialized `RecordingPolicy`),
+    /// forwarded verbatim to workers. Empty/blank → None (no recording).
+    pub async fn recording_policy_json(&self) -> Option<String> {
+        self.get(KEY_RECORDING_POLICY)
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Persist the recording policy JSON.
+    pub async fn set_recording_policy_json(&self, json: &str) -> Result<()> {
+        self.set(KEY_RECORDING_POLICY, json).await
     }
 
     /// Seed `base_domain` from the config file on startup *only if* it has never

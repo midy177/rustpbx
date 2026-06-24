@@ -211,6 +211,15 @@ async fn main() -> Result<()> {
         info!(count = queues.len(), "loaded call queues from control plane");
         proxy_config.queues = queues;
     }
+    // Global recording policy from the control plane → ProxyConfig.recording.
+    // The monolith's apply_recording_policy uses this as the per-call fallback,
+    // so workers record per the superadmin's platform-wide policy.
+    if let Some(rp) =
+        control_client::fetch_platform_recording(&cfg.control_plane_addr, cp_tls.as_ref()).await
+    {
+        info!(rtype = ?rp.recording_type, "global recording policy enabled");
+        proxy_config.recording = Some(rp);
+    }
     let proxy_config = Arc::new(proxy_config);
     let data_context = Arc::new(
         ProxyDataContext::new(proxy_config.clone(), None)

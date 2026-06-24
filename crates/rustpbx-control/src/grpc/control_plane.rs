@@ -346,8 +346,12 @@ impl ControlPlane for ControlPlaneService {
         let stun_servers = crate::settings::PlatformSettings::new(&self.store.db)
             .stun_servers()
             .await;
+        let recording_policy_json = crate::settings::PlatformSettings::new(&self.store.db)
+            .recording_policy_json()
+            .await;
         Ok(Response::new(crate::grpc::proto::control::PlatformConfig {
             stun_servers,
+            recording_policy_json,
         }))
     }
 

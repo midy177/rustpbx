@@ -289,6 +289,10 @@ message PlatformConfig {
   // STUN servers (host:port) for node NAT detection. Empty → node uses its
   // own local default.
   repeated string stun_servers = 1;
+  // Global call-recording policy (JSON-serialized RecordingPolicy). Empty →
+  // no recording. Workers inject it into ProxyConfig.recording so the monolith's
+  // apply_recording_policy evaluates it (direction / allow-deny filtering).
+  optional string recording_policy_json = 2;
 }
 
 // ─── Edge lifecycle ────────────────────────────────────────────────────────────

@@ -207,6 +207,40 @@ pub async fn fetch_platform_stun(
     }
 }
 
+/// Fetch the global call-recording policy from the control plane and
+/// deserialize it into a `RecordingPolicy`. Returns None on any error or when
+/// recording is disabled — the worker then has no global recording policy.
+pub async fn fetch_platform_recording(
+    control_plane_addr: &str,
+    tls: Option<&rustpbx_proto::tls::ClientTls>,
+) -> Option<rustpbx::config::RecordingPolicy> {
+    use crate::proto::control::{PlatformConfigRequest, control_plane_client::ControlPlaneClient};
+    let Ok(ep) = rustpbx_proto::tls::endpoint(control_plane_addr, tls) else {
+        return None;
+    };
+    let Ok(channel) = ep.connect().await else {
+        return None;
+    };
+    let json = ControlPlaneClient::new(channel)
+        .get_platform_config(PlatformConfigRequest {})
+        .await
+        .ok()?
+        .into_inner()
+        .recording_policy_json?;
+    let json = json.trim();
+    if json.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<rustpbx::config::RecordingPolicy>(json) {
+        Ok(p) if p.enabled => Some(p),
+        Ok(_) => None, // configured but disabled
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid recording_policy_json from control plane");
+            None
+        }
+    }
+}
+
 /// Fetch the active call queues from the control plane and deserialize each
 /// `spec_json` into a `RouteQueueConfig`. Returns an empty map on any error —
 /// the worker then simply has no queues until the next pull. Worker serves all

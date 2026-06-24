@@ -591,6 +591,10 @@ struct PlatformSettingsBody {
     base_domain: String,
     #[serde(default)]
     stun_servers: Vec<String>,
+    /// Global call-recording policy (RecordingPolicy JSON, opaque to the
+    /// control plane). None / empty object → disabled.
+    #[serde(default)]
+    recording_policy: Option<serde_json::Value>,
 }
 
 async fn get_platform_settings(
@@ -599,9 +603,14 @@ async fn get_platform_settings(
 ) -> ApiResult<Json<PlatformSettingsBody>> {
     require_superadmin(&user)?;
     let s = PlatformSettings::new(&state.db);
+    let recording_policy = s
+        .recording_policy_json()
+        .await
+        .and_then(|j| serde_json::from_str(&j).ok());
     Ok(Json(PlatformSettingsBody {
         base_domain: s.base_domain().await,
         stun_servers: s.stun_servers().await,
+        recording_policy,
     }))
 }
 
@@ -622,9 +631,26 @@ async fn put_platform_settings(
         .filter(|x| !x.is_empty())
         .collect();
     s.set_stun_servers(&stun).await.map_err(ApiError::internal)?;
+    // Recording policy: store as JSON string (empty/disabled object → clears).
+    let rp_json = match &body.recording_policy {
+        Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
+        _ => String::new(),
+    };
+    s.set_recording_policy_json(&rp_json)
+        .await
+        .map_err(ApiError::internal)?;
+    state.audit(
+        &user,
+        AuditEntry::action("update", "platform", None, "updated platform settings (recording/stun/domain)"),
+    );
+    let recording_policy = s
+        .recording_policy_json()
+        .await
+        .and_then(|j| serde_json::from_str(&j).ok());
     Ok(Json(PlatformSettingsBody {
         base_domain: s.base_domain().await,
         stun_servers: s.stun_servers().await,
+        recording_policy,
     }))
 }
 
