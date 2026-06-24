@@ -50,6 +50,12 @@ pub struct WorkerConfig {
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
 
+    /// How often (seconds) to re-pull call queues + the recording policy from
+    /// the control plane and hot-reload them, so config changes take effect
+    /// without restarting the worker. 0 → pull once at startup only.
+    #[serde(default = "default_config_poll_secs")]
+    pub config_poll_secs: u64,
+
     /// Prometheus metrics listen address (empty = disabled)
     #[serde(default)]
     pub metrics_addr: Option<String>,
@@ -169,6 +175,7 @@ impl Default for WorkerConfig {
             database_url: default_database_url(),
             recording_path: default_recording_path(),
             heartbeat_secs: default_heartbeat_secs(),
+            config_poll_secs: default_config_poll_secs(),
             metrics_addr: None,
             trusted_edges: Vec::new(),
             stun_servers: default_stun_servers(),
@@ -231,6 +238,10 @@ fn default_stun_servers() -> Vec<String> {
 
 fn default_heartbeat_secs() -> u64 {
     10
+}
+
+fn default_config_poll_secs() -> u64 {
+    30
 }
 fn default_log() -> String {
     "info".to_string()

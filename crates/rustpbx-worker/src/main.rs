@@ -229,6 +229,39 @@ async fn main() -> Result<()> {
     // data_context already ran reload_queues on the injected queues above.
     let routing_state = Arc::new(RoutingState::new());
 
+    // ── Hot-repoll: queues + recording policy ──────────────────────────────────
+    // Re-pull on an interval so control-plane changes (new queue, edited policy)
+    // take effect without restarting the worker. reload_queues(config_override)
+    // swaps ProxyConfig.recording too, so both update atomically.
+    if cfg.config_poll_secs > 0 {
+        let dc = Arc::clone(&data_context);
+        let base_cfg = Arc::clone(&proxy_config);
+        let cp_addr = cfg.control_plane_addr.clone();
+        let cp_tls2 = cp_tls.clone();
+        let poll = cfg.config_poll_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(poll));
+            tick.tick().await; // discard immediate first tick
+            loop {
+                tick.tick().await;
+                let queues =
+                    control_client::fetch_queues(&cp_addr, cp_tls2.as_ref()).await;
+                let recording =
+                    control_client::fetch_platform_recording(&cp_addr, cp_tls2.as_ref()).await;
+                let mut new_cfg = (*base_cfg).clone();
+                new_cfg.queues = queues;
+                new_cfg.recording = recording;
+                match dc.reload_queues(false, Some(Arc::new(new_cfg))).await {
+                    Ok(m) => info!(
+                        queues = m.config_count,
+                        "hot-reloaded queues + recording from control plane"
+                    ),
+                    Err(e) => warn!(error = %e, "hot-reload of queues failed"),
+                }
+            }
+        });
+    }
+
     // Call reservations bridge AllocateCall (gRPC) and the INVITE arrival so a
     // reserved call is counted exactly once. 30s TTL releases slots whose
     // INVITE never came.
