@@ -75,17 +75,6 @@ impl<'a> PlatformSettings<'a> {
         }
     }
 
-    /// Whether a custom STUN list is configured (vs. the built-in defaults).
-    pub async fn has_custom_stun(&self) -> bool {
-        self.get(KEY_STUN_SERVERS)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .map(|v| v.iter().any(|s| !s.trim().is_empty()))
-            .unwrap_or(false)
-    }
-
     /// Persist the STUN server list (as a JSON array).
     pub async fn set_stun_servers(&self, servers: &[String]) -> Result<()> {
         let json = serde_json::to_string(servers)?;

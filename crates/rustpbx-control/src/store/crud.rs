@@ -396,18 +396,6 @@ impl Store {
 
     // ── Queues ──────────────────────────────────────────────────────────────────
 
-    pub async fn count_queues_for_tenant(&self, tenant_id: i64) -> Result<u64> {
-        let row = self
-            .db
-            .query_one(Statement::from_sql_and_values(
-                self.db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM rustpbx_queues WHERE tenant_id = $1",
-                vec![Value::BigInt(Some(tenant_id))],
-            ))
-            .await?;
-        Ok(row.and_then(|r| r.try_get::<i64>("", "cnt").ok()).unwrap_or(0) as u64)
-    }
-
     pub async fn list_queues_admin(&self, tenant_id: Option<i64>) -> Result<Vec<QueueView>> {
         let cols = "id, name, description, tenant_id, is_active, spec";
         let (sql, vals) = match tenant_id {
