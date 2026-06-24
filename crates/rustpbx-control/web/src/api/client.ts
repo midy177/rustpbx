@@ -102,9 +102,35 @@ export interface UpdateTenant {
   storage_prefix?: string | null;
 }
 
+/** Global call-recording policy (mirrors rustpbx RecordingPolicy; serde
+ * snake_case, `type` is the recording_type alias). Opaque to the control plane. */
+export interface RecordingPolicy {
+  enabled: boolean;
+  type: "local" | "http" | "s3";
+  directions?: string[]; // inbound | outbound | internal
+  caller_allow?: string[];
+  caller_deny?: string[];
+  callee_allow?: string[];
+  callee_deny?: string[];
+  auto_start?: boolean;
+  filename_pattern?: string | null;
+  samplerate?: number | null;
+  ptime?: number | null;
+  path?: string | null;
+  url?: string | null;
+  force_file?: boolean | null;
+  // S3 (when type=s3)
+  vendor?: string | null;
+  bucket?: string | null;
+  region?: string | null;
+  endpoint?: string | null;
+  root?: string | null;
+}
+
 export interface PlatformSettings {
   base_domain: string;
   stun_servers: string[];
+  recording_policy?: RecordingPolicy | null;
 }
 
 // ── Tenant IAM users ─────────────────────────────────────────────────────────
