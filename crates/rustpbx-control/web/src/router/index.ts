@@ -40,6 +40,7 @@ const routes = [
       { path: "acl", name: "tadmin-acl", component: () => import("@/views/tadmin/Acl.vue") },
       { path: "call-records", name: "tadmin-cdr", component: () => import("@/views/tadmin/CallRecords.vue") },
       { path: "queues", name: "tadmin-queues", component: () => import("@/views/tadmin/Queues.vue") },
+      { path: "ivrs", name: "tadmin-ivrs", component: () => import("@/views/tadmin/Ivrs.vue") },
       { path: "dids", name: "tadmin-dids", component: () => import("@/views/tadmin/Dids.vue") },
       { path: "users", name: "tadmin-users", component: () => import("@/views/tadmin/Users.vue") },
       { path: "audit", name: "tadmin-audit", component: () => import("@/views/tadmin/Audit.vue") },

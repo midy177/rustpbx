@@ -418,6 +418,23 @@ export interface QueueInput {
   spec: QueueSpec;
 }
 
+/** IVR flow — `spec` is the IvrDefinition JSON (opaque to the control plane;
+ * the worker materializes it to a TOML file). Edited as raw JSON in the UI. */
+export interface Ivr {
+  id: number;
+  name: string;
+  tenant_id: number | null;
+  description: string | null;
+  is_active: boolean;
+  spec: Record<string, unknown>;
+}
+export interface IvrInput {
+  name: string;
+  description?: string | null;
+  is_active: boolean;
+  spec: Record<string, unknown>;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",
