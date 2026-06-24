@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmpty,
 } from "@/components/ui/table";
-import { RefreshCw, PlayCircle, Search } from "lucide-vue-next";
+import { RefreshCw, Search, Download } from "lucide-vue-next";
 
 const { t } = useI18n();
 const auth = useAuthStore();
@@ -185,15 +185,18 @@ onMounted(load);
               {{ r.started_at ? formatDate(r.started_at) : "—" }}
             </TableCell>
             <TableCell>
-              <a
-                v-if="r.recording_url"
-                :href="r.recording_url"
-                target="_blank"
-                rel="noopener"
-                class="inline-flex items-center gap-1 text-sm text-primary hover:underline"
-              >
-                <PlayCircle class="size-4" /> {{ t("cdrPage.play") }}
-              </a>
+              <div v-if="r.recording_url" class="flex items-center gap-2">
+                <audio :src="r.recording_url" controls preload="none" class="h-8 max-w-[200px]" />
+                <a
+                  :href="r.recording_url"
+                  download
+                  class="text-muted-foreground hover:text-primary"
+                  :aria-label="t('cdrPage.download')"
+                  :title="t('cdrPage.download')"
+                >
+                  <Download class="size-4" />
+                </a>
+              </div>
               <span v-else class="text-muted-foreground">—</span>
             </TableCell>
           </TableRow>

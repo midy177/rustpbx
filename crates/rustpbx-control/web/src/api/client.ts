@@ -246,6 +246,8 @@ export interface TenantStats {
   extensions: number;
   dids: number;
   recent_calls: number;
+  active_calls: number;
+  max_concurrent_calls: number | null;
 }
 
 export interface AclRule {
@@ -300,6 +302,45 @@ export interface AuditEntry {
   created_at: string;
 }
 
+/** Raft cluster metrics (`GET /raft/metrics`). */
+export interface RaftMetrics {
+  id: number;
+  state: string; // Leader | Follower | Candidate | Learner | …
+  current_term: number;
+  current_leader: number | null;
+  last_log_index: number | null;
+  last_applied: number | null;
+  /** [node_id, advertised_addr] pairs. */
+  members: [number, string][];
+}
+
+/** Add a Raft learner (`POST /raft/add-learner`). */
+export interface AddLearnerInput {
+  node_id: number;
+  addr: string;
+  grpc_addr?: string;
+}
+
+/** Promote the voter set (`POST /raft/change-membership`). */
+export interface ChangeMembershipInput {
+  voters: number[];
+}
+
+/** Self-service password change (`POST /me/password`). */
+export interface ChangePasswordInput {
+  current_password: string;
+  new_password: string;
+}
+
+/** Platform stats (`GET /stats`). */
+export interface PlatformStats {
+  tenants: number;
+  workers_total: number;
+  workers_healthy: number;
+  active_calls: number;
+  call_slots: number;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",
@@ -324,6 +365,7 @@ export interface Stats {
   workers_total: number;
   workers_healthy: number;
   active_calls: number;
+  call_slots: number;
 }
 
 export interface Trunk {

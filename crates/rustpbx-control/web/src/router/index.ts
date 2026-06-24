@@ -21,6 +21,7 @@ const routes = [
       { path: "edges", name: "admin-edges", component: () => import("@/views/admin/Edges.vue") },
       { path: "dids", name: "admin-dids", component: () => import("@/views/admin/Dids.vue") },
       { path: "audit", name: "admin-audit", component: () => import("@/views/admin/Audit.vue") },
+      { path: "raft", name: "admin-raft", component: () => import("@/views/admin/Raft.vue") },
       { path: "settings", name: "admin-settings", component: () => import("@/views/admin/PlatformSettings.vue") },
     ],
   },

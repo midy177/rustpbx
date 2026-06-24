@@ -6,7 +6,7 @@ import { useAuthStore } from "@/stores/auth";
 import { formatDate } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Cable, PhoneCall, Hash, ScrollText } from "lucide-vue-next";
+import { Cable, PhoneCall, Hash, ScrollText, Radio } from "lucide-vue-next";
 
 const { t } = useI18n();
 const auth = useAuthStore();
@@ -37,6 +37,13 @@ const statCards = () => [
   { key: "tdashboard.extensions", v: stats.value?.extensions, icon: PhoneCall },
   { key: "tdashboard.dids", v: stats.value?.dids, icon: Hash },
   { key: "tdashboard.recentCalls", v: stats.value?.recent_calls, icon: ScrollText },
+  {
+    key: "tdashboard.concurrency",
+    v: stats.value
+      ? `${stats.value.active_calls}${stats.value.max_concurrent_calls != null ? " / " + stats.value.max_concurrent_calls : ""}`
+      : null,
+    icon: Radio,
+  },
 ];
 
 const quota = () => [
@@ -54,7 +61,7 @@ const quota = () => [
     </div>
 
     <!-- Live counts -->
-    <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
       <Card v-for="c in statCards()" :key="c.key">
         <CardContent class="flex items-center gap-4 pt-6">
           <div class="rounded-lg bg-muted p-3">

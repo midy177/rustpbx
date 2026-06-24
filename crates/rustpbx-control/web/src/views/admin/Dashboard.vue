@@ -3,7 +3,7 @@ import { ref, onMounted, type Component } from "vue";
 import { useI18n } from "vue-i18n";
 import { api, type Stats } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Building2, Server, ServerCog, PhoneCall } from "lucide-vue-next";
+import { Building2, Server, PhoneCall, Radio } from "lucide-vue-next";
 
 const { t } = useI18n();
 const stats = ref<Stats | null>(null);
@@ -16,9 +16,13 @@ interface Metric {
 }
 const metrics: Metric[] = [
   { key: "dashboard.tenants", value: () => stats.value?.tenants ?? 0, icon: Building2 },
-  { key: "dashboard.workersHealthy", value: () => stats.value?.workers_healthy ?? 0, icon: Server },
-  { key: "dashboard.workersTotal", value: () => stats.value?.workers_total ?? 0, icon: ServerCog },
+  {
+    key: "dashboard.workers",
+    value: () => `${stats.value?.workers_healthy ?? 0} / ${stats.value?.workers_total ?? 0}`,
+    icon: Server,
+  },
   { key: "dashboard.activeCalls", value: () => stats.value?.active_calls ?? 0, icon: PhoneCall },
+  { key: "dashboard.callSlots", value: () => stats.value?.call_slots ?? 0, icon: Radio },
 ];
 
 onMounted(async () => {
