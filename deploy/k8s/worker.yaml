@@ -1,0 +1,103 @@
+# RustPBX Media Worker.
+#
+# hostNetwork: true so RTP is reachable on the node's real IP (anchored media).
+# One worker pod per node (the RTP/SIP port range is node-global). Scale by
+# adding nodes; the control plane least-load-selects across registered workers.
+#
+# The worker reports its public IP + NAT type to the control plane (STUN probe
+# at startup). When sip_addr is 0.0.0.0, the STUN-detected public IP is used as
+# the reported address, so hostNetwork deployment needs no per-node config for
+# addressing — leave rtp_external_ip unset to auto-fill.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rustpbx-worker-config
+  labels:
+    app.kubernetes.io/name: rustpbx-worker
+data:
+  config.toml: |
+    control_plane_addr = "http://rustpbx-control:9090"
+    sip_addr = "0.0.0.0"
+    sip_port = 5070               # internal SIP from the Edge (TCP)
+    rtp_bind_ip = "0.0.0.0"
+    rtp_start_port = 20000
+    rtp_end_port = 40000
+    max_concurrent = 500
+    # worker_id omitted → defaults to worker-<hostname>, unique per pod across
+    # nodes. Set explicitly only if you want a stable hand-picked id.
+    heartbeat_secs = 5
+    health_addr = "0.0.0.0:8081"
+
+    # Serves AllocateCall so the Edge reserves a slot before sending the INVITE.
+    edge_worker_addr = "0.0.0.0:9092"
+
+    # Edge node IPs/CIDRs that may send internal INVITEs (skip ACL/Auth).
+    trusted_edges = ["10.0.0.0/8"]
+
+    # Leave unset to auto-fill the node's public IP from the STUN probe.
+    # rtp_external_ip = "203.0.113.20"
+    log = "info"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustpbx-worker
+  labels:
+    app.kubernetes.io/name: rustpbx-worker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate           # hostNetwork: ports collide on rolling update
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustpbx-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustpbx-worker
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNetwork
+      containers:
+        - name: worker
+          image: rustpbx-worker:latest
+          args: ["/app/config.toml"]
+          ports:
+            - name: sip-udp
+              containerPort: 5070
+              protocol: UDP
+            - name: sip-tcp
+              containerPort: 5070
+              protocol: TCP
+            - name: alloc       # AllocateCall (Edge → Worker)
+              containerPort: 9092
+            - name: health
+              containerPort: 8081
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.toml
+              subPath: config.toml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: rustpbx-worker-config

@@ -65,6 +65,19 @@ impl ControlClient {
         })
     }
 
+    /// Replace wildcard (0.0.0.0 / ::) hosts in the addresses this worker
+    /// reports with the STUN-detected public IP, so a worker that listens on
+    /// 0.0.0.0 (hostNetwork / containers) advertises a reachable SIP +
+    /// AllocateCall address without per-node config. Applies to `sip_addr` and
+    /// `edge_worker_addr`; call after the STUN probe, before `register`.
+    pub fn apply_detected_public_ip(&mut self, public_ip: &Option<String>) {
+        let Some(ip) = public_ip.as_deref() else { return };
+        self.sip_addr = with_public_host(&self.sip_addr, ip);
+        if !self.edge_worker_addr.is_empty() {
+            self.edge_worker_addr = with_public_host(&self.edge_worker_addr, ip);
+        }
+    }
+
     /// Connect, retrying with exponential backoff until the control plane is
     /// reachable — so a worker started before the control plane waits instead of
     /// crashing.
@@ -201,4 +214,36 @@ fn cpu_usage_approx() -> f32 {
     let mut guard = SYS.get_or_init(|| Mutex::new(System::new())).lock().unwrap();
     guard.refresh_cpu_usage();
     guard.global_cpu_usage()
+}
+
+/// If `addr` parses to a SocketAddr bound to an unspecified IP (0.0.0.0 / ::),
+/// swap in `public_ip` while keeping the port; otherwise return it unchanged.
+fn with_public_host(addr: &str, public_ip: &str) -> String {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) if sa.ip().is_unspecified() => format!("{public_ip}:{}", sa.port()),
+        _ => addr.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_host_is_replaced_with_public_ip() {
+        assert_eq!(with_public_host("0.0.0.0:5070", "203.0.113.20"), "203.0.113.20:5070");
+        assert_eq!(with_public_host("0.0.0.0:9092", "203.0.113.20"), "203.0.113.20:9092");
+    }
+
+    #[test]
+    fn explicit_host_is_left_alone() {
+        assert_eq!(with_public_host("10.0.0.5:5070", "203.0.113.20"), "10.0.0.5:5070");
+        // Already-public address is not rewritten.
+        assert_eq!(with_public_host("203.0.113.99:5070", "203.0.113.20"), "203.0.113.99:5070");
+    }
+
+    #[test]
+    fn malformed_address_is_left_alone() {
+        assert_eq!(with_public_host("not-an-addr", "203.0.113.20"), "not-an-addr");
+    }
 }

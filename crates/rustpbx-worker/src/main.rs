@@ -134,6 +134,9 @@ async fn main() -> Result<()> {
     // ── Connect to Control Plane & register ──────────────────────────────────
     let mut cp_client = ControlClient::connect_with_retry(&cfg).await?;
     cp_client.nat_type = nat.nat_type.clone();
+    // Listening on 0.0.0.0 (hostNetwork/containers): report the STUN-detected
+    // public IP for the SIP + AllocateCall addresses so the Edge can dial back.
+    cp_client.apply_detected_public_ip(&nat.public_ip);
     let active_calls = Arc::clone(&cp_client.active_calls);
 
     let ack = cp_client.register().await?;

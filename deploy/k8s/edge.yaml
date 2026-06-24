@@ -1,0 +1,104 @@
+# RustPBX SIP Edge Gateway.
+#
+# hostNetwork: true so carriers reach SIP on the node's real public IP (the
+# Edge advertises that IP in Contact/Via headers). This means only one Edge
+# pod per node (ports collide otherwise) — run across multiple nodes and let
+# carriers balance across them by DNS/IP.
+#
+# The Edge always also listens on TCP for Edge↔Worker (internal). STUN/NAT
+# type is probed at startup and reported to the control plane; the STUN list
+# itself is pulled from the control plane's Platform Settings (so leave
+# stun_servers empty here unless you want a local override).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rustpbx-edge-config
+  labels:
+    app.kubernetes.io/name: rustpbx-edge
+data:
+  config.toml: |
+    control_plane_addr = "http://rustpbx-control:9090"
+    sip_addr = "0.0.0.0"
+    udp_port = 5060
+    tcp_port = 0            # 0 → TCP on udp_port (Edge↔Worker is always TCP)
+
+    # REQUIRED for production: the node's public IP, used in Contact/Via so
+    # carriers and workers can dial back. Leave unset to auto-fill from the
+    # STUN probe (works when the node has direct public connectivity).
+    # public_ip = "203.0.113.10"
+
+    # Unique per Edge pod across nodes (e.g. the node name). Defaults to
+    # edge-<pid> if omitted — fine for one node, not stable across restarts.
+    edge_id = "edge-1"
+    region = "us-east-1"
+    heartbeat_secs = 10
+    health_addr = "0.0.0.0:8081"
+
+    # Worker node IPs/CIDRs that may send outbound INVITEs to this Edge.
+    trusted_workers = ["10.0.0.0/8"]
+
+    # Serve CallStateUpdate so Workers report terminal state out-of-band.
+    edge_worker_addr = "0.0.0.0:9093"
+    log = "info"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustpbx-edge
+  labels:
+    app.kubernetes.io/name: rustpbx-edge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # hostNetwork ports collide on rolling update
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustpbx-edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustpbx-edge
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNetwork
+      containers:
+        - name: edge
+          image: rustpbx-edge:latest
+          args: ["/app/config.toml"]
+          ports:
+            - name: sip-udp
+              containerPort: 5060
+              protocol: UDP
+            - name: sip-tcp
+              containerPort: 5060
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.toml
+              subPath: config.toml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: rustpbx-edge-config

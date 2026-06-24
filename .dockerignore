@@ -1,1 +1,14 @@
+# Build artifacts
 target/
+**/target/
+
+# Web SPA build output (rebuilt in the image) + node deps
+**/node_modules
+crates/*/web/dist
+
+# VCS / CI / editor noise
+.git
+.github
+.vscode
+.idea
+*.log
