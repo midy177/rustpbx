@@ -31,7 +31,7 @@ use ipnetwork::IpNetwork;
 use rustpbx::{
     call::RoutingState,
     callrecord::CallRecordManagerBuilder,
-    config::{ProxyConfig, RtpConfig},
+    config::{ProxyConfig, RtpConfig, UserBackendConfig},
     proxy::{
         acl::AclModule,
         auth::AuthModule,
@@ -427,6 +427,17 @@ fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
     // IVR definitions materialized here (see materialize_ivrs); the shared
     // CallModule reads {name}.generated.toml from this dir at runtime.
     config.ivr_dir = Some(cfg.ivr_dir.clone());
+    // SIP auth: challenge REGISTER and validate extension sip_password against
+    // the shared DB (ExtensionUserBackend queries rustpbx_extensions). Without
+    // this the worker uses an empty Memory backend + ensure_user=true, which
+    // silently aborts REGISTERs without even sending a 401.
+    if !cfg.database_url.trim().is_empty() {
+        config.realms = Some(vec![cfg.realm.clone()]);
+        config.user_backends = vec![UserBackendConfig::Extension {
+            database_url: Some(cfg.database_url.clone()),
+            ttl: Some(30),
+        }];
+    }
     config
 }
 

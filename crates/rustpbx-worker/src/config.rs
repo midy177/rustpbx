@@ -62,6 +62,12 @@ pub struct WorkerConfig {
     #[serde(default = "default_ivr_dir")]
     pub ivr_dir: String,
 
+    /// SIP auth realm for REGISTER challenges. Set to the host clients register
+    /// against (select_realm matches the request's host against this). Defaults
+    /// to "rustpbx.com".
+    #[serde(default = "default_realm")]
+    pub realm: String,
+
     /// Prometheus metrics listen address (empty = disabled)
     #[serde(default)]
     pub metrics_addr: Option<String>,
@@ -183,6 +189,7 @@ impl Default for WorkerConfig {
             heartbeat_secs: default_heartbeat_secs(),
             config_poll_secs: default_config_poll_secs(),
             ivr_dir: default_ivr_dir(),
+            realm: default_realm(),
             metrics_addr: None,
             trusted_edges: Vec::new(),
             stun_servers: default_stun_servers(),
@@ -253,6 +260,10 @@ fn default_config_poll_secs() -> u64 {
 
 fn default_ivr_dir() -> String {
     "./generated/ivr".to_string()
+}
+
+fn default_realm() -> String {
+    "rustpbx.com".to_string()
 }
 fn default_log() -> String {
     "info".to_string()
