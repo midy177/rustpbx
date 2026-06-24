@@ -394,6 +394,87 @@ impl Store {
         self.delete_scoped("rustpbx_acl_rules", id, scope_tenant).await
     }
 
+    // ── Queues ──────────────────────────────────────────────────────────────────
+
+    pub async fn count_queues_for_tenant(&self, tenant_id: i64) -> Result<u64> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "SELECT COUNT(*) AS cnt FROM rustpbx_queues WHERE tenant_id = $1",
+                vec![Value::BigInt(Some(tenant_id))],
+            ))
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<i64>("", "cnt").ok()).unwrap_or(0) as u64)
+    }
+
+    pub async fn list_queues_admin(&self, tenant_id: Option<i64>) -> Result<Vec<QueueView>> {
+        let cols = "id, name, description, tenant_id, is_active, spec";
+        let (sql, vals) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_queues \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY name"
+                ),
+                vec![Value::BigInt(Some(tid))],
+            ),
+            None => (format!("SELECT {cols} FROM rustpbx_queues ORDER BY name"), vec![]),
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                vals,
+            ))
+            .await?;
+        rows.iter().map(row_to_queue_view).collect()
+    }
+
+    pub async fn create_queue(&self, q: &QueueInput, row_tenant: Option<i64>) -> Result<()> {
+        let sql = "INSERT INTO rustpbx_queues (name, description, spec, is_active, tenant_id) \
+                   VALUES ($1,$2,$3,$4,$5)";
+        self.exec(
+            sql,
+            vec![
+                Value::String(Some(Box::new(q.name.clone()))),
+                opt_str(&q.description),
+                Value::Json(Some(Box::new(q.spec.clone()))),
+                Value::Bool(Some(q.is_active)),
+                Value::BigInt(row_tenant),
+            ],
+        )
+        .await
+    }
+
+    pub async fn update_queue(
+        &self,
+        id: i64,
+        q: &QueueInput,
+        scope_tenant: Option<i64>,
+    ) -> Result<u64> {
+        let mut sql = String::from(
+            "UPDATE rustpbx_queues SET name=$1, description=$2, spec=$3, is_active=$4, \
+             updated_at=CURRENT_TIMESTAMP WHERE id=$5",
+        );
+        let mut vals = vec![
+            Value::String(Some(Box::new(q.name.clone()))),
+            opt_str(&q.description),
+            Value::Json(Some(Box::new(q.spec.clone()))),
+            Value::Bool(Some(q.is_active)),
+            Value::BigInt(Some(id)),
+        ];
+        if let Some(tid) = scope_tenant {
+            sql.push_str(" AND tenant_id=$6");
+            vals.push(Value::BigInt(Some(tid)));
+        }
+        self.exec_affected(&sql, vals).await
+    }
+
+    pub async fn delete_queue(&self, id: i64, scope_tenant: Option<i64>) -> Result<u64> {
+        self.delete_scoped("rustpbx_queues", id, scope_tenant).await
+    }
+
     // ── Shared helpers ──────────────────────────────────────────────────────────
 
     async fn exec(&self, sql: &str, vals: Vec<Value>) -> Result<()> {
@@ -522,6 +603,43 @@ pub struct AclView {
     pub target: String,
     pub priority: i32,
     pub is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueInput {
+    pub name: String,
+    pub description: Option<String>,
+    /// `RouteQueueConfig` serialized as JSON. Opaque to the control plane — it
+    /// stores and forwards it verbatim; the worker deserializes it into
+    /// `rustpbx::proxy::routing::RouteQueueConfig`.
+    pub spec: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueView {
+    pub id: i64,
+    pub name: String,
+    pub tenant_id: Option<i64>,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub spec: serde_json::Value,
+}
+
+fn row_to_queue_view(row: &sea_orm::QueryResult) -> Result<QueueView> {
+    let spec: Option<serde_json::Value> = row
+        .try_get::<Option<serde_json::Value>>("", "spec")
+        .ok()
+        .flatten();
+    Ok(QueueView {
+        id: row.try_get("", "id")?,
+        name: row.try_get("", "name")?,
+        tenant_id: row.try_get("", "tenant_id").ok(),
+        description: row.try_get("", "description").ok(),
+        is_active: row.try_get("", "is_active").unwrap_or(true),
+        spec: spec.unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn row_to_acl_view(row: &sea_orm::QueryResult) -> Result<AclView> {

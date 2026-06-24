@@ -1,12 +1,14 @@
 pub mod add_domain_to_tenants;
 pub mod add_tenant_id_to_call_records;
 pub mod add_tenant_id_to_extensions;
+pub mod add_tenant_id_to_queues;
 pub mod add_tenant_id_to_routing;
 pub mod add_tenant_id_to_trunks;
 pub mod create_acl_rules;
 pub mod create_call_records;
 pub mod create_extensions;
 pub mod create_platform_settings;
+pub mod create_queues;
 pub mod create_routing;
 pub mod create_sip_trunks;
 
@@ -32,11 +34,13 @@ impl MigratorTrait for ControlMigrator {
             Box::new(create_call_records::Migration),
             Box::new(create_acl_rules::Migration),
             Box::new(create_extensions::Migration),
+            Box::new(create_queues::Migration),
             // Add tenant_id / domain columns to the base/own tables
             Box::new(add_tenant_id_to_trunks::Migration),
             Box::new(add_tenant_id_to_routing::Migration),
             Box::new(add_tenant_id_to_call_records::Migration),
             Box::new(add_tenant_id_to_extensions::Migration),
+            Box::new(add_tenant_id_to_queues::Migration),
             Box::new(add_domain_to_tenants::Migration),
         ]
     }

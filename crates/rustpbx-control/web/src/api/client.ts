@@ -357,6 +357,41 @@ export interface TenantQuota {
   concurrent: QuotaUsage;
 }
 
+/** Call-queue config (mirrors rustpbx `RouteQueueConfig`; spec is opaque JSON
+ * to the control plane — the worker deserializes it). */
+export interface QueueTarget {
+  uri: string;
+  label?: string | null;
+}
+export interface QueueSpec {
+  name?: string;
+  accept_immediately?: boolean;
+  passthrough_ringback?: boolean;
+  acd_policy?: string | null;
+  strategy: {
+    mode: "sequential" | "parallel";
+    wait_timeout_secs?: number | null;
+    targets: QueueTarget[];
+  };
+  hold?: { audio_file?: string | null; loop_playback?: boolean } | null;
+  fallback?: Record<string, unknown> | null;
+  voice_prompts?: Record<string, unknown> | null;
+}
+export interface Queue {
+  id: number;
+  name: string;
+  tenant_id: number | null;
+  description: string | null;
+  is_active: boolean;
+  spec: QueueSpec;
+}
+export interface QueueInput {
+  name: string;
+  description?: string | null;
+  is_active: boolean;
+  spec: QueueSpec;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",

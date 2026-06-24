@@ -19,7 +19,7 @@ use crate::did_service::{CreateDidRequest, DidService, UpdateDidRequest};
 use crate::raft::registry::RaftRegistry;
 use crate::settings::{KEY_BASE_DOMAIN, PlatformSettings};
 use crate::store::Store;
-use crate::store::crud::{AclInput, ExtensionInput, RouteInput, TrunkInput};
+use crate::store::crud::{AclInput, ExtensionInput, QueueInput, RouteInput, TrunkInput};
 use crate::tenant_service::{
     CreateTenantRequest, TenantService, UpdateDomainRequest, UpdateTenantRequest,
 };
@@ -330,6 +330,8 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/extensions/{id}", post(update_extension).delete(delete_extension))
         .route("/acl", get(list_acl).post(create_acl))
         .route("/acl/{id}", post(update_acl).delete(delete_acl))
+        .route("/queues", get(list_queues).post(create_queue))
+        .route("/queues/{id}", post(update_queue).delete(delete_queue))
         .route("/call-records", get(list_call_records))
         .route("/dids", get(list_dids).post(create_did))
         .route("/dids/{id}", post(update_did).delete(delete_did))
@@ -1204,6 +1206,59 @@ async fn delete_acl(
     let n = state.store.delete_acl(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
     if n > 0 {
         state.audit(&user, AuditEntry::action("delete", "acl", Some(id), format!("deleted ACL rule (id {id})")));
+    }
+    affected_or_404(n)
+}
+
+// ── PBX config: call queues ───────────────────────────────────────────────────
+
+async fn list_queues(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+) -> ApiResult<Response> {
+    require_perm(&user, permissions::QUEUE_READ)?;
+    let scope = read_scope(&user, q.tenant_id)?;
+    let rows = state.store.list_queues_admin(scope).await.map_err(ApiError::internal)?;
+    Ok(Json(rows).into_response())
+}
+
+async fn create_queue(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Query(q): Query<TenantQuery>,
+    Json(input): Json<QueueInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::QUEUE_WRITE)?;
+    let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
+    state.store.create_queue(&input, row_tenant).await.map_err(ApiError::bad)?;
+    state.audit(&user, AuditEntry::action("create", "queue", None, format!("created queue '{}'", input.name)));
+    Ok(StatusCode::CREATED)
+}
+
+async fn update_queue(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+    Json(input): Json<QueueInput>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::QUEUE_WRITE)?;
+    let n = state.store.update_queue(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("update", "queue", Some(id), format!("updated queue '{}' (id {id})", input.name)));
+    }
+    affected_or_404(n)
+}
+
+async fn delete_queue(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    require_perm(&user, permissions::QUEUE_WRITE)?;
+    let n = state.store.delete_queue(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    if n > 0 {
+        state.audit(&user, AuditEntry::action("delete", "queue", Some(id), format!("deleted queue (id {id})")));
     }
     affected_or_404(n)
 }
