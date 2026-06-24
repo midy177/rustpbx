@@ -308,6 +308,7 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/me/password", post(change_my_password))
         .route("/stats", get(stats))
         .route("/tenant-stats", get(tenant_stats))
+        .route("/tenant-quotas", get(list_tenant_quotas))
         // platform (superadmin)
         .route("/platform/settings", get(get_platform_settings).put(put_platform_settings))
         .route("/permissions", get(list_permissions))
@@ -694,6 +695,72 @@ async fn tenant_stats(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(TenantStats { trunks, extensions, dids, recent_calls, active_calls, max_concurrent_calls }))
+}
+
+// ── Platform-wide quota usage (superadmin) ────────────────────────────────────
+
+/// One resource's usage vs its configured cap. `max == None` → unlimited.
+#[derive(Serialize)]
+struct QuotaUsage {
+    used: u64,
+    max: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct TenantQuota {
+    id: i64,
+    name: String,
+    status: String,
+    trunks: QuotaUsage,
+    dids: QuotaUsage,
+    /// Live reserved call slots vs the tenant's concurrency cap.
+    concurrent: QuotaUsage,
+}
+
+/// Per-tenant quota usage across the whole platform — the superadmin's
+/// "who's near their limits" view. N tenants × 3 counts; fine for the modest
+/// tenant counts a control plane manages (aggregate to GROUP BY if it ever
+/// becomes hot).
+async fn list_tenant_quotas(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<Vec<TenantQuota>>> {
+    require_superadmin(&user)?;
+    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?;
+    let did_svc = DidService::new(&state.db);
+    let mut out = Vec::with_capacity(tenants.len());
+    for t in tenants {
+        let used_trunks = state
+            .store
+            .count_trunks_for_tenant(t.id)
+            .await
+            .map_err(ApiError::internal)?;
+        let used_dids = did_svc.count_for_tenant(t.id).await.map_err(ApiError::internal)?;
+        let active = state.workers.tenant_active_calls(t.id).await as u64;
+        out.push(TenantQuota {
+            id: t.id,
+            name: t.name,
+            status: t.status,
+            trunks: QuotaUsage { used: used_trunks, max: t.max_trunks.map(|v| v as u32) },
+            dids: QuotaUsage { used: used_dids, max: t.max_dids.map(|v| v as u32) },
+            concurrent: QuotaUsage { used: active, max: t.max_concurrent_calls.map(|v| v as u32) },
+        });
+    }
+    // Most-loaded first (by how close each resource is to its cap).
+    out.sort_by_key(|q| std::cmp::Reverse(q.saturation()));
+    Ok(Json(out))
+}
+
+impl TenantQuota {
+    /// 0–100+: highest saturation across the three resources (capped resources
+    /// only). Used to order the dashboard.
+    fn saturation(&self) -> u32 {
+        [(&self.trunks, "trunks"), (&self.dids, "dids"), (&self.concurrent, "conc")]
+            .into_iter()
+            .filter_map(|(u, _)| u.max.map(|m| if m == 0 { 0 } else { (u.used * 100 / m as u64) as u32 }))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 // ── Tenant handlers (superadmin) ───────────────────────────────────────────────

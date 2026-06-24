@@ -341,6 +341,22 @@ export interface PlatformStats {
   call_slots: number;
 }
 
+/** One resource's usage vs cap (`GET /tenant-quotas`). max null = unlimited. */
+export interface QuotaUsage {
+  used: number;
+  max: number | null;
+}
+
+/** Per-tenant quota usage across the platform (`GET /tenant-quotas`). */
+export interface TenantQuota {
+  id: number;
+  name: string;
+  status: string;
+  trunks: QuotaUsage;
+  dids: QuotaUsage;
+  concurrent: QuotaUsage;
+}
+
 /** Permission catalogue values (mirror `auth::permissions`). */
 export const ALL_PERMISSIONS = [
   "trunks:read",

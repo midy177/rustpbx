@@ -17,6 +17,7 @@ const routes = [
       { path: "", redirect: "/admin/dashboard" },
       { path: "dashboard", name: "admin-dashboard", component: () => import("@/views/admin/Dashboard.vue") },
       { path: "tenants", name: "admin-tenants", component: () => import("@/views/admin/Tenants.vue") },
+      { path: "quotas", name: "admin-quotas", component: () => import("@/views/admin/Quotas.vue") },
       { path: "workers", name: "admin-workers", component: () => import("@/views/admin/Workers.vue") },
       { path: "edges", name: "admin-edges", component: () => import("@/views/admin/Edges.vue") },
       { path: "dids", name: "admin-dids", component: () => import("@/views/admin/Dids.vue") },
