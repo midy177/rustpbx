@@ -124,6 +124,24 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(crate::grpc::proto::control::QueueConfigList { queues }))
     }
 
+    async fn get_ivrs(
+        &self,
+        request: Request<crate::grpc::proto::control::GetIvrsRequest>,
+    ) -> Result<Response<crate::grpc::proto::control::IvrConfigList>, Status> {
+        let req = request.into_inner();
+        info!(tenant_id = ?req.tenant_id, "get_ivrs");
+        let pairs = self
+            .store
+            .load_ivrs(req.tenant_id)
+            .await
+            .map_err(|e| Status::internal(format!("load ivrs: {e}")))?;
+        let ivrs = pairs
+            .into_iter()
+            .map(|(name, spec_json)| crate::grpc::proto::control::IvrConfig { name, spec_json })
+            .collect();
+        Ok(Response::new(crate::grpc::proto::control::IvrConfigList { ivrs }))
+    }
+
     // ── Config push (server streaming) ────────────────────────────────────────
 
     type WatchConfigChangesStream = BoxStream<ConfigChangeEvent>;

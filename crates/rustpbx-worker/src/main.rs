@@ -220,6 +220,15 @@ async fn main() -> Result<()> {
         info!(rtype = ?rp.recording_type, "global recording policy enabled");
         proxy_config.recording = Some(rp);
     }
+    // IVR flows: materialize to TOML files in ivr_dir; the shared CallModule
+    // reads them at runtime by name. Unlike queues/recording (memory inject),
+    // IVR is a file-based model in the monolith.
+    let ivrs = control_client::fetch_ivrs(&cfg.control_plane_addr, cp_tls.as_ref()).await;
+    let ivr_dir = std::path::PathBuf::from(&cfg.ivr_dir);
+    let n = control_client::materialize_ivrs(&ivrs, &ivr_dir).await;
+    if n > 0 {
+        info!(count = n, dir = %cfg.ivr_dir, "materialized IVR flows");
+    }
     let proxy_config = Arc::new(proxy_config);
     let data_context = Arc::new(
         ProxyDataContext::new(proxy_config.clone(), None)
@@ -238,6 +247,7 @@ async fn main() -> Result<()> {
         let base_cfg = Arc::clone(&proxy_config);
         let cp_addr = cfg.control_plane_addr.clone();
         let cp_tls2 = cp_tls.clone();
+        let ivr_dir = std::path::PathBuf::from(&cfg.ivr_dir);
         let poll = cfg.config_poll_secs;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(poll));
@@ -248,6 +258,9 @@ async fn main() -> Result<()> {
                     control_client::fetch_queues(&cp_addr, cp_tls2.as_ref()).await;
                 let recording =
                     control_client::fetch_platform_recording(&cp_addr, cp_tls2.as_ref()).await;
+                // IVR is file-based: re-materialize TOML files each cycle.
+                let ivrs = control_client::fetch_ivrs(&cp_addr, cp_tls2.as_ref()).await;
+                let _ = control_client::materialize_ivrs(&ivrs, &ivr_dir).await;
                 let mut new_cfg = (*base_cfg).clone();
                 new_cfg.queues = queues;
                 new_cfg.recording = recording;
@@ -388,6 +401,9 @@ fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
         "presence".into(),
         "call".into(),
     ]);
+    // IVR definitions materialized here (see materialize_ivrs); the shared
+    // CallModule reads {name}.generated.toml from this dir at runtime.
+    config.ivr_dir = Some(cfg.ivr_dir.clone());
     config
 }
 

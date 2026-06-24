@@ -475,6 +475,53 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Active IVRs for distribution to workers (gRPC GetIvrs). Tenant-scoped,
+    /// excluding suspended tenants. Returns `(name, spec_json)` pairs — spec is
+    /// the opaque `IvrDefinition` JSON the worker writes to a TOML file.
+    pub async fn load_ivrs(&self, tenant_id: Option<i64>) -> Result<Vec<(String, String)>> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let (sql, values) = match tenant_id {
+            Some(tid) => (
+                "SELECT name, spec FROM rustpbx_ivrs \
+                 WHERE is_active = TRUE AND (tenant_id = $1 OR tenant_id IS NULL) \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
+                 ORDER BY name",
+                vec![sea_orm::Value::BigInt(Some(tid))],
+            ),
+            None => (
+                "SELECT name, spec FROM rustpbx_ivrs \
+                 WHERE is_active = TRUE \
+                 AND (tenant_id IS NULL OR tenant_id NOT IN \
+                 (SELECT id FROM rustpbx_tenants WHERE status <> 'active')) \
+                 ORDER BY name",
+                vec![],
+            ),
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                values,
+            ))
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "name")?;
+            let spec: Option<serde_json::Value> = row
+                .try_get::<Option<serde_json::Value>>("", "spec")
+                .ok()
+                .flatten();
+            let spec_json = match spec {
+                Some(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+                None => "{}".into(),
+            };
+            out.push((name, spec_json));
+        }
+        Ok(out)
+    }
 }
 
 fn row_to_trunk_view(row: &sea_orm::QueryResult) -> Result<crate::store::TrunkView> {

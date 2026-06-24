@@ -207,6 +207,67 @@ pub async fn fetch_platform_stun(
     }
 }
 
+/// Fetch the active IVR flows from the control plane. Returns `(name,
+/// spec_json)` pairs — spec is an opaque `IvrDefinition` JSON; the worker
+/// materializes it to a TOML file. Empty on any error.
+pub async fn fetch_ivrs(
+    control_plane_addr: &str,
+    tls: Option<&rustpbx_proto::tls::ClientTls>,
+) -> Vec<(String, String)> {
+    use crate::proto::control::{GetIvrsRequest, control_plane_client::ControlPlaneClient};
+    let Ok(ep) = rustpbx_proto::tls::endpoint(control_plane_addr, tls) else {
+        return Vec::new();
+    };
+    let Ok(channel) = ep.connect().await else {
+        return Vec::new();
+    };
+    let Ok(resp) = ControlPlaneClient::new(channel)
+        .get_ivrs(GetIvrsRequest { tenant_id: None })
+        .await
+    else {
+        return Vec::new();
+    };
+    resp.into_inner()
+        .ivrs
+        .into_iter()
+        .map(|i| (i.name, i.spec_json))
+        .collect()
+}
+
+/// Write IVR definitions to `{ivr_dir}/{name}.generated.toml`. Each spec_json
+/// is deserialized into an IvrDefinition, wrapped in IvrFileConfig, and
+/// serialized to TOML — the format the shared CallModule reads at runtime
+/// (sip_session.rs reads these files). Returns the count materialized;
+/// invalid specs are skipped with a warning.
+pub async fn materialize_ivrs(ivrs: &[(String, String)], ivr_dir: &std::path::Path) -> usize {
+    use rustpbx::call::app::ivr_config::{IvrDefinition, IvrFileConfig};
+    if let Err(e) = tokio::fs::create_dir_all(ivr_dir).await {
+        warn!(dir = %ivr_dir.display(), error = %e, "cannot create ivr_dir");
+        return 0;
+    }
+    let mut ok = 0usize;
+    for (name, spec_json) in ivrs {
+        let spec_json = spec_json.trim();
+        if spec_json.is_empty() {
+            continue;
+        }
+        let result = (|| async {
+            let def: IvrDefinition = serde_json::from_str(spec_json)?;
+            let fc = IvrFileConfig { ivr: def };
+            let toml_str = toml::to_string_pretty(&fc)?;
+            let path = ivr_dir.join(format!("{name}.generated.toml"));
+            tokio::fs::write(&path, toml_str).await?;
+            anyhow::Ok(path)
+        })()
+        .await;
+        match result {
+            Ok(_) => ok += 1,
+            Err(e) => warn!(name = %name, error = %e, "failed to materialize IVR"),
+        }
+    }
+    ok
+}
+
 /// Fetch the global call-recording policy from the control plane and
 /// deserialize it into a `RecordingPolicy`. Returns None on any error or when
 /// recording is disabled — the worker then has no global recording policy.

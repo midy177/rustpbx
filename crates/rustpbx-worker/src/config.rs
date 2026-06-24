@@ -56,6 +56,12 @@ pub struct WorkerConfig {
     #[serde(default = "default_config_poll_secs")]
     pub config_poll_secs: u64,
 
+    /// Directory where IVR definitions from the control plane are materialized
+    /// as `{name}.generated.toml` files. The shared CallModule reads IVRs from
+    /// here at runtime. Defaults to ./generated/ivr.
+    #[serde(default = "default_ivr_dir")]
+    pub ivr_dir: String,
+
     /// Prometheus metrics listen address (empty = disabled)
     #[serde(default)]
     pub metrics_addr: Option<String>,
@@ -176,6 +182,7 @@ impl Default for WorkerConfig {
             recording_path: default_recording_path(),
             heartbeat_secs: default_heartbeat_secs(),
             config_poll_secs: default_config_poll_secs(),
+            ivr_dir: default_ivr_dir(),
             metrics_addr: None,
             trusted_edges: Vec::new(),
             stun_servers: default_stun_servers(),
@@ -242,6 +249,10 @@ fn default_heartbeat_secs() -> u64 {
 
 fn default_config_poll_secs() -> u64 {
     30
+}
+
+fn default_ivr_dir() -> String {
+    "./generated/ivr".to_string()
 }
 fn default_log() -> String {
     "info".to_string()

@@ -475,6 +475,75 @@ impl Store {
         self.delete_scoped("rustpbx_queues", id, scope_tenant).await
     }
 
+    // ── IVRs ────────────────────────────────────────────────────────────────────
+
+    pub async fn list_ivrs_admin(&self, tenant_id: Option<i64>) -> Result<Vec<IvrView>> {
+        let cols = "id, name, description, tenant_id, is_active, spec";
+        let (sql, vals) = match tenant_id {
+            Some(tid) => (
+                format!(
+                    "SELECT {cols} FROM rustpbx_ivrs \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL ORDER BY name"
+                ),
+                vec![Value::BigInt(Some(tid))],
+            ),
+            None => (format!("SELECT {cols} FROM rustpbx_ivrs ORDER BY name"), vec![]),
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                vals,
+            ))
+            .await?;
+        rows.iter().map(row_to_ivr_view).collect()
+    }
+
+    pub async fn create_ivr(&self, iv: &IvrInput, row_tenant: Option<i64>) -> Result<()> {
+        let sql = "INSERT INTO rustpbx_ivrs (name, description, spec, is_active, tenant_id) \
+                   VALUES ($1,$2,$3,$4,$5)";
+        self.exec(
+            sql,
+            vec![
+                Value::String(Some(Box::new(iv.name.clone()))),
+                opt_str(&iv.description),
+                Value::Json(Some(Box::new(iv.spec.clone()))),
+                Value::Bool(Some(iv.is_active)),
+                Value::BigInt(row_tenant),
+            ],
+        )
+        .await
+    }
+
+    pub async fn update_ivr(
+        &self,
+        id: i64,
+        iv: &IvrInput,
+        scope_tenant: Option<i64>,
+    ) -> Result<u64> {
+        let mut sql = String::from(
+            "UPDATE rustpbx_ivrs SET name=$1, description=$2, spec=$3, is_active=$4, \
+             updated_at=CURRENT_TIMESTAMP WHERE id=$5",
+        );
+        let mut vals = vec![
+            Value::String(Some(Box::new(iv.name.clone()))),
+            opt_str(&iv.description),
+            Value::Json(Some(Box::new(iv.spec.clone()))),
+            Value::Bool(Some(iv.is_active)),
+            Value::BigInt(Some(id)),
+        ];
+        if let Some(tid) = scope_tenant {
+            sql.push_str(" AND tenant_id=$6");
+            vals.push(Value::BigInt(Some(tid)));
+        }
+        self.exec_affected(&sql, vals).await
+    }
+
+    pub async fn delete_ivr(&self, id: i64, scope_tenant: Option<i64>) -> Result<u64> {
+        self.delete_scoped("rustpbx_ivrs", id, scope_tenant).await
+    }
+
     // ── Shared helpers ──────────────────────────────────────────────────────────
 
     async fn exec(&self, sql: &str, vals: Vec<Value>) -> Result<()> {
@@ -633,6 +702,42 @@ fn row_to_queue_view(row: &sea_orm::QueryResult) -> Result<QueueView> {
         .ok()
         .flatten();
     Ok(QueueView {
+        id: row.try_get("", "id")?,
+        name: row.try_get("", "name")?,
+        tenant_id: row.try_get("", "tenant_id").ok(),
+        description: row.try_get("", "description").ok(),
+        is_active: row.try_get("", "is_active").unwrap_or(true),
+        spec: spec.unwrap_or(serde_json::Value::Null),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IvrInput {
+    pub name: String,
+    pub description: Option<String>,
+    /// `IvrDefinition` serialized as JSON. Opaque to the control plane; the
+    /// worker materializes it into a `{name}.generated.toml` file.
+    pub spec: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IvrView {
+    pub id: i64,
+    pub name: String,
+    pub tenant_id: Option<i64>,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub spec: serde_json::Value,
+}
+
+fn row_to_ivr_view(row: &sea_orm::QueryResult) -> Result<IvrView> {
+    let spec: Option<serde_json::Value> = row
+        .try_get::<Option<serde_json::Value>>("", "spec")
+        .ok()
+        .flatten();
+    Ok(IvrView {
         id: row.try_get("", "id")?,
         name: row.try_get("", "name")?,
         tenant_id: row.try_get("", "tenant_id").ok(),

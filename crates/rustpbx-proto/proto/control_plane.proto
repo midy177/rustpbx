@@ -8,6 +8,7 @@ service ControlPlane {
   rpc GetRouteRules(GetRouteRulesRequest)     returns (RouteRuleList);
   rpc GetAclRules(GetAclRulesRequest)         returns (AclRuleList);
   rpc GetQueues(GetQueuesRequest)             returns (QueueConfigList);
+  rpc GetIvrs(GetIvrsRequest)                 returns (IvrConfigList);
 
   // ── Config push (server-streaming) ───────────────────────────────────────
   rpc WatchConfigChanges(WatchRequest) returns (stream ConfigChangeEvent);
@@ -71,6 +72,21 @@ message QueueConfig {
 }
 message QueueConfigList {
   repeated QueueConfig queues = 1;
+}
+
+// ─── IVR flows ────────────────────────────────────────────────────────────────
+
+message GetIvrsRequest {
+  optional int64 tenant_id = 1;
+}
+// `spec_json` is a JSON-serialized IvrDefinition; the worker writes it to a
+// `{name}.generated.toml` file (converted to TOML) for the shared CallModule.
+message IvrConfig {
+  string name      = 1;
+  string spec_json = 2;
+}
+message IvrConfigList {
+  repeated IvrConfig ivrs = 1;
 }
 
 message AcquireSlotRequest {

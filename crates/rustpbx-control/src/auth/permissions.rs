@@ -50,6 +50,8 @@ pub const DOMAIN_READ: &str = "domain:read";
 pub const DOMAIN_WRITE: &str = "domain:write";
 pub const QUEUE_READ: &str = "queue:read";
 pub const QUEUE_WRITE: &str = "queue:write";
+pub const IVR_READ: &str = "ivr:read";
+pub const IVR_WRITE: &str = "ivr:write";
 /// View the audit trail (who changed what). Tenant admins see their own
 /// tenant's entries; the superadmin sees all. Not granularly delegable.
 pub const AUDIT_READ: &str = "audit:read";
@@ -74,6 +76,8 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     DOMAIN_WRITE,
     QUEUE_READ,
     QUEUE_WRITE,
+    IVR_READ,
+    IVR_WRITE,
 ];
 
 /// Whether a principal holds `perm`. Admins (super or tenant) always do;
