@@ -40,6 +40,9 @@ message CallStateEvent {
   CallState state       = 3;
   optional uint32 hangup_cause = 4;
   optional string reason = 5;
+  // Event timestamp in unix milliseconds when known. For lifecycle events
+  // reconstructed from CDR, this is the original call timestamp.
+  optional int64 event_time_unix_ms = 6;
 }
 
 enum CallState {

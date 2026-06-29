@@ -10,8 +10,8 @@
 //! lives on the Worker; here it's unimplemented.
 
 use rustpbx_proto::edge::{
-    edge_worker_server::EdgeWorker, AllocateCallRequest, AllocateCallResponse, CallState,
-    CallStateAck, CallStateEvent,
+    AllocateCallRequest, AllocateCallResponse, CallState, CallStateAck, CallStateEvent,
+    edge_worker_server::EdgeWorker,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -43,6 +43,7 @@ impl EdgeWorker for EdgeWorkerServer {
             call_id = %ev.call_id,
             worker_id = %ev.worker_id,
             ?state,
+            event_time_unix_ms = ev.event_time_unix_ms,
             hangup_cause = ev.hangup_cause,
             reason = ev.reason.as_deref().unwrap_or(""),
             "worker reported call state"
