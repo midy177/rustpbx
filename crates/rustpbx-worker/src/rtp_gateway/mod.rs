@@ -46,6 +46,8 @@ pub mod command;
 #[allow(dead_code)]
 pub mod handle;
 pub mod logging_sink;
+#[allow(dead_code)]
+pub mod media_thread;
 
 #[allow(dead_code, unused_imports)]
 pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge};
@@ -56,3 +58,5 @@ pub use command::{
 };
 pub use handle::RtpGatewayHandle;
 pub use logging_sink::LoggingSink;
+#[allow(dead_code, unused_imports)]
+pub use media_thread::MediaThreadCallSink;
