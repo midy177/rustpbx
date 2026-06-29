@@ -1,11 +1,12 @@
 /// gRPC client wrapper for communicating with the Control Plane.
 use crate::proto::control::{
-    control_plane_client::ControlPlaneClient, AclRuleList, EdgeHeartbeatRequest, EdgeInfo,
-    GetAclRulesRequest, GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest,
-    RegisterAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerList,
+    AclRuleList, EdgeHeartbeatRequest, EdgeInfo, GetAclRulesRequest, GetRouteRulesRequest,
+    GetTrunkConfigsRequest, GetWorkersRequest, RegisterAck, RouteRuleList, TrunkConfigList,
+    WatchRequest, WorkerList, control_plane_client::ControlPlaneClient,
 };
 use anyhow::{Context, Result};
 use rustpbx_proto::tls::ClientTls;
+use std::collections::HashMap;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
@@ -83,10 +84,17 @@ impl GrpcControlClient {
         Ok(resp.into_inner())
     }
 
-    pub async fn get_available_workers(&mut self, tenant_id: Option<i64>) -> Result<WorkerList> {
+    pub async fn get_available_workers(
+        &mut self,
+        tenant_id: Option<i64>,
+        required_labels: HashMap<String, String>,
+    ) -> Result<WorkerList> {
         let resp = self
             .client
-            .get_available_workers(GetWorkersRequest { tenant_id })
+            .get_available_workers(GetWorkersRequest {
+                tenant_id,
+                required_labels,
+            })
             .await?;
         Ok(resp.into_inner())
     }

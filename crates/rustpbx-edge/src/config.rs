@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -65,6 +67,11 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub trusted_workers: Vec<String>,
 
+    /// Labels a Worker must advertise before this Edge will dispatch calls to it.
+    /// Example: `{ region = "us-east", tier = "media" }`.
+    #[serde(default)]
+    pub worker_required_labels: HashMap<String, String>,
+
     /// EdgeWorker gRPC listen address (`host:port`). When set, the Edge serves
     /// `CallStateUpdate` so Workers can report call state out-of-band. Empty →
     /// no control channel (state still flows over SIP).
@@ -127,7 +134,11 @@ impl TlsClientConfig {
             None
         };
         let domain = (!self.domain.trim().is_empty()).then(|| self.domain.clone());
-        Ok(Some(rustpbx_proto::tls::ClientTls { ca_pem, identity, domain }))
+        Ok(Some(rustpbx_proto::tls::ClientTls {
+            ca_pem,
+            identity,
+            domain,
+        }))
     }
 }
 
@@ -149,6 +160,7 @@ impl Default for EdgeConfig {
             stun_servers: default_stun_servers(),
             log: default_log(),
             trusted_workers: Vec::new(),
+            worker_required_labels: HashMap::new(),
             edge_worker_addr: None,
             health_addr: None,
             tls: TlsClientConfig::default(),

@@ -6,6 +6,7 @@
 
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Node id type — a simple monotonic integer assigned per control replica.
 pub type NodeId = u64;
@@ -52,6 +53,8 @@ pub struct WorkerRecord {
     pub max_concurrent: u32,
     pub active_calls: u32,
     pub cpu_usage: f32,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
     /// EdgeWorker gRPC address (host:port) for AllocateCall; empty if absent.
     #[serde(default)]
     pub edge_worker_addr: String,
@@ -139,7 +142,11 @@ pub enum RegistryCommand {
     /// Insert or replace an edge (register / re-register).
     RegisterEdge { record: EdgeRecord },
     /// Refresh an edge's load + heartbeat timestamp.
-    EdgeHeartbeat { edge_id: String, active_calls: u32, at_ms: i64 },
+    EdgeHeartbeat {
+        edge_id: String,
+        active_calls: u32,
+        at_ms: i64,
+    },
     /// Remove an edge outright.
     RemoveEdge { edge_id: String },
     /// Remove every edge whose heartbeat is older than `before_ms`.
@@ -190,7 +197,12 @@ fn default_true() -> bool {
 impl RegistryResponse {
     /// The common worker/edge response (granted/count unused).
     pub fn known(known: bool, removed: u32) -> Self {
-        Self { known, removed, granted: true, count: 0 }
+        Self {
+            known,
+            removed,
+            granted: true,
+            count: 0,
+        }
     }
 }
 

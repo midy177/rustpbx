@@ -31,11 +31,13 @@ impl RaftServer {
 }
 
 /// Decode a JSON request body, returning a gRPC `invalid_argument` on failure.
+#[allow(clippy::result_large_err)]
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Status> {
     serde_json::from_slice(bytes).map_err(|e| Status::invalid_argument(format!("decode: {e}")))
 }
 
 /// Encode a handler `Result<T, E>` as a `WireResult` JSON body.
+#[allow(clippy::result_large_err)]
 fn encode_result<T: Serialize, E: Serialize>(
     result: Result<T, E>,
 ) -> Result<Response<RaftBytes>, Status> {

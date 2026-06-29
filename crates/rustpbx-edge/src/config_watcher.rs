@@ -95,8 +95,7 @@ async fn handle_event(
 ) {
     use crate::proto::control::config_change_event::ChangeType;
 
-    let change_type =
-        ChangeType::try_from(event.change_type).unwrap_or(ChangeType::TrunkUpdated);
+    let change_type = ChangeType::try_from(event.change_type).unwrap_or(ChangeType::TrunkUpdated);
     match change_type {
         ChangeType::TrunkAdded | ChangeType::TrunkUpdated | ChangeType::TrunkRemoved => {
             info!(name = ?event.name, "config change: trunk — re-pulling from control plane");
@@ -104,7 +103,10 @@ async fn handle_event(
                 Ok(trunks) => {
                     let mut config = (*data_context.config()).clone();
                     config.trunks = trunks;
-                    if let Err(e) = data_context.reload_trunks(false, Some(Arc::new(config))).await {
+                    if let Err(e) = data_context
+                        .reload_trunks(false, Some(Arc::new(config)))
+                        .await
+                    {
                         error!(error = %e, "trunk reload failed");
                     }
                 }
@@ -117,7 +119,10 @@ async fn handle_event(
                 Ok(routes) => {
                     let mut config = (*data_context.config()).clone();
                     config.routes = Some(routes);
-                    if let Err(e) = data_context.reload_routes(false, Some(Arc::new(config))).await {
+                    if let Err(e) = data_context
+                        .reload_routes(false, Some(Arc::new(config)))
+                        .await
+                    {
                         error!(error = %e, "route reload failed");
                     }
                 }
@@ -130,6 +135,35 @@ async fn handle_event(
                 Ok(rules) => data_context.set_acl_rules(rules),
                 Err(e) => error!(error = %e, "acl re-pull failed"),
             }
+        }
+        ChangeType::PlatformChanged => {
+            info!("config change: platform — re-pulling edge-facing config");
+            if let Ok(trunks) = config_source.load_trunks().await {
+                let mut config = (*data_context.config()).clone();
+                config.trunks = trunks;
+                if let Err(e) = data_context
+                    .reload_trunks(false, Some(Arc::new(config)))
+                    .await
+                {
+                    error!(error = %e, "trunk reload failed");
+                }
+            }
+            if let Ok(routes) = config_source.load_routes().await {
+                let mut config = (*data_context.config()).clone();
+                config.routes = Some(routes);
+                if let Err(e) = data_context
+                    .reload_routes(false, Some(Arc::new(config)))
+                    .await
+                {
+                    error!(error = %e, "route reload failed");
+                }
+            }
+            if let Ok(rules) = config_source.load_acl_rules().await {
+                data_context.set_acl_rules(rules);
+            }
+        }
+        ChangeType::QueueChanged | ChangeType::IvrChanged => {
+            info!("config change is worker-only; edge ignoring");
         }
     }
 }

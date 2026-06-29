@@ -16,6 +16,8 @@
 use crate::audit_service::{AuditEntry, AuditFilter, AuditService};
 use crate::auth::permissions::{self, roles};
 use crate::did_service::{CreateDidRequest, DidService, UpdateDidRequest};
+use crate::grpc::proto::control::ConfigChangeEvent;
+use crate::grpc::proto::control::config_change_event::ChangeType;
 use crate::raft::registry::RaftRegistry;
 use crate::settings::{KEY_BASE_DOMAIN, PlatformSettings};
 use crate::store::Store;
@@ -34,12 +36,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::net::SocketAddr;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
@@ -75,6 +79,7 @@ pub struct HttpState {
     pub login_gate: Arc<DashMap<String, LoginGate>>,
     pub admin_username: String,
     pub admin_password: String,
+    pub config_change_tx: broadcast::Sender<ConfigChangeEvent>,
 }
 
 impl HttpState {
@@ -102,6 +107,25 @@ impl HttpState {
             }
         });
     }
+
+    async fn publish_config_change(
+        &self,
+        change_type: ChangeType,
+        name: Option<String>,
+    ) -> ApiResult<u64> {
+        let version = PlatformSettings::new(&self.db)
+            .bump_config_version()
+            .await
+            .map_err(ApiError::internal)?;
+        let event = ConfigChangeEvent {
+            change_type: change_type as i32,
+            name,
+            trunk: None,
+            version,
+        };
+        let _ = self.config_change_tx.send(event);
+        Ok(version)
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -128,7 +152,10 @@ struct ApiError {
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
     fn internal(e: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -146,7 +173,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 
@@ -162,12 +193,17 @@ fn require_perm(u: &UserInfo, perm: &str) -> ApiResult<()> {
     if permissions::has_permission(&u.role, &u.permissions, perm) {
         Ok(())
     } else {
-        Err(ApiError::new(StatusCode::FORBIDDEN, format!("missing permission: {perm}")))
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!("missing permission: {perm}"),
+        ))
     }
 }
 
 fn require_superadmin(u: &UserInfo) -> ApiResult<()> {
-    is_superadmin(u).then_some(()).ok_or_else(ApiError::forbidden)
+    is_superadmin(u)
+        .then_some(())
+        .ok_or_else(ApiError::forbidden)
 }
 
 /// Resolve the tenant scope for a *read*. Superadmin may filter by an explicit
@@ -277,15 +313,15 @@ fn affected_or_404(n: u64) -> ApiResult<StatusCode> {
 /// the SPA itself wasn't embedded.
 async fn spa_fallback(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if !path.is_empty() {
-        if let Some(asset) = WebAssets::get(path) {
-            let mime = asset.metadata.mimetype().to_string();
-            return (
-                [(axum::http::header::CONTENT_TYPE, mime)],
-                asset.data.into_owned(),
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && let Some(asset) = WebAssets::get(path)
+    {
+        let mime = asset.metadata.mimetype().to_string();
+        return (
+            [(axum::http::header::CONTENT_TYPE, mime)],
+            asset.data.into_owned(),
+        )
+            .into_response();
     }
     match WebAssets::get("index.html") {
         Some(index) => (
@@ -310,24 +346,42 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/tenant-stats", get(tenant_stats))
         .route("/tenant-quotas", get(list_tenant_quotas))
         // platform (superadmin)
-        .route("/platform/settings", get(get_platform_settings).put(put_platform_settings))
+        .route(
+            "/platform/settings",
+            get(get_platform_settings).put(put_platform_settings),
+        )
         .route("/permissions", get(list_permissions))
         // tenants (superadmin)
         .route("/tenants", get(list_tenants).post(create_tenant))
-        .route("/tenants/{id}", get(get_tenant).put(update_tenant).delete(delete_tenant))
+        .route(
+            "/tenants/{id}",
+            get(get_tenant).put(update_tenant).delete(delete_tenant),
+        )
         // tenant IAM users
         .route("/tenant-user-counts", get(tenant_user_counts))
-        .route("/tenant-users", get(list_tenant_users).post(create_tenant_user))
-        .route("/tenant-users/{id}", post(update_tenant_user).delete(delete_tenant_user))
+        .route(
+            "/tenant-users",
+            get(list_tenant_users).post(create_tenant_user),
+        )
+        .route(
+            "/tenant-users/{id}",
+            post(update_tenant_user).delete(delete_tenant_user),
+        )
         // tenant domain self-service
-        .route("/tenant-domain", get(get_tenant_domain).put(put_tenant_domain))
+        .route(
+            "/tenant-domain",
+            get(get_tenant_domain).put(put_tenant_domain),
+        )
         // PBX config
         .route("/trunks", get(list_trunks).post(create_trunk))
         .route("/trunks/{id}", post(update_trunk).delete(delete_trunk))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/{id}", post(update_route).delete(delete_route))
         .route("/extensions", get(list_extensions).post(create_extension))
-        .route("/extensions/{id}", post(update_extension).delete(delete_extension))
+        .route(
+            "/extensions/{id}",
+            post(update_extension).delete(delete_extension),
+        )
         .route("/acl", get(list_acl).post(create_acl))
         .route("/acl/{id}", post(update_acl).delete(delete_acl))
         .route("/queues", get(list_queues).post(create_queue))
@@ -453,10 +507,13 @@ fn check_login_gate(state: &HttpState, key: &str) -> ApiResult<()> {
 
 fn record_login_fail(state: &HttpState, key: &str) {
     let now = Utc::now();
-    let mut g = state.login_gate.entry(key.to_string()).or_insert(LoginGate {
-        fails: 0,
-        window_start: now,
-    });
+    let mut g = state
+        .login_gate
+        .entry(key.to_string())
+        .or_insert(LoginGate {
+            fails: 0,
+            window_start: now,
+        });
     if (now - g.window_start).num_seconds() >= LOGIN_WINDOW_SECS {
         g.fails = 0;
         g.window_start = now;
@@ -473,7 +530,11 @@ async fn login(
     let key = client_key(&headers, peer);
     check_login_gate(&state, &key)?;
 
-    let domain = req.domain.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let domain = req
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     // Resolve the principal; any failure here is a throttled attempt.
     let auth: ApiResult<UserInfo> = async {
@@ -481,7 +542,10 @@ async fn login(
             None => {
                 if req.username != state.admin_username || req.password != state.admin_password {
                     warn!(username = %req.username, "failed superadmin login");
-                    return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"));
+                    return Err(ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid credentials",
+                    ));
                 }
                 Ok(UserInfo {
                     username: state.admin_username.clone(),
@@ -573,14 +637,21 @@ async fn change_my_password(
         ApiError::bad("the platform administrator password is managed via config")
     })?;
     TenantUserService::new(&state.db)
-        .change_password(tid, &user.username, &req.current_password, &req.new_password)
+        .change_password(
+            tid,
+            &user.username,
+            &req.current_password,
+            &req.new_password,
+        )
         .await
         .map_err(ApiError::bad)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// The permission catalogue, for the tenant-admin user editor.
-async fn list_permissions(Extension(user): Extension<UserInfo>) -> ApiResult<Json<Vec<&'static str>>> {
+async fn list_permissions(
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<Vec<&'static str>>> {
     // Any authenticated principal that can manage users may read the catalogue.
     require_perm(&user, permissions::USERS_READ)?;
     Ok(Json(permissions::ALL_PERMISSIONS.to_vec()))
@@ -597,6 +668,8 @@ struct PlatformSettingsBody {
     /// control plane). None / empty object → disabled.
     #[serde(default)]
     recording_policy: Option<serde_json::Value>,
+    #[serde(default)]
+    config_version: u64,
 }
 
 async fn get_platform_settings(
@@ -613,6 +686,7 @@ async fn get_platform_settings(
         base_domain: s.base_domain().await,
         stun_servers: s.stun_servers().await,
         recording_policy,
+        config_version: s.config_version().await,
     }))
 }
 
@@ -632,7 +706,9 @@ async fn put_platform_settings(
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty())
         .collect();
-    s.set_stun_servers(&stun).await.map_err(ApiError::internal)?;
+    s.set_stun_servers(&stun)
+        .await
+        .map_err(ApiError::internal)?;
     // Recording policy: store as JSON string (empty/disabled object → clears).
     let rp_json = match &body.recording_policy {
         Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
@@ -641,9 +717,17 @@ async fn put_platform_settings(
     s.set_recording_policy_json(&rp_json)
         .await
         .map_err(ApiError::internal)?;
+    state
+        .publish_config_change(ChangeType::PlatformChanged, Some("platform".to_string()))
+        .await?;
     state.audit(
         &user,
-        AuditEntry::action("update", "platform", None, "updated platform settings (recording/stun/domain)"),
+        AuditEntry::action(
+            "update",
+            "platform",
+            None,
+            "updated platform settings (recording/stun/domain)",
+        ),
     );
     let recording_policy = s
         .recording_policy_json()
@@ -653,6 +737,7 @@ async fn put_platform_settings(
         base_domain: s.base_domain().await,
         stun_servers: s.stun_servers().await,
         recording_policy,
+        config_version: s.config_version().await,
     }))
 }
 
@@ -671,11 +756,20 @@ struct Stats {
 }
 
 async fn stats(State(state): State<HttpState>) -> ApiResult<Json<Stats>> {
-    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?.len();
+    let tenants = state
+        .tenants()
+        .await
+        .list()
+        .await
+        .map_err(ApiError::internal)?
+        .len();
     let all = state.workers.all().await;
     let timeout_ms = state.workers.heartbeat_timeout().as_millis() as i64;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let workers_healthy = all.iter().filter(|w| w.is_healthy(now_ms, timeout_ms)).count();
+    let workers_healthy = all
+        .iter()
+        .filter(|w| w.is_healthy(now_ms, timeout_ms))
+        .count();
     let active_calls = all.iter().map(|w| w.active_calls).sum();
     let call_slots = state.workers.total_call_slots().await;
     Ok(Json(Stats {
@@ -707,11 +801,28 @@ async fn tenant_stats(
     Query(q): Query<TenantQuery>,
 ) -> ApiResult<Json<TenantStats>> {
     let tid = required_tenant(&user, q.tenant_id)?;
-    let trunks = state.store.list_trunks(Some(tid)).await.map_err(ApiError::internal)?.len();
-    let extensions = state.store.list_extensions(Some(tid)).await.map_err(ApiError::internal)?.len();
-    let dids = DidService::new(&state.db).count_for_tenant(tid).await.map_err(ApiError::internal)?;
+    let trunks = state
+        .store
+        .list_trunks(Some(tid))
+        .await
+        .map_err(ApiError::internal)?
+        .len();
+    let extensions = state
+        .store
+        .list_extensions(Some(tid))
+        .await
+        .map_err(ApiError::internal)?
+        .len();
+    let dids = DidService::new(&state.db)
+        .count_for_tenant(tid)
+        .await
+        .map_err(ApiError::internal)?;
     // Accurate total CDR count for the tenant (no 1000-row cap).
-    let opts = crate::store::CdrListOpts { tenant_id: Some(tid), limit: 1, ..Default::default() };
+    let opts = crate::store::CdrListOpts {
+        tenant_id: Some(tid),
+        limit: 1,
+        ..Default::default()
+    };
     let recent_calls = state
         .store
         .list_call_records_paged(&opts)
@@ -724,7 +835,14 @@ async fn tenant_stats(
         .tenant_max_concurrent(tid)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(TenantStats { trunks, extensions, dids, recent_calls, active_calls, max_concurrent_calls }))
+    Ok(Json(TenantStats {
+        trunks,
+        extensions,
+        dids,
+        recent_calls,
+        active_calls,
+        max_concurrent_calls,
+    }))
 }
 
 // ── Platform-wide quota usage (superadmin) ────────────────────────────────────
@@ -756,7 +874,12 @@ async fn list_tenant_quotas(
     Extension(user): Extension<UserInfo>,
 ) -> ApiResult<Json<Vec<TenantQuota>>> {
     require_superadmin(&user)?;
-    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?;
+    let tenants = state
+        .tenants()
+        .await
+        .list()
+        .await
+        .map_err(ApiError::internal)?;
     let did_svc = DidService::new(&state.db);
     let mut out = Vec::with_capacity(tenants.len());
     for t in tenants {
@@ -765,15 +888,27 @@ async fn list_tenant_quotas(
             .count_trunks_for_tenant(t.id)
             .await
             .map_err(ApiError::internal)?;
-        let used_dids = did_svc.count_for_tenant(t.id).await.map_err(ApiError::internal)?;
+        let used_dids = did_svc
+            .count_for_tenant(t.id)
+            .await
+            .map_err(ApiError::internal)?;
         let active = state.workers.tenant_active_calls(t.id).await as u64;
         out.push(TenantQuota {
             id: t.id,
             name: t.name,
             status: t.status,
-            trunks: QuotaUsage { used: used_trunks, max: t.max_trunks.map(|v| v as u32) },
-            dids: QuotaUsage { used: used_dids, max: t.max_dids.map(|v| v as u32) },
-            concurrent: QuotaUsage { used: active, max: t.max_concurrent_calls.map(|v| v as u32) },
+            trunks: QuotaUsage {
+                used: used_trunks,
+                max: t.max_trunks.map(|v| v as u32),
+            },
+            dids: QuotaUsage {
+                used: used_dids,
+                max: t.max_dids.map(|v| v as u32),
+            },
+            concurrent: QuotaUsage {
+                used: active,
+                max: t.max_concurrent_calls.map(|v| v as u32),
+            },
         });
     }
     // Most-loaded first (by how close each resource is to its cap).
@@ -785,11 +920,23 @@ impl TenantQuota {
     /// 0–100+: highest saturation across the three resources (capped resources
     /// only). Used to order the dashboard.
     fn saturation(&self) -> u32 {
-        [(&self.trunks, "trunks"), (&self.dids, "dids"), (&self.concurrent, "conc")]
-            .into_iter()
-            .filter_map(|(u, _)| u.max.map(|m| if m == 0 { 0 } else { (u.used * 100 / m as u64) as u32 }))
-            .max()
-            .unwrap_or(0)
+        [
+            (&self.trunks, "trunks"),
+            (&self.dids, "dids"),
+            (&self.concurrent, "conc"),
+        ]
+        .into_iter()
+        .filter_map(|(u, _)| {
+            u.max.map(|m| {
+                if m == 0 {
+                    0
+                } else {
+                    (u.used * 100 / m as u64) as u32
+                }
+            })
+        })
+        .max()
+        .unwrap_or(0)
     }
 }
 
@@ -800,7 +947,12 @@ async fn list_tenants(
     Extension(user): Extension<UserInfo>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
-    let tenants = state.tenants().await.list().await.map_err(ApiError::internal)?;
+    let tenants = state
+        .tenants()
+        .await
+        .list()
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(tenants).into_response())
 }
 
@@ -813,7 +965,12 @@ async fn get_tenant(
     if !is_superadmin(&user) && user.tenant_id != Some(id) {
         return Err(ApiError::forbidden());
     }
-    let tenant = state.tenants().await.get(id).await.map_err(ApiError::not_found)?;
+    let tenant = state
+        .tenants()
+        .await
+        .get(id)
+        .await
+        .map_err(ApiError::not_found)?;
     Ok(Json(tenant).into_response())
 }
 
@@ -826,18 +983,28 @@ async fn create_tenant(
 
     // Validate the optional initial-admin credentials BEFORE creating the
     // tenant, so an invalid password doesn't leave behind an orphan tenant.
-    let admin_creds = match (req.admin_username.as_deref().map(str::trim), req.admin_password.as_deref()) {
+    let admin_creds = match (
+        req.admin_username.as_deref().map(str::trim),
+        req.admin_password.as_deref(),
+    ) {
         (Some(u), p) if !u.is_empty() => {
             let p = p.unwrap_or("");
             if p.len() < 6 {
-                return Err(ApiError::bad("admin password must be at least 6 characters"));
+                return Err(ApiError::bad(
+                    "admin password must be at least 6 characters",
+                ));
             }
             Some((u.to_string(), p.to_string()))
         }
         _ => None,
     };
 
-    let tenant = state.tenants().await.create(&req).await.map_err(ApiError::bad)?;
+    let tenant = state
+        .tenants()
+        .await
+        .create(&req)
+        .await
+        .map_err(ApiError::bad)?;
     audit_tenant(&state, &user, "create", tenant.id, &tenant.name);
 
     // Provision the tenant's first admin account (creds already validated).
@@ -871,7 +1038,10 @@ fn audit_tenant(state: &HttpState, user: &UserInfo, action: &str, id: i64, name:
     } else {
         format!("{action} tenant '{name}' (id {id})")
     };
-    state.audit(user, AuditEntry::action(action, "tenant", Some(id), summary));
+    state.audit(
+        user,
+        AuditEntry::action(action, "tenant", Some(id), summary),
+    );
 }
 
 async fn update_tenant(
@@ -881,7 +1051,12 @@ async fn update_tenant(
     Json(req): Json<UpdateTenantRequest>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
-    let tenant = state.tenants().await.update(id, req).await.map_err(ApiError::bad)?;
+    let tenant = state
+        .tenants()
+        .await
+        .update(id, req)
+        .await
+        .map_err(ApiError::bad)?;
     audit_tenant(&state, &user, "update", tenant.id, &tenant.name);
     Ok(Json(tenant).into_response())
 }
@@ -892,7 +1067,12 @@ async fn delete_tenant(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_superadmin(&user)?;
-    state.tenants().await.delete(id).await.map_err(ApiError::not_found)?;
+    state
+        .tenants()
+        .await
+        .delete(id)
+        .await
+        .map_err(ApiError::not_found)?;
     audit_tenant(&state, &user, "delete", id, "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -919,7 +1099,10 @@ async fn list_tenant_users(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::USERS_READ)?;
     let tid = required_tenant(&user, q.tenant_id)?;
-    let users = TenantUserService::new(&state.db).list(tid).await.map_err(ApiError::internal)?;
+    let users = TenantUserService::new(&state.db)
+        .list(tid)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(users).into_response())
 }
 
@@ -941,7 +1124,12 @@ async fn create_tenant_user(
         .map_err(ApiError::bad)?;
     state.audit(
         &user,
-        AuditEntry::action("create", "tenant_user", Some(created.id), format!("created user '{}'", created.username)),
+        AuditEntry::action(
+            "create",
+            "tenant_user",
+            Some(created.id),
+            format!("created user '{}'", created.username),
+        ),
     );
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -961,7 +1149,12 @@ async fn update_tenant_user(
     let updated = svc.update(id, req).await.map_err(ApiError::bad)?;
     state.audit(
         &user,
-        AuditEntry::action("update", "tenant_user", Some(id), format!("updated user '{}' (id {id})", updated.username)),
+        AuditEntry::action(
+            "update",
+            "tenant_user",
+            Some(id),
+            format!("updated user '{}' (id {id})", updated.username),
+        ),
     );
     Ok(Json(updated).into_response())
 }
@@ -980,7 +1173,12 @@ async fn delete_tenant_user(
     svc.delete(id).await.map_err(ApiError::bad)?;
     state.audit(
         &user,
-        AuditEntry::action("delete", "tenant_user", Some(id), format!("deleted user '{}' (id {id})", target.username)),
+        AuditEntry::action(
+            "delete",
+            "tenant_user",
+            Some(id),
+            format!("deleted user '{}' (id {id})", target.username),
+        ),
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -994,7 +1192,12 @@ async fn get_tenant_domain(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::DOMAIN_READ)?;
     let tid = required_tenant(&user, q.tenant_id)?;
-    let tenant = state.tenants().await.get(tid).await.map_err(ApiError::not_found)?;
+    let tenant = state
+        .tenants()
+        .await
+        .get(tid)
+        .await
+        .map_err(ApiError::not_found)?;
     Ok(Json(tenant).into_response())
 }
 
@@ -1006,10 +1209,20 @@ async fn put_tenant_domain(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::DOMAIN_WRITE)?;
     let tid = required_tenant(&user, q.tenant_id)?;
-    let tenant = state.tenants().await.update_domain(tid, req).await.map_err(ApiError::bad)?;
+    let tenant = state
+        .tenants()
+        .await
+        .update_domain(tid, req)
+        .await
+        .map_err(ApiError::bad)?;
     state.audit(
         &user,
-        AuditEntry::action("update", "domain", Some(tid), format!("updated domain for tenant '{name}'", name = tenant.name)),
+        AuditEntry::action(
+            "update",
+            "domain",
+            Some(tid),
+            format!("updated domain for tenant '{name}'", name = tenant.name),
+        ),
     );
     Ok(Json(tenant).into_response())
 }
@@ -1028,7 +1241,11 @@ async fn list_trunks(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::TRUNKS_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_trunks(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_trunks(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1043,8 +1260,23 @@ async fn create_trunk(
     if let Some(tid) = row_tenant {
         enforce_trunk_quota(&state, tid).await?;
     }
-    state.store.create_trunk(&input, row_tenant).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "trunk", None, format!("created trunk '{}'", input.name)));
+    state
+        .store
+        .create_trunk(&input, row_tenant)
+        .await
+        .map_err(ApiError::bad)?;
+    state
+        .publish_config_change(ChangeType::TrunkAdded, Some(input.name.clone()))
+        .await?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "trunk",
+            None,
+            format!("created trunk '{}'", input.name),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1055,9 +1287,24 @@ async fn update_trunk(
     Json(input): Json<TrunkInput>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::TRUNKS_WRITE)?;
-    let n = state.store.update_trunk(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .update_trunk(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "trunk", Some(id), format!("updated trunk '{}' (id {id})", input.name)));
+        state
+            .publish_config_change(ChangeType::TrunkUpdated, Some(input.name.clone()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "trunk",
+                Some(id),
+                format!("updated trunk '{}' (id {id})", input.name),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1068,9 +1315,24 @@ async fn delete_trunk(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::TRUNKS_WRITE)?;
-    let n = state.store.delete_trunk(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_trunk(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "trunk", Some(id), format!("deleted trunk (id {id})")));
+        state
+            .publish_config_change(ChangeType::TrunkRemoved, Some(id.to_string()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "delete",
+                "trunk",
+                Some(id),
+                format!("deleted trunk (id {id})"),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1084,7 +1346,11 @@ async fn list_routes(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::ROUTING_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_routes(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_routes(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1096,8 +1362,23 @@ async fn create_route(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ROUTING_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
-    state.store.create_route(&input, row_tenant).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "route", None, format!("created route '{}'", input.name)));
+    state
+        .store
+        .create_route(&input, row_tenant)
+        .await
+        .map_err(ApiError::bad)?;
+    state
+        .publish_config_change(ChangeType::RouteChanged, Some(input.name.clone()))
+        .await?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "route",
+            None,
+            format!("created route '{}'", input.name),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1108,9 +1389,24 @@ async fn update_route(
     Json(input): Json<RouteInput>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ROUTING_WRITE)?;
-    let n = state.store.update_route(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .update_route(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "route", Some(id), format!("updated route '{}' (id {id})", input.name)));
+        state
+            .publish_config_change(ChangeType::RouteChanged, Some(input.name.clone()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "route",
+                Some(id),
+                format!("updated route '{}' (id {id})", input.name),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1121,9 +1417,24 @@ async fn delete_route(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ROUTING_WRITE)?;
-    let n = state.store.delete_route(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_route(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "route", Some(id), format!("deleted route (id {id})")));
+        state
+            .publish_config_change(ChangeType::RouteChanged, Some(id.to_string()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "delete",
+                "route",
+                Some(id),
+                format!("deleted route (id {id})"),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1137,7 +1448,11 @@ async fn list_extensions(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::EXTENSIONS_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_extensions(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_extensions(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1149,8 +1464,20 @@ async fn create_extension(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::EXTENSIONS_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
-    state.store.create_extension(&input, row_tenant).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "extension", None, format!("created extension '{}'", input.extension)));
+    state
+        .store
+        .create_extension(&input, row_tenant)
+        .await
+        .map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "extension",
+            None,
+            format!("created extension '{}'", input.extension),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1167,7 +1494,15 @@ async fn update_extension(
         .await
         .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "extension", Some(id), format!("updated extension '{}' (id {id})", input.extension)));
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "extension",
+                Some(id),
+                format!("updated extension '{}' (id {id})", input.extension),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1178,9 +1513,21 @@ async fn delete_extension(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::EXTENSIONS_WRITE)?;
-    let n = state.store.delete_extension(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_extension(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "extension", Some(id), format!("deleted extension (id {id})")));
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "delete",
+                "extension",
+                Some(id),
+                format!("deleted extension (id {id})"),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1194,7 +1541,11 @@ async fn list_acl(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::ACL_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_acl_admin(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_acl_admin(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1206,8 +1557,23 @@ async fn create_acl(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ACL_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
-    state.store.create_acl(&input, row_tenant).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "acl", None, format!("created ACL rule: {} {}", input.action, input.target)));
+    state
+        .store
+        .create_acl(&input, row_tenant)
+        .await
+        .map_err(ApiError::bad)?;
+    state
+        .publish_config_change(ChangeType::AclChanged, Some(input.target.clone()))
+        .await?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "acl",
+            None,
+            format!("created ACL rule: {} {}", input.action, input.target),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1218,9 +1584,27 @@ async fn update_acl(
     Json(input): Json<AclInput>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ACL_WRITE)?;
-    let n = state.store.update_acl(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .update_acl(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "acl", Some(id), format!("updated ACL rule (id {id}): {} {}", input.action, input.target)));
+        state
+            .publish_config_change(ChangeType::AclChanged, Some(input.target.clone()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "acl",
+                Some(id),
+                format!(
+                    "updated ACL rule (id {id}): {} {}",
+                    input.action, input.target
+                ),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1231,9 +1615,24 @@ async fn delete_acl(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::ACL_WRITE)?;
-    let n = state.store.delete_acl(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_acl(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "acl", Some(id), format!("deleted ACL rule (id {id})")));
+        state
+            .publish_config_change(ChangeType::AclChanged, Some(id.to_string()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "delete",
+                "acl",
+                Some(id),
+                format!("deleted ACL rule (id {id})"),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1247,7 +1646,11 @@ async fn list_queues(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::QUEUE_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_queues_admin(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_queues_admin(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1259,8 +1662,23 @@ async fn create_queue(
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::QUEUE_WRITE)?;
     let row_tenant = create_tenant_scope(&user, q.tenant_id)?;
-    state.store.create_queue(&input, row_tenant).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "queue", None, format!("created queue '{}'", input.name)));
+    state
+        .store
+        .create_queue(&input, row_tenant)
+        .await
+        .map_err(ApiError::bad)?;
+    state
+        .publish_config_change(ChangeType::QueueChanged, Some(input.name.clone()))
+        .await?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "queue",
+            None,
+            format!("created queue '{}'", input.name),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1271,9 +1689,24 @@ async fn update_queue(
     Json(input): Json<QueueInput>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::QUEUE_WRITE)?;
-    let n = state.store.update_queue(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .update_queue(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "queue", Some(id), format!("updated queue '{}' (id {id})", input.name)));
+        state
+            .publish_config_change(ChangeType::QueueChanged, Some(input.name.clone()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "queue",
+                Some(id),
+                format!("updated queue '{}' (id {id})", input.name),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1284,9 +1717,24 @@ async fn delete_queue(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::QUEUE_WRITE)?;
-    let n = state.store.delete_queue(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_queue(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "queue", Some(id), format!("deleted queue (id {id})")));
+        state
+            .publish_config_change(ChangeType::QueueChanged, Some(id.to_string()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "delete",
+                "queue",
+                Some(id),
+                format!("deleted queue (id {id})"),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1300,7 +1748,11 @@ async fn list_ivrs(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::IVR_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let rows = state.store.list_ivrs_admin(scope).await.map_err(ApiError::internal)?;
+    let rows = state
+        .store
+        .list_ivrs_admin(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(rows).into_response())
 }
 
@@ -1319,12 +1771,26 @@ async fn create_ivr(
         Err(e) if e.to_string().contains("UNIQUE") => {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                format!("an IVR named '{}' already exists (names are globally unique)", input.name),
+                format!(
+                    "an IVR named '{}' already exists (names are globally unique)",
+                    input.name
+                ),
             ));
         }
         Err(e) => return Err(ApiError::bad(e)),
     }
-    state.audit(&user, AuditEntry::action("create", "ivr", None, format!("created IVR '{}'", input.name)));
+    state
+        .publish_config_change(ChangeType::IvrChanged, Some(input.name.clone()))
+        .await?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "ivr",
+            None,
+            format!("created IVR '{}'", input.name),
+        ),
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -1335,9 +1801,24 @@ async fn update_ivr(
     Json(input): Json<IvrInput>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::IVR_WRITE)?;
-    let n = state.store.update_ivr(id, &input, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .update_ivr(id, &input, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("update", "ivr", Some(id), format!("updated IVR '{}' (id {id})", input.name)));
+        state
+            .publish_config_change(ChangeType::IvrChanged, Some(input.name.clone()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action(
+                "update",
+                "ivr",
+                Some(id),
+                format!("updated IVR '{}' (id {id})", input.name),
+            ),
+        );
     }
     affected_or_404(n)
 }
@@ -1348,9 +1829,19 @@ async fn delete_ivr(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_perm(&user, permissions::IVR_WRITE)?;
-    let n = state.store.delete_ivr(id, mutate_scope(&user)).await.map_err(ApiError::bad)?;
+    let n = state
+        .store
+        .delete_ivr(id, mutate_scope(&user))
+        .await
+        .map_err(ApiError::bad)?;
     if n > 0 {
-        state.audit(&user, AuditEntry::action("delete", "ivr", Some(id), format!("deleted IVR (id {id})")));
+        state
+            .publish_config_change(ChangeType::IvrChanged, Some(id.to_string()))
+            .await?;
+        state.audit(
+            &user,
+            AuditEntry::action("delete", "ivr", Some(id), format!("deleted IVR (id {id})")),
+        );
     }
     affected_or_404(n)
 }
@@ -1411,7 +1902,13 @@ async fn list_call_records(
         .list_call_records_paged(&opts)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(CdrPage { records, total, limit, offset }).into_response())
+    Ok(Json(CdrPage {
+        records,
+        total,
+        limit,
+        offset,
+    })
+    .into_response())
 }
 
 // ── Audit trail ───────────────────────────────────────────────────────────────
@@ -1434,7 +1931,11 @@ async fn list_audit(
     require_perm(&user, permissions::AUDIT_READ)?;
     // Tenant admins are locked to their own tenant; only superadmin may cross
     // tenants (and only then is tenant_id=None meaningful → all entries).
-    let scope = if is_superadmin(&user) { q.tenant_id } else { user.tenant_id };
+    let scope = if is_superadmin(&user) {
+        q.tenant_id
+    } else {
+        user.tenant_id
+    };
     let filter = AuditFilter {
         tenant_id: scope,
         action: q.action,
@@ -1457,7 +1958,10 @@ async fn list_dids(
 ) -> ApiResult<Response> {
     require_perm(&user, permissions::DIDS_READ)?;
     let scope = read_scope(&user, q.tenant_id)?;
-    let dids = DidService::new(&state.db).list(scope).await.map_err(ApiError::internal)?;
+    let dids = DidService::new(&state.db)
+        .list(scope)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(dids).into_response())
 }
 
@@ -1472,8 +1976,19 @@ async fn create_did(
     if let Some(tid) = req.tenant_id {
         enforce_did_quota(&state, tid).await?;
     }
-    let did = DidService::new(&state.db).create(&req).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("create", "did", Some(did.id), format!("created DID '{}'", did.number)));
+    let did = DidService::new(&state.db)
+        .create(&req)
+        .await
+        .map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "create",
+            "did",
+            Some(did.id),
+            format!("created DID '{}'", did.number),
+        ),
+    );
     Ok((StatusCode::CREATED, Json(did)).into_response())
 }
 
@@ -1484,8 +1999,19 @@ async fn update_did(
     Json(req): Json<UpdateDidRequest>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
-    let did = DidService::new(&state.db).update(id, req).await.map_err(ApiError::bad)?;
-    state.audit(&user, AuditEntry::action("update", "did", Some(id), format!("updated DID '{}' (id {id})", did.number)));
+    let did = DidService::new(&state.db)
+        .update(id, req)
+        .await
+        .map_err(ApiError::bad)?;
+    state.audit(
+        &user,
+        AuditEntry::action(
+            "update",
+            "did",
+            Some(id),
+            format!("updated DID '{}' (id {id})", did.number),
+        ),
+    );
     Ok(Json(did).into_response())
 }
 
@@ -1495,8 +2021,14 @@ async fn delete_did(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     require_superadmin(&user)?;
-    DidService::new(&state.db).delete(id).await.map_err(ApiError::not_found)?;
-    state.audit(&user, AuditEntry::action("delete", "did", Some(id), format!("deleted DID (id {id})")));
+    DidService::new(&state.db)
+        .delete(id)
+        .await
+        .map_err(ApiError::not_found)?;
+    state.audit(
+        &user,
+        AuditEntry::action("delete", "did", Some(id), format!("deleted DID (id {id})")),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1511,6 +2043,7 @@ struct WorkerView {
     max_concurrent: u32,
     available_capacity: u32,
     cpu_usage: f32,
+    labels: HashMap<String, String>,
     nat_type: String,
     registered_at: String,
     last_heartbeat_secs_ago: u64,
@@ -1533,7 +2066,8 @@ async fn list_workers(
         .map(|w| WorkerView {
             healthy: w.is_healthy(now_ms, timeout_ms),
             available_capacity: w.available_capacity(),
-            last_heartbeat_secs_ago: now_ms.saturating_sub(w.last_heartbeat_ms).max(0) as u64 / 1000,
+            last_heartbeat_secs_ago: now_ms.saturating_sub(w.last_heartbeat_ms).max(0) as u64
+                / 1000,
             registered_at: chrono::DateTime::from_timestamp_millis(w.registered_at_ms)
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_default(),
@@ -1543,6 +2077,7 @@ async fn list_workers(
             active_calls: w.active_calls,
             max_concurrent: w.max_concurrent,
             cpu_usage: w.cpu_usage,
+            labels: w.labels,
             nat_type: w.nat_type,
             draining: w.draining,
         })
@@ -1569,7 +2104,11 @@ async fn remove_worker(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     require_superadmin(&user)?;
-    state.workers.remove(&id).await.map_err(ApiError::internal)?;
+    state
+        .workers
+        .remove(&id)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1604,7 +2143,8 @@ async fn list_edges_admin(
         .into_iter()
         .map(|e| EdgeView {
             healthy: e.is_healthy(now_ms, timeout_ms),
-            last_heartbeat_secs_ago: now_ms.saturating_sub(e.last_heartbeat_ms).max(0) as u64 / 1000,
+            last_heartbeat_secs_ago: now_ms.saturating_sub(e.last_heartbeat_ms).max(0) as u64
+                / 1000,
             registered_at: chrono::DateTime::from_timestamp_millis(e.registered_at_ms)
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_default(),
@@ -1655,7 +2195,11 @@ async fn raft_add_learner(
         .add_learner(req.node_id, &req.addr, grpc_addr)
         .await
         .map_err(ApiError::bad)?;
-    Ok((StatusCode::OK, Json(serde_json::json!({"added": req.node_id}))).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"added": req.node_id})),
+    )
+        .into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -1669,6 +2213,10 @@ async fn raft_change_membership(
     Json(req): Json<ChangeMembershipRequest>,
 ) -> ApiResult<Response> {
     require_superadmin(&user)?;
-    state.workers.change_membership(req.voters).await.map_err(ApiError::bad)?;
+    state
+        .workers
+        .change_membership(req.voters)
+        .await
+        .map_err(ApiError::bad)?;
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }

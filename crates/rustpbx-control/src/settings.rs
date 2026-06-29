@@ -8,6 +8,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
 pub const KEY_BASE_DOMAIN: &str = "base_domain";
 pub const KEY_STUN_SERVERS: &str = "stun_servers";
 pub const KEY_RECORDING_POLICY: &str = "recording_policy";
+pub const KEY_CONFIG_VERSION: &str = "config_version";
 
 pub struct PlatformSettings<'a> {
     db: &'a DatabaseConnection,
@@ -50,9 +51,30 @@ impl<'a> PlatformSettings<'a> {
         Ok(())
     }
 
+    /// Monotonic configuration version used by config-watch events.
+    pub async fn config_version(&self) -> u64 {
+        self.get(KEY_CONFIG_VERSION)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_default()
+    }
+
+    /// Increment and persist the configuration version.
+    pub async fn bump_config_version(&self) -> Result<u64> {
+        let next = self.config_version().await.saturating_add(1);
+        self.set(KEY_CONFIG_VERSION, &next.to_string()).await?;
+        Ok(next)
+    }
+
     /// Convenience: the configured wildcard base domain (empty string if unset).
     pub async fn base_domain(&self) -> String {
-        self.get(KEY_BASE_DOMAIN).await.ok().flatten().unwrap_or_default()
+        self.get(KEY_BASE_DOMAIN)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     /// Centrally-managed STUN server list (`host:port`), stored as a JSON array.

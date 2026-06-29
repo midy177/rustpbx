@@ -46,6 +46,10 @@ stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 # sources skip ACL/Auth and decode X-* routing headers.
 trusted_workers = ["10.0.0.0/24"]
 
+# Optional Worker label constraints. When set, this Edge only dispatches calls
+# to Workers that registered all matching labels.
+worker_required_labels = { region = "us-east", tier = "default" }
+
 # EdgeWorker gRPC listen address (host:port). When set, the Edge serves
 # CallStateUpdate so Workers can report terminal call state out-of-band.
 # edge_worker_addr = "0.0.0.0:9093"

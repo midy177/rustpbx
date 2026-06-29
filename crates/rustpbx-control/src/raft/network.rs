@@ -111,6 +111,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NetworkError> {
 }
 
 /// Decode a `WireResult` reply into the openraft `Result<T, RPCError>` shape.
+#[allow(clippy::result_large_err)]
 fn decode_reply<T, E>(
     target: NodeId,
     bytes: &[u8],

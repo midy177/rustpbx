@@ -5,6 +5,7 @@
 /// most available capacity (max_concurrent - active_calls).
 use crate::grpc_client::GrpcControlClient;
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -23,20 +24,32 @@ pub struct WorkerEndpoint {
 
 pub struct WorkerSelector {
     client: Arc<RwLock<GrpcControlClient>>,
+    required_labels: HashMap<String, String>,
 }
 
 impl WorkerSelector {
-    pub fn new(client: Arc<RwLock<GrpcControlClient>>) -> Self {
-        Self { client }
+    pub fn new(
+        client: Arc<RwLock<GrpcControlClient>>,
+        required_labels: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            client,
+            required_labels,
+        }
     }
 
     /// Query Control Plane and return the best worker for a new call.
     pub async fn select(&self, tenant_id: Option<i64>) -> Result<WorkerEndpoint> {
         let mut client = self.client.write().await;
-        let list = client.get_available_workers(tenant_id).await?;
+        let list = client
+            .get_available_workers(tenant_id, self.required_labels.clone())
+            .await?;
 
         if list.workers.is_empty() {
-            return Err(anyhow!("no available workers"));
+            return Err(anyhow!(
+                "no available workers matching labels {:?}",
+                self.required_labels
+            ));
         }
 
         // Workers are already sorted by available capacity (Control Plane does this).
@@ -48,6 +61,7 @@ impl WorkerSelector {
             sip_addr = %best.sip_addr,
             active = best.active_calls,
             max = best.max_concurrent,
+            labels = ?best.labels,
             "selected worker"
         );
 

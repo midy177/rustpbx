@@ -28,10 +28,7 @@ use rustpbx::{
     callrecord::CallRecordManagerBuilder,
     config::ProxyConfig,
     proxy::{
-        acl::AclModule,
-        auth::AuthModule,
-        call::CallModule,
-        data::ProxyDataContext,
+        acl::AclModule, auth::AuthModule, call::CallModule, data::ProxyDataContext,
         server::SipServerBuilder,
     },
 };
@@ -111,7 +108,8 @@ async fn main() -> Result<()> {
         &cfg.control_plane_addr,
         cfg.edge_id.clone(),
         cp_tls.as_ref(),
-    ).await?;
+    )
+    .await?;
     let grpc_client = Arc::new(tokio::sync::RwLock::new(grpc_client));
 
     // ── GrpcConfigSource ──────────────────────────────────────────────────────
@@ -126,7 +124,10 @@ async fn main() -> Result<()> {
     );
 
     // ── Worker selector ───────────────────────────────────────────────────────
-    let worker_selector = Arc::new(WorkerSelector::new(Arc::clone(&grpc_client)));
+    let worker_selector = Arc::new(WorkerSelector::new(
+        Arc::clone(&grpc_client),
+        cfg.worker_required_labels.clone(),
+    ));
 
     // ── CancellationToken ─────────────────────────────────────────────────────
     let cancel = CancellationToken::new();
@@ -141,7 +142,11 @@ async fn main() -> Result<()> {
     // fall back to the node's local config when none is configured/reachable.
     let central_stun =
         grpc_client::fetch_platform_stun(&cfg.control_plane_addr, cp_tls.as_ref()).await;
-    let stun = if central_stun.is_empty() { cfg.stun_servers.clone() } else { central_stun };
+    let stun = if central_stun.is_empty() {
+        cfg.stun_servers.clone()
+    } else {
+        central_stun
+    };
     let nat = rustpbx_netprobe::probe(&stun, std::time::Duration::from_secs(3)).await;
     info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
     if cfg.public_ip.is_none()
@@ -155,9 +160,12 @@ async fn main() -> Result<()> {
     // Edges aren't load-selected; this just lets the admin console see which
     // edges are alive, their address/version/region, and health.
     {
-        let mut reg_client =
-            GrpcControlClient::connect(&cfg.control_plane_addr, cfg.edge_id.clone(), cp_tls.as_ref())
-                .await?;
+        let mut reg_client = GrpcControlClient::connect(
+            &cfg.control_plane_addr,
+            cfg.edge_id.clone(),
+            cp_tls.as_ref(),
+        )
+        .await?;
         let info = build_edge_info(&cfg, &nat.nat_type);
         match reg_client.register_edge(info.clone()).await {
             Ok(_) => {
@@ -212,8 +220,9 @@ async fn main() -> Result<()> {
     // `active_calls` on completion. The authoritative CDR is reported by the
     // worker, so the edge uploads nothing.
     let mut cdr_builder = CallRecordManagerBuilder::new().with_cancel_token(cancel.clone());
-    let active_hook: Box<dyn rustpbx::callrecord::CallRecordHook> =
-        Box::new(EdgeActiveCallHook { active_calls: Arc::clone(&active_calls) });
+    let active_hook: Box<dyn rustpbx::callrecord::CallRecordHook> = Box::new(EdgeActiveCallHook {
+        active_calls: Arc::clone(&active_calls),
+    });
     cdr_builder = cdr_builder.with_hook(active_hook);
     let mut cdr_manager = cdr_builder.build().await?;
     let cdr_sender = cdr_manager.sender.clone();
@@ -292,7 +301,10 @@ async fn main() -> Result<()> {
 
 /// Build the EdgeInfo reported to the Control Plane (for the admin console).
 fn build_edge_info(cfg: &EdgeConfig, nat_type: &str) -> crate::proto::control::EdgeInfo {
-    let host = cfg.public_ip.clone().unwrap_or_else(|| cfg.sip_addr.clone());
+    let host = cfg
+        .public_ip
+        .clone()
+        .unwrap_or_else(|| cfg.sip_addr.clone());
     // The Edge always listens on TCP too (build_proxy_config sets tcp_port =
     // tcp_port>0 ? tcp_port : udp_port), so it's always advertised. TLS is
     // optional (only when tls_port > 0).
@@ -319,9 +331,22 @@ fn build_proxy_config(cfg: &EdgeConfig) -> ProxyConfig {
         // Always listen on TCP so Workers can reach the Edge over a persistent
         // TCP connection (worker→edge outbound + in-dialog). Defaults to the
         // main SIP port unless an explicit tcp_port is configured.
-        tcp_port: Some(if cfg.tcp_port > 0 { cfg.tcp_port } else { cfg.udp_port }),
-        tls_port: if cfg.tls_port > 0 { Some(cfg.tls_port) } else { None },
-        modules: Some(vec!["internal-peer".into(), "acl".into(), "auth".into(), "call".into()]),
+        tcp_port: Some(if cfg.tcp_port > 0 {
+            cfg.tcp_port
+        } else {
+            cfg.udp_port
+        }),
+        tls_port: if cfg.tls_port > 0 {
+            Some(cfg.tls_port)
+        } else {
+            None
+        },
+        modules: Some(vec![
+            "internal-peer".into(),
+            "acl".into(),
+            "auth".into(),
+            "call".into(),
+        ]),
         ..Default::default()
     }
 }

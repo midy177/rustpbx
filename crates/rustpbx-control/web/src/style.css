@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* stylelint-disable-next-line at-rule-no-unknown -- Tailwind CSS v4 directive. */
 @custom-variant dark (&:is(.dark *));
 
 :root {

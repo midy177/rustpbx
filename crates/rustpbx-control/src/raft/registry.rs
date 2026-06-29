@@ -5,7 +5,7 @@
 //! join), and reads are served from the local state machine. In single-node
 //! mode this node is the only voter, so writes commit immediately.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use super::log_store::LogStore;
 use super::network::NetworkFactory;
 use super::state_machine::StateMachineStore;
 use super::types::{
-    node_addr, EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
+    EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord, node_addr,
 };
 
 /// Current wall-clock in unix-millis. Used by the leader to stamp commands so
@@ -118,13 +118,17 @@ impl RaftRegistry {
             let mut members = BTreeMap::new();
             members.insert(node_id, node_addr::make(advertise_addr, grpc_addr));
             match this.raft.initialize(members).await {
-                Ok(()) => info!(node_id, advertise_addr, grpc_addr, "raft cluster bootstrapped (single voter)"),
+                Ok(()) => info!(
+                    node_id,
+                    advertise_addr, grpc_addr, "raft cluster bootstrapped (single voter)"
+                ),
                 Err(e) => info!(node_id, error = %e, "raft bootstrap skipped"),
             }
         } else {
             info!(
                 node_id,
-                advertise_addr, "raft node started uninitialized; awaiting join from a cluster leader"
+                advertise_addr,
+                "raft node started uninitialized; awaiting join from a cluster leader"
             );
         }
 
@@ -145,7 +149,12 @@ impl RaftRegistry {
     /// `raft_addr` is the new node's Raft transport addr; `grpc_addr` its
     /// business gRPC addr (used for write-forwarding). First step of joining a
     /// new replica; follow with `change_membership` to promote it to a voter.
-    pub async fn add_learner(&self, node_id: NodeId, raft_addr: &str, grpc_addr: &str) -> Result<()> {
+    pub async fn add_learner(
+        &self,
+        node_id: NodeId,
+        raft_addr: &str,
+        grpc_addr: &str,
+    ) -> Result<()> {
         self.raft
             .add_learner(node_id, node_addr::make(raft_addr, grpc_addr), true)
             .await?;
@@ -154,7 +163,10 @@ impl RaftRegistry {
 
     /// Set the cluster's voter membership to exactly `voters`. Learners not in
     /// the set are retained as learners (`retain = true`).
-    pub async fn change_membership(&self, voters: std::collections::BTreeSet<NodeId>) -> Result<()> {
+    pub async fn change_membership(
+        &self,
+        voters: std::collections::BTreeSet<NodeId>,
+    ) -> Result<()> {
         self.raft.change_membership(voters, true).await?;
         Ok(())
     }
@@ -294,7 +306,9 @@ impl RaftRegistry {
     pub async fn reap_stale(&self) -> Result<u32> {
         let threshold_ms = (self.heartbeat_timeout.as_millis() as i64) * 2;
         let before_ms = now_ms() - threshold_ms;
-        let resp = self.propose(RegistryCommand::ReapStale { before_ms }).await?;
+        let resp = self
+            .propose(RegistryCommand::ReapStale { before_ms })
+            .await?;
         Ok(resp.removed)
     }
 
@@ -312,7 +326,8 @@ impl RaftRegistry {
             record.registered_at_ms = now;
         }
         record.last_heartbeat_ms = now;
-        self.propose(RegistryCommand::RegisterEdge { record }).await?;
+        self.propose(RegistryCommand::RegisterEdge { record })
+            .await?;
         Ok(())
     }
 
@@ -333,7 +348,9 @@ impl RaftRegistry {
     pub async fn reap_stale_edges(&self) -> Result<u32> {
         let threshold_ms = (self.heartbeat_timeout.as_millis() as i64) * 2;
         let before_ms = now_ms() - threshold_ms;
-        let resp = self.propose(RegistryCommand::ReapStaleEdges { before_ms }).await?;
+        let resp = self
+            .propose(RegistryCommand::ReapStaleEdges { before_ms })
+            .await?;
         Ok(resp.removed)
     }
 
@@ -366,7 +383,9 @@ impl RaftRegistry {
     /// Release a call slot (on CDR). Returns whether a slot was held.
     pub async fn release_call_slot(&self, call_id: &str) -> Result<bool> {
         let resp = self
-            .propose(RegistryCommand::ReleaseCallSlot { call_id: call_id.to_string() })
+            .propose(RegistryCommand::ReleaseCallSlot {
+                call_id: call_id.to_string(),
+            })
             .await?;
         Ok(resp.removed > 0)
     }
@@ -374,7 +393,9 @@ impl RaftRegistry {
     /// Reap call slots older than `ttl` (crash/leak backstop). Returns the count.
     pub async fn reap_call_slots(&self, ttl: Duration) -> Result<u32> {
         let before_ms = now_ms() - ttl.as_millis() as i64;
-        let resp = self.propose(RegistryCommand::ReapCallSlots { before_ms }).await?;
+        let resp = self
+            .propose(RegistryCommand::ReapCallSlots { before_ms })
+            .await?;
         Ok(resp.removed)
     }
 
@@ -389,7 +410,16 @@ impl RaftRegistry {
     }
 
     /// Healthy workers with spare capacity, most-available first.
+    #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
+        self.available_with_labels(&HashMap::new()).await
+    }
+
+    /// Healthy workers matching all required labels, most-available first.
+    pub async fn available_with_labels(
+        &self,
+        required_labels: &HashMap<String, String>,
+    ) -> Vec<WorkerRecord> {
         let now = now_ms();
         let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
         let mut workers: Vec<WorkerRecord> = self
@@ -398,6 +428,11 @@ impl RaftRegistry {
             .await
             .into_iter()
             .filter(|w| w.is_healthy(now, timeout_ms))
+            .filter(|w| {
+                required_labels
+                    .iter()
+                    .all(|(k, v)| w.labels.get(k) == Some(v))
+            })
             .collect();
         workers.sort_by_key(|w| std::cmp::Reverse(w.available_capacity()));
         workers
@@ -418,6 +453,7 @@ mod tests {
             max_concurrent: 100,
             active_calls: 0,
             cpu_usage: 0.0,
+            labels: Default::default(),
             edge_worker_addr: String::new(),
             nat_type: String::new(),
             registered_at_ms: 0,
@@ -442,7 +478,9 @@ mod tests {
     }
 
     async fn start() -> RaftRegistry {
-        RaftRegistry::start(1, Duration::from_secs(30)).await.unwrap()
+        RaftRegistry::start(1, Duration::from_secs(30))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -455,7 +493,12 @@ mod tests {
         // Heartbeat updates load and is known; unknown edge reports not-known.
         assert!(reg.edge_heartbeat("edge-1", 5).await.unwrap());
         assert!(!reg.edge_heartbeat("ghost", 1).await.unwrap());
-        let e1 = reg.all_edges().await.into_iter().find(|e| e.edge_id == "edge-1").unwrap();
+        let e1 = reg
+            .all_edges()
+            .await
+            .into_iter()
+            .find(|e| e.edge_id == "edge-1")
+            .unwrap();
         assert_eq!(e1.active_calls, 5);
 
         // Force edge-2 stale, then reap.
@@ -469,7 +512,12 @@ mod tests {
             .unwrap();
         let removed = reg.reap_stale_edges().await.unwrap();
         assert_eq!(removed, 1, "only the stale edge is reaped");
-        let ids: Vec<String> = reg.all_edges().await.into_iter().map(|e| e.edge_id).collect();
+        let ids: Vec<String> = reg
+            .all_edges()
+            .await
+            .into_iter()
+            .map(|e| e.edge_id)
+            .collect();
         assert_eq!(ids, vec!["edge-1".to_string()]);
         // Worker registry is unaffected by edge commands.
         assert!(reg.all().await.is_empty());
@@ -529,7 +577,10 @@ mod tests {
         assert_eq!(reg.tenant_active_calls(1).await, 2);
 
         // Reaping with any positive TTL drops the ancient slot, keeps the live one.
-        let removed = reg.reap_call_slots(Duration::from_secs(3600)).await.unwrap();
+        let removed = reg
+            .reap_call_slots(Duration::from_secs(3600))
+            .await
+            .unwrap();
         assert_eq!(removed, 1, "only the leaked slot is reaped");
         assert_eq!(reg.tenant_active_calls(1).await, 1);
         assert_eq!(reg.total_call_slots().await, 1);
@@ -542,7 +593,11 @@ mod tests {
         reg.register(rec("w2")).await.unwrap();
 
         let all = reg.all().await;
-        assert_eq!(all.len(), 2, "both workers should be committed and readable");
+        assert_eq!(
+            all.len(),
+            2,
+            "both workers should be committed and readable"
+        );
 
         let avail = reg.available().await;
         assert_eq!(avail.len(), 2, "fresh workers are healthy and available");
@@ -559,7 +614,12 @@ mod tests {
         let unknown = reg.heartbeat("ghost", 1, 0.1).await.unwrap();
         assert!(!unknown, "heartbeat for an unregistered worker is unknown");
 
-        let w = reg.all().await.into_iter().find(|w| w.worker_id == "w1").unwrap();
+        let w = reg
+            .all()
+            .await
+            .into_iter()
+            .find(|w| w.worker_id == "w1")
+            .unwrap();
         assert_eq!(w.active_calls, 7, "heartbeat updates active_calls");
     }
 
@@ -621,13 +681,15 @@ mod tests {
 
         // Node 1 bootstraps a single-voter cluster advertising its real addr.
         // (grpc_addr unused here — this test writes only on the leader.)
-        let n1 = RaftRegistry::start_cluster(1, &addr1.to_string(), &addr1.to_string(), true, hb, None)
-            .await
-            .unwrap();
+        let n1 =
+            RaftRegistry::start_cluster(1, &addr1.to_string(), &addr1.to_string(), true, hb, None)
+                .await
+                .unwrap();
         // Node 2 starts uninitialized, waiting to be added.
-        let n2 = RaftRegistry::start_cluster(2, &addr2.to_string(), &addr2.to_string(), false, hb, None)
-            .await
-            .unwrap();
+        let n2 =
+            RaftRegistry::start_cluster(2, &addr2.to_string(), &addr2.to_string(), false, hb, None)
+                .await
+                .unwrap();
 
         spawn_raft_server(&n1, addr1);
         spawn_raft_server(&n2, addr2);
@@ -636,7 +698,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Join node 2: learner first, then promote both to voters.
-        n1.add_learner(2, &addr2.to_string(), &addr2.to_string()).await.unwrap();
+        n1.add_learner(2, &addr2.to_string(), &addr2.to_string())
+            .await
+            .unwrap();
         n1.change_membership([1, 2].into_iter().collect())
             .await
             .unwrap();
@@ -648,7 +712,12 @@ mod tests {
         let mut found = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if n2.all().await.iter().any(|w| w.worker_id == "replicated-worker") {
+            if n2
+                .all()
+                .await
+                .iter()
+                .any(|w| w.worker_id == "replicated-worker")
+            {
                 found = true;
                 break;
             }
@@ -695,12 +764,14 @@ mod tests {
         let hb = Duration::from_secs(30);
 
         // Each node advertises its raft addr + its business grpc addr.
-        let n1 = RaftRegistry::start_cluster(1, &raft1.to_string(), &grpc1.to_string(), true, hb, None)
-            .await
-            .unwrap();
-        let n2 = RaftRegistry::start_cluster(2, &raft2.to_string(), &grpc2.to_string(), false, hb, None)
-            .await
-            .unwrap();
+        let n1 =
+            RaftRegistry::start_cluster(1, &raft1.to_string(), &grpc1.to_string(), true, hb, None)
+                .await
+                .unwrap();
+        let n2 =
+            RaftRegistry::start_cluster(2, &raft2.to_string(), &grpc2.to_string(), false, hb, None)
+                .await
+                .unwrap();
 
         spawn_raft_server(&n1, raft1);
         spawn_raft_server(&n2, raft2);
@@ -708,8 +779,12 @@ mod tests {
         spawn_control_server(&n2, grpc2).await;
 
         tokio::time::sleep(Duration::from_millis(500)).await;
-        n1.add_learner(2, &raft2.to_string(), &grpc2.to_string()).await.unwrap();
-        n1.change_membership([1, 2].into_iter().collect()).await.unwrap();
+        n1.add_learner(2, &raft2.to_string(), &grpc2.to_string())
+            .await
+            .unwrap();
+        n1.change_membership([1, 2].into_iter().collect())
+            .await
+            .unwrap();
 
         // Write on the FOLLOWER (node 2). Must succeed via forwarding.
         n2.register(rec("forwarded-worker")).await.unwrap();
@@ -718,14 +793,22 @@ mod tests {
         let mut on_leader = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if n1.all().await.iter().any(|w| w.worker_id == "forwarded-worker") {
+            if n1
+                .all()
+                .await
+                .iter()
+                .any(|w| w.worker_id == "forwarded-worker")
+            {
                 on_leader = true;
                 break;
             }
         }
         assert!(on_leader, "forwarded write must commit on the leader");
         assert!(
-            n2.all().await.iter().any(|w| w.worker_id == "forwarded-worker"),
+            n2.all()
+                .await
+                .iter()
+                .any(|w| w.worker_id == "forwarded-worker"),
             "and replicate back to the follower"
         );
     }
@@ -763,9 +846,10 @@ mod tests {
         let key_pem = ck.signing_key.serialize_pem();
 
         let server_tls = || {
-            tonic::transport::ServerTlsConfig::new().identity(
-                tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone()),
-            )
+            tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+                cert_pem.clone(),
+                key_pem.clone(),
+            ))
         };
         let client_tls = tonic::transport::ClientTlsConfig::new()
             .ca_certificate(tonic::transport::Certificate::from_pem(cert_pem.clone()))
@@ -790,7 +874,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         n1.add_learner(2, &adv2, &adv2).await.unwrap();
-        n1.change_membership([1, 2].into_iter().collect()).await.unwrap();
+        n1.change_membership([1, 2].into_iter().collect())
+            .await
+            .unwrap();
 
         n1.register(rec("tls-worker")).await.unwrap();
 

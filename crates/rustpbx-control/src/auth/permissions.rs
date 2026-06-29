@@ -1,10 +1,10 @@
 //! Role + permission model for the admin console.
 //!
 //! Three principal kinds:
-//!   - `superadmin`   — platform operator (config account, `tenant_id = None`).
-//!   - `tenant_admin` — a tenant's IAM admin; implicitly holds every permission
-//!                      *within its own tenant* (incl. managing sub-users).
-//!   - `tenant_user`  — a tenant sub-account limited to its granted permissions.
+//! - `superadmin`   — platform operator (config account, `tenant_id = None`).
+//! - `tenant_admin` — a tenant's IAM admin; implicitly holds every permission
+//!   *within its own tenant* (incl. managing sub-users).
+//! - `tenant_user`  — a tenant sub-account limited to its granted permissions.
 //!
 //! Permissions are fine-grained `"<resource>:<action>"` strings. They only ever
 //! constrain `tenant_user`; admins bypass the check (but are still confined to

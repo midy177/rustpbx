@@ -32,10 +32,14 @@ pub fn default_domain(tenant_id: i64, base_domain: &str) -> Option<String> {
 /// otherwise the auto-assigned default. The default is always *reserved* for the
 /// tenant even while a custom domain is active.
 pub fn active_domain(t: &Model, base_domain: &str) -> Option<String> {
-    if t.custom_domain_enabled {
-        if let Some(c) = t.custom_domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return Some(c.to_string());
-        }
+    if t.custom_domain_enabled
+        && let Some(c) = t
+            .custom_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(c.to_string());
     }
     default_domain(t.id, base_domain)
 }
@@ -182,10 +186,9 @@ impl<'a> TenantService<'a> {
             storage_prefix: Set(req.storage_prefix.clone()),
             custom_domain: Set(custom_domain.clone()),
             custom_domain_enabled: Set(custom_domain.is_some()),
-            metadata: Set(req.metadata.clone().map(sea_orm::prelude::Json::from)),
+            metadata: Set(req.metadata.clone()),
             created_at: Set(now),
             updated_at: Set(now),
-            ..Default::default()
         };
         let row = model.insert(self.db).await?;
         Ok(self.to_response(row))
@@ -223,7 +226,7 @@ impl<'a> TenantService<'a> {
             model.storage_prefix = Set(Some(v));
         }
         if let Some(v) = req.metadata {
-            model.metadata = Set(Some(sea_orm::prelude::Json::from(v)));
+            model.metadata = Set(Some(v));
         }
         model.updated_at = Set(Utc::now());
 
@@ -283,15 +286,13 @@ impl<'a> TenantService<'a> {
         let base = self.base_domain.trim();
         if !base.is_empty() {
             let suffix = format!(".{base}");
-            if let Some(prefix) = domain.strip_suffix(&suffix) {
-                if let Ok(id) = prefix.parse::<i64>() {
-                    if let Some(t) = Entity::find_by_id(id).one(self.db).await?
-                        && t.status != TenantStatus::Deleted
-                        && active_domain(&t, base).as_deref() == Some(domain)
-                    {
-                        return Ok(Some(t));
-                    }
-                }
+            if let Some(prefix) = domain.strip_suffix(&suffix)
+                && let Ok(id) = prefix.parse::<i64>()
+                && let Some(t) = Entity::find_by_id(id).one(self.db).await?
+                && t.status != TenantStatus::Deleted
+                && active_domain(&t, base).as_deref() == Some(domain)
+            {
+                return Ok(Some(t));
             }
         }
         Ok(None)

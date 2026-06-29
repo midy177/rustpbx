@@ -27,6 +27,7 @@ use dashmap::DashMap;
 use sea_orm::Database;
 use sea_orm_migration::{MigratorTrait, SchemaManager};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::time::Duration;
 use tracing::info;
 
@@ -103,7 +104,11 @@ async fn main() -> Result<()> {
         let bootstrap = node_id == 1;
         // The business gRPC addr is advertised alongside the Raft addr so a
         // follower can forward writes to the leader's ControlPlane service.
-        let client_tls = cfg.tls.is_enabled().then(|| cfg.tls.client_tls()).transpose()?;
+        let client_tls = cfg
+            .tls
+            .is_enabled()
+            .then(|| cfg.tls.client_tls())
+            .transpose()?;
         RaftRegistry::start_cluster(
             node_id,
             &advertise,
@@ -121,7 +126,11 @@ async fn main() -> Result<()> {
     if cfg.raft.is_cluster_mode() {
         let raft_addr: std::net::SocketAddr = cfg.raft.addr.parse()?;
         let raft_server = raft::server::RaftServer::new(workers.raft().clone());
-        let tls = cfg.tls.is_enabled().then(|| cfg.tls.server_tls()).transpose()?;
+        let tls = cfg
+            .tls
+            .is_enabled()
+            .then(|| cfg.tls.server_tls())
+            .transpose()?;
         info!(%raft_addr, node_id = cfg.raft.node_id, tls = tls.is_some(), "raft transport listening");
         tokio::spawn(async move {
             let svc = grpc::proto::raft::raft_service_server::RaftServiceServer::new(raft_server);
@@ -168,7 +177,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let svc = ControlPlaneService::new(Arc::clone(&store), workers.clone());
+    let (config_change_tx, _) = broadcast::channel(256);
+    let svc = ControlPlaneService::with_change_tx(
+        Arc::clone(&store),
+        workers.clone(),
+        config_change_tx.clone(),
+    );
     let grpc_svc = ControlPlaneServer::new(svc);
 
     // ── HTTP admin API + SPA ────────────────────────────────────────────────
@@ -180,6 +194,7 @@ async fn main() -> Result<()> {
         login_gate: Arc::new(DashMap::new()),
         admin_username: cfg.admin_username.clone(),
         admin_password: cfg.admin_password.clone(),
+        config_change_tx,
     };
     let http_router = http_api::build_router(http_state);
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;

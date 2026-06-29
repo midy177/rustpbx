@@ -29,18 +29,13 @@ impl TrackSelector {
 }
 
 /// Recording container format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordingFormat {
     /// Uncompressed WAV — default, lowest CPU.
+    #[default]
     Wav,
     /// Opus in OGG container — smaller files, more CPU.
     OpusOgg,
-}
-
-impl Default for RecordingFormat {
-    fn default() -> Self {
-        RecordingFormat::Wav
-    }
 }
 
 /// Source for playback operations.
@@ -117,10 +112,7 @@ pub enum MediaCommand {
 
     // ── Mute / hold ─────────────────────────────────────────────────────────
     /// Mute or unmute a track's outbound audio (towards the far end).
-    Mute {
-        track: TrackSelector,
-        muted: bool,
-    },
+    Mute { track: TrackSelector, muted: bool },
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
     /// Renegotiate media after a re-INVITE (rtp_gateway re-evaluates codecs).
@@ -175,18 +167,12 @@ pub struct QualityReport {
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
     /// Inbound DTMF digit detected from the far end.
-    DtmfDetected {
-        digit: char,
-        track: TrackSelector,
-    },
+    DtmfDetected { digit: char, track: TrackSelector },
 
     /// Recording finished successfully (StopRecording or max_duration reached).
     RecordingCompleted(RecordingResult),
     /// Recording failed (disk full, permission denied, codec error).
-    RecordingFailed {
-        path: PathBuf,
-        error: String,
-    },
+    RecordingFailed { path: PathBuf, error: String },
 
     /// Playback finished naturally (end of file, not interrupted).
     PlayCompleted { track_id: String },
@@ -205,10 +191,7 @@ pub enum MediaEvent {
     /// Non-fatal warning (e.g., jitter buffer underrun recovered).
     MediaWarning { message: String },
     /// Fatal media error — business logic should hang up the call.
-    MediaError {
-        error: String,
-        fatal: bool,
-    },
+    MediaError { error: String, fatal: bool },
 }
 
 impl MediaEvent {

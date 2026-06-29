@@ -29,18 +29,13 @@ pub const H_RECORD: &str = "X-Record";
 pub const H_MAX_DURATION: &str = "X-Max-Duration";
 
 /// What the Edge decided to do with this call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteAction {
+    #[default]
     Forward,
     Queue,
     Application,
-}
-
-impl Default for RouteAction {
-    fn default() -> Self {
-        RouteAction::Forward
-    }
 }
 
 impl RouteAction {
@@ -51,29 +46,28 @@ impl RouteAction {
             RouteAction::Application => "application",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for RouteAction {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "forward" => Some(RouteAction::Forward),
-            "queue" => Some(RouteAction::Queue),
-            "application" => Some(RouteAction::Application),
-            _ => None,
+            "forward" => Ok(RouteAction::Forward),
+            "queue" => Ok(RouteAction::Queue),
+            "application" => Ok(RouteAction::Application),
+            _ => Err(()),
         }
     }
 }
 
 /// Dial strategy for Forward action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DialStrategyKind {
+    #[default]
     Sequential,
     Parallel,
-}
-
-impl Default for DialStrategyKind {
-    fn default() -> Self {
-        DialStrategyKind::Sequential
-    }
 }
 
 impl DialStrategyKind {
@@ -83,28 +77,27 @@ impl DialStrategyKind {
             DialStrategyKind::Parallel => "parallel",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "parallel" => DialStrategyKind::Parallel,
-            _ => DialStrategyKind::Sequential,
-        }
+impl std::str::FromStr for DialStrategyKind {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "parallel" => Self::Parallel,
+            _ => Self::Sequential,
+        })
     }
 }
 
 /// Call direction as determined by the Edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum InternalDirection {
+    #[default]
     Inbound,
     Outbound,
     Internal,
-}
-
-impl Default for InternalDirection {
-    fn default() -> Self {
-        InternalDirection::Inbound
-    }
 }
 
 impl InternalDirection {
@@ -115,13 +108,17 @@ impl InternalDirection {
             InternalDirection::Internal => "internal",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for InternalDirection {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "inbound" => Some(InternalDirection::Inbound),
-            "outbound" => Some(InternalDirection::Outbound),
-            "internal" => Some(InternalDirection::Internal),
-            _ => None,
+            "inbound" => Ok(InternalDirection::Inbound),
+            "outbound" => Ok(InternalDirection::Outbound),
+            "internal" => Ok(InternalDirection::Internal),
+            _ => Err(()),
         }
     }
 }
@@ -222,13 +219,13 @@ impl InternalCallContext {
         let get = |name: &str| -> Option<String> { map.get(&name.to_ascii_lowercase()).cloned() };
 
         let action_str = get(H_ROUTE_ACTION)?;
-        let action = RouteAction::from_str(&action_str)?;
+        let action = action_str.parse().ok()?;
 
         let edge_id = get(H_EDGE_ID)?;
         let trunk_name = get(H_TRUNK_NAME)?;
         let direction = get(H_DIRECTION)
             .as_deref()
-            .and_then(InternalDirection::from_str)
+            .and_then(|s| s.parse().ok())
             .unwrap_or(InternalDirection::Inbound);
 
         let original_from = get(H_ORIGINAL_FROM).unwrap_or_default();
@@ -246,7 +243,7 @@ impl InternalCallContext {
 
         let dial_strategy = get(H_DIAL_STRATEGY)
             .as_deref()
-            .map(DialStrategyKind::from_str)
+            .map(|s| s.parse().unwrap_or_default())
             .unwrap_or_default();
 
         let tenant_id = get(H_TENANT_ID).and_then(|s| s.parse().ok());
@@ -295,7 +292,10 @@ mod tests {
             action: RouteAction::Forward,
             original_from: "sip:+861390000@carrier".into(),
             original_to: "sip:1001@pbx".into(),
-            targets: vec!["sip:1001@10.0.0.5:5060".into(), "sip:1002@10.0.0.6:5060".into()],
+            targets: vec![
+                "sip:1001@10.0.0.5:5060".into(),
+                "sip:1002@10.0.0.6:5060".into(),
+            ],
             dial_strategy: DialStrategyKind::Parallel,
             ..Default::default()
         };
@@ -304,7 +304,10 @@ mod tests {
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
             .collect();
-        let ref_pairs: Vec<(&str, &str)> = pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let ref_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         let decoded = InternalCallContext::from_header_pairs(ref_pairs).expect("decode");
         assert_eq!(decoded.edge_id, "edge-1");
         assert_eq!(decoded.tenant_id, Some(42));
@@ -334,7 +337,10 @@ mod tests {
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
             .collect();
-        let ref_pairs: Vec<(&str, &str)> = pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let ref_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         let decoded = InternalCallContext::from_header_pairs(ref_pairs).expect("decode");
         assert_eq!(decoded.action, RouteAction::Application);
         assert_eq!(decoded.app_name.as_deref(), Some("ivr-welcome"));
@@ -350,10 +356,14 @@ mod tests {
 
     #[test]
     fn action_roundtrip() {
-        for a in [RouteAction::Forward, RouteAction::Queue, RouteAction::Application] {
-            assert_eq!(RouteAction::from_str(a.as_str()), Some(a));
+        for a in [
+            RouteAction::Forward,
+            RouteAction::Queue,
+            RouteAction::Application,
+        ] {
+            assert_eq!(a.as_str().parse::<RouteAction>(), Ok(a));
         }
-        assert!(RouteAction::from_str("unknown").is_none());
+        assert!("unknown".parse::<RouteAction>().is_err());
     }
 
     #[test]
@@ -375,8 +385,10 @@ mod tests {
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
             .collect();
-        let ref_pairs: Vec<(&str, &str)> =
-            pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        let ref_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         let decoded = InternalCallContext::from_header_pairs(ref_pairs).expect("decode");
         assert_eq!(decoded.direction, InternalDirection::Outbound);
         assert_eq!(decoded.trunk_name, "carrier-a");

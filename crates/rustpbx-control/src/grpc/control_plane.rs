@@ -2,9 +2,9 @@ use crate::{
     grpc::proto::control::{
         AclRuleList, AcquireSlotRequest, AcquireSlotResponse, CallRecordReport, ConfigChangeEvent,
         EdgeHeartbeatRequest, EdgeInfo, GetAclRulesRequest, GetRouteRulesRequest,
-        GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest, HeartbeatResponse, RegisterAck,
-        ReportAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerInfo, WorkerList,
-        control_plane_server::ControlPlane,
+        GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest, HeartbeatResponse,
+        RegisterAck, ReportAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerInfo,
+        WorkerList, control_plane_server::ControlPlane,
     },
     raft::registry::RaftRegistry,
     store::Store,
@@ -12,8 +12,8 @@ use crate::{
 use futures::Stream;
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -24,9 +24,26 @@ pub struct ControlPlaneService {
 }
 
 impl ControlPlaneService {
+    #[cfg(test)]
     pub fn new(store: Arc<Store>, workers: RaftRegistry) -> Self {
         let (change_tx, _) = broadcast::channel(256);
-        Self { store, workers, change_tx }
+        Self {
+            store,
+            workers,
+            change_tx,
+        }
+    }
+
+    pub fn with_change_tx(
+        store: Arc<Store>,
+        workers: RaftRegistry,
+        change_tx: broadcast::Sender<ConfigChangeEvent>,
+    ) -> Self {
+        Self {
+            store,
+            workers,
+            change_tx,
+        }
     }
 
     /// Broadcast a config-change event to all streaming watchers.
@@ -51,14 +68,10 @@ impl ControlPlane for ControlPlaneService {
         let req = request.into_inner();
         info!(edge_id = ?req.edge_id, tenant_id = ?req.tenant_id, "get_trunk_configs");
 
-        let trunks = self
-            .store
-            .load_trunks(req.tenant_id)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "db error loading trunks");
-                Status::internal(e.to_string())
-            })?;
+        let trunks = self.store.load_trunks(req.tenant_id).await.map_err(|e| {
+            warn!(error = %e, "db error loading trunks");
+            Status::internal(e.to_string())
+        })?;
 
         info!(count = trunks.len(), "trunk configs sent");
         Ok(Response::new(TrunkConfigList {
@@ -74,14 +87,10 @@ impl ControlPlane for ControlPlaneService {
         let req = request.into_inner();
         info!(tenant_id = ?req.tenant_id, "get_route_rules");
 
-        let rules = self
-            .store
-            .load_routes(req.tenant_id)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "db error loading routes");
-                Status::internal(e.to_string())
-            })?;
+        let rules = self.store.load_routes(req.tenant_id).await.map_err(|e| {
+            warn!(error = %e, "db error loading routes");
+            Status::internal(e.to_string())
+        })?;
 
         info!(count = rules.len(), "route rules sent");
         Ok(Response::new(RouteRuleList {
@@ -103,7 +112,10 @@ impl ControlPlane for ControlPlaneService {
             .await
             .map_err(|e| Status::internal(format!("load acl rules: {e}")))?;
 
-        Ok(Response::new(AclRuleList { rules, version: version_now() }))
+        Ok(Response::new(AclRuleList {
+            rules,
+            version: version_now(),
+        }))
     }
 
     async fn get_queues(
@@ -121,7 +133,9 @@ impl ControlPlane for ControlPlaneService {
             .into_iter()
             .map(|(name, spec_json)| crate::grpc::proto::control::QueueConfig { name, spec_json })
             .collect();
-        Ok(Response::new(crate::grpc::proto::control::QueueConfigList { queues }))
+        Ok(Response::new(
+            crate::grpc::proto::control::QueueConfigList { queues },
+        ))
     }
 
     async fn get_ivrs(
@@ -139,7 +153,9 @@ impl ControlPlane for ControlPlaneService {
             .into_iter()
             .map(|(name, spec_json)| crate::grpc::proto::control::IvrConfig { name, spec_json })
             .collect();
-        Ok(Response::new(crate::grpc::proto::control::IvrConfigList { ivrs }))
+        Ok(Response::new(crate::grpc::proto::control::IvrConfigList {
+            ivrs,
+        }))
     }
 
     // ── Config push (server streaming) ────────────────────────────────────────
@@ -215,6 +231,7 @@ impl ControlPlane for ControlPlaneService {
                 max_concurrent: info.max_concurrent,
                 active_calls: info.active_calls,
                 cpu_usage: 0.0,
+                labels: info.labels,
                 edge_worker_addr: info.edge_worker_addr,
                 nat_type: info.nat_type,
                 // Timestamps are stamped by the registry at propose time.
@@ -296,7 +313,7 @@ impl ControlPlane for ControlPlaneService {
 
         let workers = self
             .workers
-            .available()
+            .available_with_labels(&req.required_labels)
             .await
             .into_iter()
             .map(|w| WorkerInfo {
@@ -307,7 +324,7 @@ impl ControlPlane for ControlPlaneService {
                 rtp_end_port: w.rtp_end_port,
                 max_concurrent: w.max_concurrent,
                 active_calls: w.active_calls,
-                labels: Default::default(),
+                labels: w.labels,
                 edge_worker_addr: w.edge_worker_addr,
                 nat_type: w.nat_type,
             })

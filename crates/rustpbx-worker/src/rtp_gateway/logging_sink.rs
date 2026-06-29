@@ -30,12 +30,7 @@ impl LoggingSink {
     /// Snapshot of all commands received so far (for testing / introspection).
     #[allow(dead_code)]
     pub fn commands(&self) -> Vec<String> {
-        self.log
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|c| command_label(c))
-            .collect()
+        self.log.lock().unwrap().iter().map(command_label).collect()
     }
 
     #[allow(dead_code)]
@@ -84,7 +79,8 @@ mod tests {
     #[test]
     fn logs_play_command() {
         let sink = LoggingSink::new("test");
-        sink.send(CallCommand::StopPlayback { leg_id: None }).unwrap();
+        sink.send(CallCommand::StopPlayback { leg_id: None })
+            .unwrap();
         sink.send(CallCommand::StopRecording).unwrap();
         assert_eq!(sink.count(), 2);
         assert_eq!(sink.commands(), vec!["stop_playback", "stop_recording"]);
@@ -94,7 +90,8 @@ mod tests {
     fn cloned_sinks_share_log() {
         let sink = LoggingSink::new("shared");
         let clone = sink.clone();
-        sink.send(CallCommand::Hangup(HangupCommand::all(None, None))).unwrap();
+        sink.send(CallCommand::Hangup(HangupCommand::all(None, None)))
+            .unwrap();
         assert_eq!(clone.count(), 1);
     }
 

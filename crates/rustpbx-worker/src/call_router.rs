@@ -9,28 +9,30 @@
 //! - `Queue`    → `DialplanFlow::Queue` with the named queue plan
 //! - `Application` → `DialplanFlow::Application` for IVR / voicemail
 //!
-//! For non-internal calls (local extension-to-extension), falls back to the
-//! standard routing path — not yet wired, returns `NotImplemented`.
+//! For non-internal calls, outbound origination goes through the Edge when
+//! configured; otherwise the Worker builds a local anchored dialplan.
 
 use crate::headers::encode_headers;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rsipstack::dialog::invitation::InviteOption;
-use rsipstack::sip::Uri;
 use rsipstack::sip::Transport;
+use rsipstack::sip::Uri;
 use rsipstack::sip::prelude::HeadersExt;
-use rustpbx::call::{
-    DialDirection, DialStrategy, Dialplan, Location, RouteInvite,
-    RoutingState, TransactionCookie, user::SipUser,
-};
 use rustpbx::call::cookie::{TenantId, TrunkContext};
-use rustpbx::config::{MediaProxyMode, RouteResult, RtpConfig};
+use rustpbx::call::{
+    DialDirection, DialStrategy, Dialplan, Location, RouteInvite, RoutingState, TransactionCookie,
+    user::SipUser,
+};
+use rustpbx::config::{DialplanHints, MediaProxyMode, RouteResult, RtpConfig};
 use rustpbx::proxy::call::{CallRouter, RouteError};
 use rustpbx::proxy::data::ProxyDataContext;
 use rustpbx::proxy::routing::matcher::{RouteResourceLookup, RouteTrace, match_invite_with_trace};
-use rustpbx_core::internal::{DialStrategyKind, InternalCallContext, InternalDirection, RouteAction};
-use std::sync::atomic::{AtomicU32, Ordering};
+use rustpbx_core::internal::{
+    DialStrategyKind, InternalCallContext, InternalDirection, RouteAction,
+};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 pub struct WorkerCallRouter {
@@ -55,13 +57,15 @@ impl CallRouter for WorkerCallRouter {
     async fn resolve(
         &self,
         original: &rsipstack::sip::Request,
-        _route_invite: Box<dyn RouteInvite>,
+        route_invite: Box<dyn RouteInvite>,
         caller: &SipUser,
         cookie: &TransactionCookie,
     ) -> std::result::Result<Dialplan, RouteError> {
         // InternalPeerModule stores InternalCallContext in the cookie.
         if let Some(internal_ctx) = cookie.get_extension::<InternalCallContext>() {
-            return self.resolve_internal(original, internal_ctx, caller, cookie).await;
+            return self
+                .resolve_internal(original, internal_ctx, caller, cookie)
+                .await;
         }
 
         // Non-internal call — a local extension dialing out. If an Edge is
@@ -73,12 +77,8 @@ impl CallRouter for WorkerCallRouter {
                 .await;
         }
 
-        // No Edge configured — local-to-local routing is out of scope here.
-        warn!("worker received non-internal call but no edge_sip_addr configured — rejecting");
-        Err(RouteError::from((
-            anyhow!("worker-only mode: outbound origination requires edge_sip_addr"),
-            Some(rsipstack::sip::StatusCode::NotImplemented),
-        )))
+        self.resolve_local(original, route_invite, caller, cookie)
+            .await
     }
 }
 
@@ -99,17 +99,11 @@ impl WorkerCallRouter {
         );
 
         // ── Resolve caller / callee URIs ──────────────────────────────────────
-        let callee_uri = resolve_callee_uri(original)
-            .map_err(|e| RouteError::from((e, None)))?;
+        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
         let caller_uri = caller
             .from
             .clone()
-            .or_else(|| {
-                original
-                    .from_header()
-                    .ok()
-                    .and_then(|h| h.uri().ok())
-            })
+            .or_else(|| original.from_header().ok().and_then(|h| h.uri().ok()))
             .unwrap_or_else(|| callee_uri.clone());
 
         let session_id = original
@@ -161,14 +155,12 @@ impl WorkerCallRouter {
                         Some(rsipstack::sip::StatusCode::ServerInternalError),
                     ))
                 })?;
-                let queue_plan = self
-                    .load_queue_plan(&queue_name)
-                    .map_err(|e| {
-                        RouteError::from((
-                            anyhow!("failed to load queue '{}': {}", queue_name, e),
-                            Some(rsipstack::sip::StatusCode::ServerInternalError),
-                        ))
-                    })?;
+                let queue_plan = self.load_queue_plan(&queue_name).map_err(|e| {
+                    RouteError::from((
+                        anyhow!("failed to load queue '{}': {}", queue_name, e),
+                        Some(rsipstack::sip::StatusCode::ServerInternalError),
+                    ))
+                })?;
                 dialplan = dialplan.with_queue(queue_plan);
                 debug!(queue = %queue_name, "built queue dialplan");
             }
@@ -219,6 +211,150 @@ impl WorkerCallRouter {
         Ok(dialplan)
     }
 
+    /// Worker-only fallback: build a local anchored dialplan when no Edge is
+    /// configured. This covers extension-to-extension calls and local
+    /// queue/application routes without sending traffic to a carrier edge.
+    async fn resolve_local(
+        &self,
+        original: &rsipstack::sip::Request,
+        route_invite: Box<dyn RouteInvite>,
+        caller: &SipUser,
+        cookie: &TransactionCookie,
+    ) -> std::result::Result<Dialplan, RouteError> {
+        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
+        let caller_uri = caller
+            .from
+            .clone()
+            .or_else(|| original.from_header().ok().and_then(|h| h.uri().ok()))
+            .ok_or_else(|| {
+                RouteError::from((
+                    anyhow!("local: cannot resolve caller URI"),
+                    Some(rsipstack::sip::StatusCode::BadRequest),
+                ))
+            })?;
+        let session_id = original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_else(|_| format!("worker-local-{}", std::process::id()));
+
+        let option = InviteOption {
+            callee: callee_uri.clone(),
+            caller: caller_uri.clone(),
+            contact: caller_uri.clone(),
+            ..Default::default()
+        };
+        let route_result = route_invite
+            .preview_route(option, original, &DialDirection::Internal, cookie)
+            .await
+            .map_err(|e| {
+                RouteError::from((
+                    anyhow!("local route preview failed: {e}"),
+                    Some(rsipstack::sip::StatusCode::ServerInternalError),
+                ))
+            })?;
+
+        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Internal)
+            .with_caller(caller_uri)
+            .with_route_invite(route_invite)
+            .with_passthrough_failure(true);
+        dialplan.media.proxy_mode = MediaProxyMode::All;
+        dialplan.media.external_ip = self.rtp_config.external_ip.clone();
+        dialplan.media.rtp_start_port = self.rtp_config.start_port;
+        dialplan.media.rtp_end_port = self.rtp_config.end_port;
+        dialplan.recording = self
+            .data_context
+            .config()
+            .recording
+            .as_ref()
+            .map(|p| p.new_recording_config())
+            .unwrap_or_default();
+
+        let hints = match route_result {
+            RouteResult::Forward(option, hints) => {
+                let contact_raw = option.callee.to_string();
+                let target = Location {
+                    aor: option.callee,
+                    destination: option.destination,
+                    credential: option.credential,
+                    headers: option.headers,
+                    contact_raw: Some(contact_raw),
+                    ..Default::default()
+                };
+                dialplan = dialplan.with_targets(DialStrategy::Sequential(vec![target]));
+                hints
+            }
+            RouteResult::Queue { queue, hints, .. } => {
+                dialplan = dialplan.with_queue(queue);
+                hints
+            }
+            RouteResult::Application {
+                option,
+                app_name,
+                app_params,
+                auto_answer,
+                ..
+            } => {
+                dialplan = dialplan.with_application(app_name, app_params, auto_answer);
+                dialplan.routed_headers = option.headers;
+                None
+            }
+            RouteResult::NotHandled(_, hints) => {
+                dialplan = dialplan.with_targets(DialStrategy::Sequential(vec![Location {
+                    aor: callee_uri,
+                    ..Default::default()
+                }]));
+                hints
+            }
+            RouteResult::Abort(code, reason) => {
+                return Err(RouteError::from((
+                    anyhow!(reason.unwrap_or_else(|| "local route aborted".to_string())),
+                    Some(code),
+                )));
+            }
+        };
+        self.apply_local_hints(&mut dialplan, hints);
+
+        let prev = self.active_calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics.call_started();
+        debug!(active_calls = prev + 1, "worker accepted local call");
+        Ok(dialplan)
+    }
+
+    fn apply_local_hints(&self, dialplan: &mut Dialplan, hints: Option<DialplanHints>) {
+        let Some(mut hints) = hints else {
+            return;
+        };
+        if let Some(policy) = hints.recording.take() {
+            dialplan.recording = policy.new_recording_config();
+            dialplan.recording_policy = Some(policy);
+        }
+        if let Some(enabled) = hints.enable_recording {
+            dialplan.recording.enabled = enabled;
+        }
+        if hints.bypass_media == Some(true) {
+            dialplan.media.proxy_mode = MediaProxyMode::Bypass;
+        }
+        if let Some(media_mode) = hints.media_mode {
+            dialplan.media.proxy_mode = media_mode;
+        }
+        if let Some(video_policy) = hints.video_policy {
+            dialplan.media.video_policy = Some(video_policy);
+        }
+        if let Some(max_duration) = hints.max_duration {
+            dialplan.max_call_duration = Some(max_duration);
+        }
+        if let Some(enable_sipflow) = hints.enable_sipflow {
+            dialplan.enable_sipflow = enable_sipflow;
+        }
+        if hints.disable_ice_servers == Some(true) {
+            dialplan.media.ice_servers = None;
+        }
+        if let Some(ringback) = hints.ringback.take() {
+            dialplan.audio_profile = Some(ringback);
+        }
+        dialplan.extensions = std::mem::take(&mut hints.extensions);
+    }
+
     /// Outbound origination: a local extension dials an external number.
     /// Route-match (Outbound) to select an egress trunk, then forward the call
     /// to the Edge encoded as an internal `X-*` INVITE. The Worker anchors
@@ -232,8 +368,7 @@ impl WorkerCallRouter {
         // edge_sip_addr presence is guaranteed by the caller.
         let edge_addr = self.edge_sip_addr.as_deref().unwrap_or_default();
 
-        let callee_uri = resolve_callee_uri(original)
-            .map_err(|e| RouteError::from((e, None)))?;
+        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
         let caller_uri = caller
             .from
             .clone()
@@ -257,8 +392,16 @@ impl WorkerCallRouter {
         let lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
         let mut trace = RouteTrace::default();
         let result = match_invite_with_trace(
-            if trunks.is_empty() { None } else { Some(&trunks) },
-            if routes.is_empty() { None } else { Some(&routes) },
+            if trunks.is_empty() {
+                None
+            } else {
+                Some(&trunks)
+            },
+            if routes.is_empty() {
+                None
+            } else {
+                Some(&routes)
+            },
             Some(lookup),
             option,
             original,
@@ -360,7 +503,10 @@ impl WorkerCallRouter {
 
         let prev = self.active_calls.fetch_add(1, Ordering::Relaxed);
         self.metrics.call_started();
-        debug!(active_calls = prev + 1, "worker accepted outbound origination");
+        debug!(
+            active_calls = prev + 1,
+            "worker accepted outbound origination"
+        );
 
         Ok(dialplan)
     }
@@ -419,4 +565,3 @@ fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<Uri> {
         .uri()
         .map_err(anyhow::Error::from)
 }
-

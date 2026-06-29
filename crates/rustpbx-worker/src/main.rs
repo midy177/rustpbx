@@ -33,13 +33,8 @@ use rustpbx::{
     callrecord::CallRecordManagerBuilder,
     config::{ProxyConfig, RtpConfig, UserBackendConfig},
     proxy::{
-        acl::AclModule,
-        auth::AuthModule,
-        call::CallModule,
-        data::ProxyDataContext,
-        presence::PresenceModule,
-        registrar::RegistrarModule,
-        server::SipServerBuilder,
+        acl::AclModule, auth::AuthModule, call::CallModule, data::ProxyDataContext,
+        presence::PresenceModule, registrar::RegistrarModule, server::SipServerBuilder,
     },
 };
 use std::str::FromStr;
@@ -121,7 +116,11 @@ async fn main() -> Result<()> {
     let cp_tls = cfg.tls.load()?;
     let central_stun =
         control_client::fetch_platform_stun(&cfg.control_plane_addr, cp_tls.as_ref()).await;
-    let stun = if central_stun.is_empty() { cfg.stun_servers.clone() } else { central_stun };
+    let stun = if central_stun.is_empty() {
+        cfg.stun_servers.clone()
+    } else {
+        central_stun
+    };
     let nat = rustpbx_netprobe::probe(&stun, std::time::Duration::from_secs(3)).await;
     info!(nat_type = %nat.nat_type, public_ip = ?nat.public_ip, "NAT probe complete");
     if cfg.rtp_external_ip.is_none()
@@ -162,17 +161,17 @@ async fn main() -> Result<()> {
     //   1. Addon metrics (observability Prometheus counters/histograms)
     //   2. ActiveCallTracker — decrements active_calls counter on call end
     //   3. GrpcCdrHook — uploads CDR to Control Plane
-    let grpc_hook: Box<dyn rustpbx::callrecord::CallRecordHook> =
-        Box::new(GrpcCdrHook::new(Arc::clone(&cp_client), cfg.worker_id.clone()));
-    let tracker_hook: Box<dyn rustpbx::callrecord::CallRecordHook> = Box::new(
-        ActiveCallTrackerHook {
+    let grpc_hook: Box<dyn rustpbx::callrecord::CallRecordHook> = Box::new(GrpcCdrHook::new(
+        Arc::clone(&cp_client),
+        cfg.worker_id.clone(),
+    ));
+    let tracker_hook: Box<dyn rustpbx::callrecord::CallRecordHook> =
+        Box::new(ActiveCallTrackerHook {
             active_calls: Arc::clone(&active_calls),
             metrics: Arc::clone(&worker_metrics),
-        },
-    );
+        });
 
-    let mut cdr_builder = CallRecordManagerBuilder::new()
-        .with_cancel_token(cancel.clone());
+    let mut cdr_builder = CallRecordManagerBuilder::new().with_cancel_token(cancel.clone());
 
     for hook in collect_addon_cdr_hooks() {
         cdr_builder = cdr_builder.with_hook(hook);
@@ -208,7 +207,10 @@ async fn main() -> Result<()> {
     // .queues + reload_queues, so resolve_queue_config finds them at runtime.
     let queues = control_client::fetch_queues(&cfg.control_plane_addr, cp_tls.as_ref()).await;
     if !queues.is_empty() {
-        info!(count = queues.len(), "loaded call queues from control plane");
+        info!(
+            count = queues.len(),
+            "loaded call queues from control plane"
+        );
         proxy_config.queues = queues;
     }
     // Global recording policy from the control plane → ProxyConfig.recording.
@@ -277,8 +279,7 @@ async fn main() -> Result<()> {
             tick.tick().await; // discard immediate first tick
             loop {
                 tick.tick().await;
-                let queues =
-                    control_client::fetch_queues(&cp_addr, cp_tls2.as_ref()).await;
+                let queues = control_client::fetch_queues(&cp_addr, cp_tls2.as_ref()).await;
                 let recording =
                     control_client::fetch_platform_recording(&cp_addr, cp_tls2.as_ref()).await;
                 // IVR is file-based: re-materialize TOML files each cycle.
@@ -296,6 +297,26 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Event-driven config refresh. Polling above remains as a backstop for
+    // missed events or old control planes that do not publish config changes.
+    {
+        let dc = Arc::clone(&data_context);
+        let base_cfg = Arc::clone(&proxy_config);
+        let cp_addr = cfg.control_plane_addr.clone();
+        let cp_tls2 = cp_tls.clone();
+        let ivr_dir = std::path::PathBuf::from(&cfg.ivr_dir);
+        let worker_id = cfg.worker_id.clone();
+        tokio::spawn(run_config_watcher(
+            cp_addr,
+            cp_tls2,
+            worker_id,
+            dc,
+            base_cfg,
+            ivr_dir,
+            cancel.clone(),
+        ));
     }
 
     // Call reservations bridge AllocateCall (gRPC) and the INVITE arrival so a
@@ -387,7 +408,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("media worker ready — SIP on {}:{}", cfg.sip_addr, cfg.sip_port);
+    info!(
+        "media worker ready — SIP on {}:{}",
+        cfg.sip_addr, cfg.sip_port
+    );
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     signal::ctrl_c().await?;
@@ -448,5 +472,105 @@ async fn wait_for_drain(active: &AtomicU32) {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+}
+
+async fn run_config_watcher(
+    control_plane_addr: String,
+    tls: Option<rustpbx_proto::tls::ClientTls>,
+    worker_id: String,
+    data_context: Arc<ProxyDataContext>,
+    base_config: Arc<ProxyConfig>,
+    ivr_dir: std::path::PathBuf,
+    cancel: CancellationToken,
+) {
+    use crate::proto::control::config_change_event::ChangeType;
+    use crate::proto::control::{WatchRequest, control_plane_client::ControlPlaneClient};
+    use tokio::time::{Duration, sleep};
+
+    let mut version = 0u64;
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        let result = async {
+            let endpoint = rustpbx_proto::tls::endpoint(&control_plane_addr, tls.as_ref())
+                .map_err(|e| anyhow::anyhow!("invalid control plane addr/TLS: {e}"))?;
+            let channel = endpoint.connect().await?;
+            let mut client = ControlPlaneClient::new(channel);
+            let mut stream = client
+                .watch_config_changes(WatchRequest {
+                    edge_id: None,
+                    worker_id: Some(worker_id.clone()),
+                    from_version: version,
+                })
+                .await?
+                .into_inner();
+            info!(from_version = version, "worker config watch stream opened");
+
+            while let Some(event) = stream.message().await? {
+                version = version.max(event.version);
+                let change_type =
+                    ChangeType::try_from(event.change_type).unwrap_or(ChangeType::PlatformChanged);
+                match change_type {
+                    ChangeType::QueueChanged
+                    | ChangeType::IvrChanged
+                    | ChangeType::PlatformChanged => {
+                        reload_worker_runtime_config(
+                            &control_plane_addr,
+                            tls.as_ref(),
+                            Arc::clone(&data_context),
+                            Arc::clone(&base_config),
+                            &ivr_dir,
+                        )
+                        .await;
+                    }
+                    ChangeType::TrunkAdded
+                    | ChangeType::TrunkUpdated
+                    | ChangeType::TrunkRemoved
+                    | ChangeType::RouteChanged
+                    | ChangeType::AclChanged => {}
+                }
+            }
+            anyhow::Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            warn!(error = %e, "worker config watch stream error, retrying in 5s");
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = sleep(Duration::from_secs(5)) => {}
+        }
+    }
+}
+
+async fn reload_worker_runtime_config(
+    control_plane_addr: &str,
+    tls: Option<&rustpbx_proto::tls::ClientTls>,
+    data_context: Arc<ProxyDataContext>,
+    base_config: Arc<ProxyConfig>,
+    ivr_dir: &std::path::Path,
+) {
+    let queues = control_client::fetch_queues(control_plane_addr, tls).await;
+    let recording = control_client::fetch_platform_recording(control_plane_addr, tls).await;
+    let ivrs = control_client::fetch_ivrs(control_plane_addr, tls).await;
+    let _ = control_client::materialize_ivrs(&ivrs, ivr_dir).await;
+
+    let mut new_cfg = (*base_config).clone();
+    new_cfg.queues = queues;
+    new_cfg.recording = recording;
+    match data_context
+        .reload_queues(false, Some(Arc::new(new_cfg)))
+        .await
+    {
+        Ok(m) => info!(
+            queues = m.config_count,
+            "hot-reloaded queues + recording from config event"
+        ),
+        Err(e) => warn!(error = %e, "config-event queue reload failed"),
     }
 }

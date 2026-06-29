@@ -174,10 +174,11 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             }
             let current = tenant_slots(slots, tenant_id);
             // Enforce the cap (evaluated here, in log order, so it's linearizable).
-            if let Some(m) = max {
-                if m > 0 && current >= m {
-                    return RegistryResponse { known: true, removed: 0, granted: false, count: current };
-                }
+            if let Some(m) = max
+                && m > 0
+                && current >= m
+            {
+                return RegistryResponse { known: true, removed: 0, granted: false, count: current };
             }
             slots.insert(call_id, CallSlotRecord { tenant_id, at_ms });
             RegistryResponse { known: true, removed: 0, granted: true, count: current + 1 }

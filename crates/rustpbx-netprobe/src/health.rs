@@ -1,9 +1,9 @@
 //! Minimal dependency-free HTTP health server for edge/worker nodes.
 //!
 //! Serves two unauthenticated endpoints for k8s/LB probes:
-//!   - `GET /healthz` → 200 (liveness: the process is up)
-//!   - `GET /readyz`  → 200 when `ready` is set (e.g. registered with the
-//!                       control plane), else 503
+//! - `GET /healthz` → 200 (liveness: the process is up)
+//! - `GET /readyz`  → 200 when `ready` is set (e.g. registered with the
+//!   control plane), else 503
 //!
 //! It's a tiny HTTP/1.1 responder over `tokio` (no axum/hyper) — the node SIP
 //! servers don't otherwise speak HTTP.

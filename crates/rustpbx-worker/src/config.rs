@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WorkerConfig {
@@ -30,6 +31,11 @@ pub struct WorkerConfig {
     /// Max concurrent calls this worker accepts
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+
+    /// Worker labels advertised to the Control Plane for future scheduling
+    /// decisions, e.g. region = "cn-east", tier = "premium".
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 
     /// Worker instance ID (defaults to hostname:pid)
     #[serde(default = "default_worker_id")]
@@ -168,7 +174,11 @@ impl TlsClientConfig {
             None
         };
         let domain = (!self.domain.trim().is_empty()).then(|| self.domain.clone());
-        Ok(Some(rustpbx_proto::tls::ClientTls { ca_pem, identity, domain }))
+        Ok(Some(rustpbx_proto::tls::ClientTls {
+            ca_pem,
+            identity,
+            domain,
+        }))
     }
 }
 
@@ -183,6 +193,7 @@ impl Default for WorkerConfig {
             rtp_start_port: default_rtp_start(),
             rtp_end_port: default_rtp_end(),
             max_concurrent: default_max_concurrent(),
+            labels: HashMap::new(),
             worker_id: default_worker_id(),
             database_url: default_database_url(),
             recording_path: default_recording_path(),

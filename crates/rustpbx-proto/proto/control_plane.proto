@@ -241,6 +241,9 @@ message ConfigChangeEvent {
     TRUNK_REMOVED = 2;
     ROUTE_CHANGED = 3;
     ACL_CHANGED   = 4;
+    QUEUE_CHANGED = 5;
+    IVR_CHANGED   = 6;
+    PLATFORM_CHANGED = 7;
   }
   ChangeType change_type          = 1;
   optional string name            = 2;
@@ -297,7 +300,11 @@ message HeartbeatRequest {
   uint32 rtp_ports_used = 4;
 }
 message HeartbeatResponse  { bool drain = 1; }
-message GetWorkersRequest  { optional int64 tenant_id = 1; }
+message GetWorkersRequest  {
+  optional int64 tenant_id = 1;
+  // All requested labels must be present with the same value on the worker.
+  map<string, string> required_labels = 2;
+}
 message WorkerList         { repeated WorkerInfo workers = 1; }
 
 message PlatformConfigRequest {}

@@ -95,7 +95,12 @@ pub struct AuditFilter {
 
 impl Default for AuditFilter {
     fn default() -> Self {
-        Self { tenant_id: None, action: None, target_type: None, limit: 100 }
+        Self {
+            tenant_id: None,
+            action: None,
+            target_type: None,
+            limit: 100,
+        }
     }
 }
 
@@ -128,22 +133,27 @@ impl<'a> AuditService<'a> {
 
     /// List audit entries matching `filter`, newest first.
     pub async fn list(&self, filter: &AuditFilter) -> Result<Vec<AuditResponse>> {
-        let limit = filter.limit.clamp(1, 500) as u64;
+        let limit = filter.limit.clamp(1, 500);
         let mut q = Entity::find().order_by_desc(Column::CreatedAt);
         if let Some(tid) = filter.tenant_id {
             q = q.filter(Column::ActorTenantId.eq(tid));
         }
-        if let Some(a) = filter.action.as_deref() {
-            if !a.is_empty() {
-                q = q.filter(Column::Action.eq(a));
-            }
+        if let Some(a) = filter.action.as_deref()
+            && !a.is_empty()
+        {
+            q = q.filter(Column::Action.eq(a));
         }
-        if let Some(t) = filter.target_type.as_deref() {
-            if !t.is_empty() {
-                q = q.filter(Column::TargetType.eq(t));
-            }
+        if let Some(t) = filter.target_type.as_deref()
+            && !t.is_empty()
+        {
+            q = q.filter(Column::TargetType.eq(t));
         }
-        Ok(q.limit(limit).all(self.db).await?.into_iter().map(Into::into).collect())
+        Ok(q.limit(limit)
+            .all(self.db)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 }
 
@@ -155,7 +165,9 @@ mod tests {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         // Bring up the full control schema (the audit table + its indices).
         use sea_orm_migration::MigratorTrait;
-        crate::migration::ControlMigrator::up(&db, None).await.unwrap();
+        crate::migration::ControlMigrator::up(&db, None)
+            .await
+            .unwrap();
         db
     }
 
@@ -182,12 +194,25 @@ mod tests {
         svc.record(entry(None, "create", "tenant")).await.unwrap();
 
         // Tenant 1 sees only its own two entries.
-        let t1 = svc.list(&AuditFilter { tenant_id: Some(1), limit: 100, ..Default::default() }).await.unwrap();
+        let t1 = svc
+            .list(&AuditFilter {
+                tenant_id: Some(1),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(t1.len(), 2);
         assert!(t1.iter().all(|e| e.actor_tenant_id == Some(1)));
 
         // Superadmin (no scope) sees all four, newest first.
-        let all = svc.list(&AuditFilter { limit: 100, ..Default::default() }).await.unwrap();
+        let all = svc
+            .list(&AuditFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(all.len(), 4);
         // created_at desc ordering: the last-inserted ("create tenant") is first.
         assert_eq!(all[0].target_type, "tenant");
@@ -203,7 +228,14 @@ mod tests {
         assert_eq!(svc.list(&f).await.unwrap().len(), 1);
 
         // Payload round-trips.
-        let with_payload = svc.list(&AuditFilter { tenant_id: Some(1), limit: 1, ..Default::default() }).await.unwrap();
+        let with_payload = svc
+            .list(&AuditFilter {
+                tenant_id: Some(1),
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(with_payload[0].payload.as_ref().unwrap()["name"], "acme");
     }
 
@@ -214,7 +246,14 @@ mod tests {
         for _ in 0..5 {
             svc.record(entry(Some(9), "create", "trunk")).await.unwrap();
         }
-        let rows = svc.list(&AuditFilter { tenant_id: Some(9), limit: 2, ..Default::default() }).await.unwrap();
+        let rows = svc
+            .list(&AuditFilter {
+                tenant_id: Some(9),
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2, "limit caps the page");
     }
 }

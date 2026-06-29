@@ -12,9 +12,12 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +32,7 @@ pub struct ControlClient {
     rtp_start_port: u32,
     rtp_end_port: u32,
     max_concurrent: u32,
+    labels: HashMap<String, String>,
     /// EdgeWorker gRPC addr advertised for AllocateCall (empty if disabled).
     edge_worker_addr: String,
     /// Detected NAT type (STUN), reported at registration. Set by main.
@@ -59,6 +63,7 @@ impl ControlClient {
             rtp_start_port: cfg.rtp_start_port as u32,
             rtp_end_port: cfg.rtp_end_port as u32,
             max_concurrent: cfg.max_concurrent,
+            labels: cfg.labels.clone(),
             edge_worker_addr: cfg.edge_worker_addr.clone().unwrap_or_default(),
             nat_type: String::new(),
             active_calls: Arc::new(AtomicU32::new(0)),
@@ -71,7 +76,9 @@ impl ControlClient {
     /// AllocateCall address without per-node config. Applies to `sip_addr` and
     /// `edge_worker_addr`; call after the STUN probe, before `register`.
     pub fn apply_detected_public_ip(&mut self, public_ip: &Option<String>) {
-        let Some(ip) = public_ip.as_deref() else { return };
+        let Some(ip) = public_ip.as_deref() else {
+            return;
+        };
         self.sip_addr = with_public_host(&self.sip_addr, ip);
         if !self.edge_worker_addr.is_empty() {
             self.edge_worker_addr = with_public_host(&self.edge_worker_addr, ip);
@@ -113,7 +120,7 @@ impl ControlClient {
                 rtp_end_port: self.rtp_end_port,
                 max_concurrent: self.max_concurrent,
                 active_calls: self.active_calls.load(Ordering::Relaxed),
-                labels: Default::default(),
+                labels: self.labels.clone(),
                 edge_worker_addr: self.edge_worker_addr.clone(),
                 nat_type: self.nat_type.clone(),
             })
@@ -251,14 +258,14 @@ pub async fn materialize_ivrs(ivrs: &[(String, String)], ivr_dir: &std::path::Pa
         if spec_json.is_empty() {
             continue;
         }
-        let result = (|| async {
+        let result = async {
             let def: IvrDefinition = serde_json::from_str(spec_json)?;
             let fc = IvrFileConfig { ivr: def };
             let toml_str = toml::to_string_pretty(&fc)?;
             let path = ivr_dir.join(format!("{name}.generated.toml"));
             tokio::fs::write(&path, toml_str).await?;
             anyhow::Ok(path)
-        })()
+        }
         .await;
         match result {
             Ok(_) => ok += 1,
@@ -293,7 +300,7 @@ pub async fn fetch_platform_recording(
         return None;
     }
     match serde_json::from_str::<rustpbx::config::RecordingPolicy>(json) {
-        Ok(p) if p.enabled => Some(p),
+        Ok(p) if p.enabled.unwrap_or(false) => Some(p),
         Ok(_) => None, // configured but disabled
         Err(e) => {
             tracing::warn!(error = %e, "invalid recording_policy_json from control plane");
@@ -330,17 +337,22 @@ pub async fn fetch_queues(
             Ok(cfg) => {
                 map.insert(q.name, cfg);
             }
-            Err(e) => tracing::warn!(name = %q.name, error = %e, "skipped queue: invalid spec_json"),
+            Err(e) => {
+                tracing::warn!(name = %q.name, error = %e, "skipped queue: invalid spec_json")
+            }
         }
     }
     map
 }
 
 fn cpu_usage_approx() -> f32 {
-    use sysinfo::System;
     use std::sync::Mutex;
+    use sysinfo::System;
     static SYS: std::sync::OnceLock<Mutex<System>> = std::sync::OnceLock::new();
-    let mut guard = SYS.get_or_init(|| Mutex::new(System::new())).lock().unwrap();
+    let mut guard = SYS
+        .get_or_init(|| Mutex::new(System::new()))
+        .lock()
+        .unwrap();
     guard.refresh_cpu_usage();
     guard.global_cpu_usage()
 }
@@ -360,19 +372,34 @@ mod tests {
 
     #[test]
     fn wildcard_host_is_replaced_with_public_ip() {
-        assert_eq!(with_public_host("0.0.0.0:5070", "203.0.113.20"), "203.0.113.20:5070");
-        assert_eq!(with_public_host("0.0.0.0:9092", "203.0.113.20"), "203.0.113.20:9092");
+        assert_eq!(
+            with_public_host("0.0.0.0:5070", "203.0.113.20"),
+            "203.0.113.20:5070"
+        );
+        assert_eq!(
+            with_public_host("0.0.0.0:9092", "203.0.113.20"),
+            "203.0.113.20:9092"
+        );
     }
 
     #[test]
     fn explicit_host_is_left_alone() {
-        assert_eq!(with_public_host("10.0.0.5:5070", "203.0.113.20"), "10.0.0.5:5070");
+        assert_eq!(
+            with_public_host("10.0.0.5:5070", "203.0.113.20"),
+            "10.0.0.5:5070"
+        );
         // Already-public address is not rewritten.
-        assert_eq!(with_public_host("203.0.113.99:5070", "203.0.113.20"), "203.0.113.99:5070");
+        assert_eq!(
+            with_public_host("203.0.113.99:5070", "203.0.113.20"),
+            "203.0.113.99:5070"
+        );
     }
 
     #[test]
     fn malformed_address_is_left_alone() {
-        assert_eq!(with_public_host("not-an-addr", "203.0.113.20"), "not-an-addr");
+        assert_eq!(
+            with_public_host("not-an-addr", "203.0.113.20"),
+            "not-an-addr"
+        );
     }
 }
