@@ -59,16 +59,74 @@ impl CallStateReporter {
             CallState::Failed
         };
 
-        let mut events = vec![self.event(
-            record,
-            CallState::Ringing,
-            record.start_time.timestamp_millis(),
-        )];
+        let ring_time = record.ring_time.unwrap_or(record.start_time);
+        let mut events = vec![self.event(record, CallState::Ringing, ring_time.timestamp_millis())];
         if let Some(answer_time) = record.answer_time {
             events.push(self.event(record, CallState::Answered, answer_time.timestamp_millis()));
         }
         events.push(self.event(record, terminal_state, record.end_time.timestamp_millis()));
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+    use rustpbx::callrecord::{CallRecord, CallRecordHangupReason};
+
+    fn state(event: &CallStateEvent) -> CallState {
+        CallState::try_from(event.state).unwrap()
+    }
+
+    fn record(status_code: u16, answered: bool) -> CallRecord {
+        let start = Utc.timestamp_millis_opt(1_000).unwrap();
+        let ring = Utc.timestamp_millis_opt(1_500).unwrap();
+        let answer = Utc.timestamp_millis_opt(2_000).unwrap();
+        CallRecord {
+            call_id: "call-1".to_string(),
+            start_time: start,
+            ring_time: Some(ring),
+            answer_time: answered.then_some(answer),
+            end_time: start + Duration::seconds(5),
+            caller: "sip:1001@example.test".to_string(),
+            callee: "sip:1002@example.test".to_string(),
+            status_code,
+            hangup_reason: (status_code >= 300).then_some(CallRecordHangupReason::Failed),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn events_for_completed_call_include_ringing_answered_completed() {
+        let reporter = CallStateReporter::new("127.0.0.1:9093", "worker-a".to_string());
+        let events = reporter.events_for_record(&record(200, true));
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(state(&events[0]), CallState::Ringing);
+        assert_eq!(events[0].event_time_unix_ms, Some(1_500));
+        assert_eq!(events[0].hangup_cause, None);
+
+        assert_eq!(state(&events[1]), CallState::Answered);
+        assert_eq!(events[1].event_time_unix_ms, Some(2_000));
+        assert_eq!(events[1].hangup_cause, None);
+
+        assert_eq!(state(&events[2]), CallState::Completed);
+        assert_eq!(events[2].event_time_unix_ms, Some(6_000));
+        assert_eq!(events[2].hangup_cause, Some(200));
+    }
+
+    #[test]
+    fn events_for_failed_unanswered_call_skip_answered() {
+        let reporter = CallStateReporter::new("127.0.0.1:9093", "worker-a".to_string());
+        let events = reporter.events_for_record(&record(486, false));
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(state(&events[0]), CallState::Ringing);
+        assert_eq!(state(&events[1]), CallState::Failed);
+        assert_eq!(events[1].event_time_unix_ms, Some(6_000));
+        assert_eq!(events[1].hangup_cause, Some(486));
+        assert!(events[1].reason.as_deref().unwrap_or("").contains("Failed"));
     }
 }
 
