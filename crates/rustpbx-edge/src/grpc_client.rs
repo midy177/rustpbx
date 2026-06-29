@@ -108,17 +108,27 @@ impl GrpcControlClient {
         &mut self,
         tenant_id: i64,
         call_id: &str,
-    ) -> Result<(bool, u32, u32)> {
+        trunk_name: Option<&str>,
+        trunk_max_calls: Option<u32>,
+    ) -> Result<(bool, u32, u32, u32, u32)> {
         use crate::proto::control::AcquireSlotRequest;
         let resp = self
             .client
             .acquire_call_slot(AcquireSlotRequest {
                 tenant_id,
                 call_id: call_id.to_string(),
+                trunk_name: trunk_name.map(str::to_string),
+                trunk_max_calls,
             })
             .await?
             .into_inner();
-        Ok((resp.granted, resp.active, resp.max))
+        Ok((
+            resp.granted,
+            resp.active,
+            resp.max,
+            resp.trunk_active,
+            resp.trunk_max,
+        ))
     }
 
     /// Register this edge with the Control Plane (observability only).

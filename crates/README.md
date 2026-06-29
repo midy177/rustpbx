@@ -235,7 +235,7 @@ rust-lldb target/debug/rustpbx-worker -- rustpbx-worker.toml
 ## 9. 分布式 SIP 补齐计划
 
 已完成：Control → Edge/Worker 的配置事件推送、配置版本递增、Worker 配置事件热加载，
-以及 Worker 无 Edge 时的本地路由 fallback。
+Worker 无 Edge 时的本地路由 fallback，以及 tenant/trunk 级并发配额。
 
 后续按以下顺序推进：
 
@@ -246,7 +246,7 @@ rust-lldb target/debug/rustpbx-worker -- rustpbx-worker.toml
    真实 media-thread sink，并通过 `MediaEvent` 返回成功/失败。
 3. **调度增强**：Worker 注册补充 region、labels、capabilities；Control 按健康、
    draining、容量、租户亲和、NAT 可达性进行打分选择。
-4. **配额与状态流**：补 trunk 级并发/CPS 计数，完善 Worker → Edge 的
+4. **配额与状态流**：补 trunk 级 CPS 计数，完善 Worker → Edge 的
    `CallStateUpdate` 生命周期上报。
 
 验证基线：

@@ -17,20 +17,20 @@ use crate::headers::encode_headers;
 use crate::worker_selector::WorkerSelector;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use rsipstack::dialog::authenticate::Credential;
+use rsipstack::dialog::invitation::InviteOption;
+use rsipstack::sip::Transport;
+use rsipstack::sip::Uri;
+use rsipstack::sip::prelude::HeadersExt;
+use rustpbx::call::cookie::{TransactionCookie, TrunkContext};
+use rustpbx::call::user::SipUser;
 use rustpbx::call::{
     CallRecordingConfig, DialDirection, DialStrategy, Dialplan, Location, RoutingState,
 };
-use rustpbx::call::cookie::{TrunkContext, TransactionCookie};
-use rustpbx::call::user::SipUser;
 use rustpbx::config::{MediaProxyMode, RouteResult};
 use rustpbx::proxy::call::{CallRouter, RouteError};
 use rustpbx::proxy::data::ProxyDataContext;
-use rsipstack::dialog::authenticate::Credential;
 use rustpbx_core::internal::{InternalCallContext, InternalDirection, RouteAction};
-use rsipstack::dialog::invitation::InviteOption;
-use rsipstack::sip::Uri;
-use rsipstack::sip::Transport;
-use rsipstack::sip::prelude::HeadersExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::RwLock;
@@ -60,7 +60,14 @@ impl EdgeCallRouter {
         active_calls: Arc<AtomicU32>,
         control: Arc<RwLock<GrpcControlClient>>,
     ) -> Self {
-        Self { worker_selector, data_context, routing_state, edge_id, active_calls, control }
+        Self {
+            worker_selector,
+            data_context,
+            routing_state,
+            edge_id,
+            active_calls,
+            control,
+        }
     }
 
     /// Reserve a slot on the selected worker via `AllocateCall`, returning the
@@ -79,9 +86,7 @@ impl EdgeCallRouter {
         caller: &str,
         callee: &str,
     ) -> Result<String> {
-        use rustpbx_proto::edge::{
-            edge_worker_client::EdgeWorkerClient, AllocateCallRequest,
-        };
+        use rustpbx_proto::edge::{AllocateCallRequest, edge_worker_client::EdgeWorkerClient};
 
         if worker.edge_worker_addr.trim().is_empty() {
             // Worker doesn't serve AllocateCall — use the known SIP contact.
@@ -136,16 +141,21 @@ impl CallRouter for EdgeCallRouter {
     ) -> std::result::Result<Dialplan, RouteError> {
         if let Some(internal_ctx) = cookie.get_extension::<InternalCallContext>() {
             if matches!(internal_ctx.direction, InternalDirection::Outbound) {
-                return self.resolve_outbound(original, &internal_ctx, caller, cookie).await;
+                return self
+                    .resolve_outbound(original, &internal_ctx, caller, cookie)
+                    .await;
             }
         }
 
         let trunk_ctx = cookie.get_extension::<TrunkContext>();
         if trunk_ctx.is_some() {
-            self.resolve_inbound(original, route_invite, caller, cookie).await
+            self.resolve_inbound(original, route_invite, caller, cookie)
+                .await
         } else {
             Err(RouteError::from((
-                anyhow!("edge: no trunk context on INVITE — only trunk-sourced or worker-outbound calls accepted"),
+                anyhow!(
+                    "edge: no trunk context on INVITE — only trunk-sourced or worker-outbound calls accepted"
+                ),
                 Some(rsipstack::sip::StatusCode::Forbidden),
             )))
         }
@@ -210,8 +220,9 @@ impl EdgeCallRouter {
             .map(|h| h.value().to_string())
             .unwrap_or_else(|_| format!("edge-{}", std::process::id()));
 
-        let dest_uri = Uri::try_from(trunk.dest.as_str())
-            .map_err(|e| RouteError::from((anyhow!("invalid trunk dest '{}': {}", trunk.dest, e), None)))?;
+        let dest_uri = Uri::try_from(trunk.dest.as_str()).map_err(|e| {
+            RouteError::from((anyhow!("invalid trunk dest '{}': {}", trunk.dest, e), None))
+        })?;
 
         let credential = match (&trunk.username, &trunk.password) {
             (Some(user), Some(pass)) => Some(Credential {
@@ -264,17 +275,11 @@ impl EdgeCallRouter {
             .ok_or_else(|| RouteError::from((anyhow!("missing trunk context"), None)))?;
 
         // ── Resolve caller / callee URIs ──────────────────────────────────────
-        let callee_uri = resolve_callee_uri(original)
-            .map_err(|e| RouteError::from((e, None)))?;
+        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
         let caller_uri = caller
             .from
             .clone()
-            .or_else(|| {
-                original
-                    .from_header()
-                    .ok()
-                    .and_then(|h| h.uri().ok())
-            })
+            .or_else(|| original.from_header().ok().and_then(|h| h.uri().ok()))
             .ok_or_else(|| {
                 RouteError::from((
                     anyhow!("failed to extract caller URI"),
@@ -296,12 +301,8 @@ impl EdgeCallRouter {
             .map_err(|e| RouteError::from((e, None)))?;
 
         // ── Map RouteResult → InternalCallContext ─────────────────────────────
-        let internal_ctx = self.build_internal_context(
-            &route_result,
-            &trunk_ctx,
-            &caller_uri,
-            &callee_uri,
-        )?;
+        let internal_ctx =
+            self.build_internal_context(&route_result, &trunk_ctx, &caller_uri, &callee_uri)?;
 
         info!(
             call_id = ?original.call_id_header().ok().map(|h| h.value().to_string()),
@@ -318,10 +319,7 @@ impl EdgeCallRouter {
             .await
             .map_err(|e| {
                 warn!(error = %e, "no worker available");
-                RouteError::from((
-                    e,
-                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                ))
+                RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
             })?;
 
         debug!(worker_id = %worker.worker_id, sip_contact = %worker.sip_contact, "selected worker");
@@ -365,9 +363,10 @@ impl EdgeCallRouter {
             ..Default::default()
         };
 
-        let mut dialplan = Dialplan::new(session_id.clone(), original.clone(), DialDirection::Inbound)
-            .with_caller(caller_uri)
-            .with_targets(DialStrategy::Sequential(vec![worker_location]));
+        let mut dialplan =
+            Dialplan::new(session_id.clone(), original.clone(), DialDirection::Inbound)
+                .with_caller(caller_uri)
+                .with_targets(DialStrategy::Sequential(vec![worker_location]));
 
         // Edge is signaling-only — bypass all media handling.
         dialplan.media.proxy_mode = MediaProxyMode::None;
@@ -381,20 +380,48 @@ impl EdgeCallRouter {
         // releases the slot when this call's CDR arrives. Fail OPEN on an RPC
         // error — a control-plane blip shouldn't drop every call.
         if let Some(tenant_id) = trunk_ctx.tenant_id {
+            let trunk_max_calls = self
+                .data_context
+                .get_trunk(&trunk_ctx.name)
+                .and_then(|trunk| trunk.max_calls)
+                .filter(|max| *max > 0);
             match self
                 .control
                 .write()
                 .await
-                .acquire_call_slot(tenant_id, &session_id)
+                .acquire_call_slot(
+                    tenant_id,
+                    &session_id,
+                    Some(&trunk_ctx.name),
+                    trunk_max_calls,
+                )
                 .await
             {
-                Ok((true, active, max)) => {
-                    debug!(tenant_id, active, max, "tenant call slot acquired");
+                Ok((true, active, max, trunk_active, trunk_max)) => {
+                    debug!(
+                        tenant_id,
+                        trunk = %trunk_ctx.name,
+                        active,
+                        max,
+                        trunk_active,
+                        trunk_max,
+                        "call slot acquired"
+                    );
                 }
-                Ok((false, active, max)) => {
-                    warn!(tenant_id, active, max, "rejecting call — tenant concurrency cap reached");
+                Ok((false, active, max, trunk_active, trunk_max)) => {
+                    warn!(
+                        tenant_id,
+                        trunk = %trunk_ctx.name,
+                        active,
+                        max,
+                        trunk_active,
+                        trunk_max,
+                        "rejecting call — tenant or trunk concurrency cap reached"
+                    );
                     return Err(RouteError::from((
-                        anyhow!("tenant concurrency limit reached ({active}/{max})"),
+                        anyhow!(
+                            "concurrency limit reached: tenant {active}/{max}, trunk {trunk_active}/{trunk_max}"
+                        ),
                         Some(rsipstack::sip::StatusCode::ServiceUnavailable),
                     )));
                 }
@@ -430,7 +457,9 @@ impl EdgeCallRouter {
                 queue.label.clone(),
             ),
             RouteResult::Application {
-                app_name, app_params, ..
+                app_name,
+                app_params,
+                ..
             } => (
                 RouteAction::Application,
                 Vec::new(),

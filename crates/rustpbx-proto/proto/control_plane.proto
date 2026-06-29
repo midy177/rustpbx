@@ -57,6 +57,7 @@ message ProposeWriteResponse {
   // Carry the acquire-slot result back through the leader-forwarding path.
   bool granted = 3;
   uint32 count = 4;
+  uint32 trunk_count = 5;
 }
 
 // ─── Call queues ──────────────────────────────────────────────────────────────
@@ -92,6 +93,9 @@ message IvrConfigList {
 message AcquireSlotRequest {
   int64  tenant_id = 1;
   string call_id   = 2;
+  // Optional source trunk context for trunk-level concurrency enforcement.
+  optional string trunk_name = 3;
+  optional uint32 trunk_max_calls = 4;
 }
 message AcquireSlotResponse {
   // Whether a slot was reserved. false → the tenant is at its concurrency cap.
@@ -100,6 +104,9 @@ message AcquireSlotResponse {
   uint32 active  = 2;
   // The tenant's configured limit; 0 = unlimited.
   uint32 max     = 3;
+  // Trunk active-call count and configured trunk limit; 0 limit = unlimited.
+  uint32 trunk_active = 4;
+  uint32 trunk_max    = 5;
 }
 
 // ─── Trunk ───────────────────────────────────────────────────────────────────

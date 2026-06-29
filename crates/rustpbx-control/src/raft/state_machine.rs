@@ -9,15 +9,15 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use openraft::storage::RaftSnapshotBuilder;
-use openraft::storage::RaftStateMachine;
-use openraft::storage::Snapshot;
+use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::StoredMembership;
-use openraft::EntryPayload;
+use openraft::storage::RaftSnapshotBuilder;
+use openraft::storage::RaftStateMachine;
+use openraft::storage::Snapshot;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -102,6 +102,14 @@ fn tenant_slots(slots: &BTreeMap<String, CallSlotRecord>, tenant_id: i64) -> u32
     slots.values().filter(|s| s.tenant_id == tenant_id).count() as u32
 }
 
+/// Count a tenant+trunk's currently-held slots in the map.
+fn trunk_slots(slots: &BTreeMap<String, CallSlotRecord>, tenant_id: i64, trunk_name: &str) -> u32 {
+    slots
+        .values()
+        .filter(|s| s.tenant_id == tenant_id && s.trunk_name.as_deref() == Some(trunk_name))
+        .count() as u32
+}
+
 /// Apply one command to the registry maps. Pure function of (data, command) so
 /// the result is identical on every replica.
 fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryResponse {
@@ -111,7 +119,12 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             workers.insert(record.worker_id.clone(), record);
             RegistryResponse::known(true, 0)
         }
-        RegistryCommand::Heartbeat { worker_id, active_calls, cpu_usage, at_ms } => {
+        RegistryCommand::Heartbeat {
+            worker_id,
+            active_calls,
+            cpu_usage,
+            at_ms,
+        } => {
             if let Some(w) = workers.get_mut(&worker_id) {
                 w.active_calls = active_calls;
                 w.cpu_usage = cpu_usage;
@@ -145,7 +158,11 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             data.edges.insert(record.edge_id.clone(), record);
             RegistryResponse::known(true, 0)
         }
-        RegistryCommand::EdgeHeartbeat { edge_id, active_calls, at_ms } => {
+        RegistryCommand::EdgeHeartbeat {
+            edge_id,
+            active_calls,
+            at_ms,
+        } => {
             if let Some(e) = data.edges.get_mut(&edge_id) {
                 e.active_calls = active_calls;
                 e.last_heartbeat_ms = at_ms;
@@ -165,12 +182,29 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             RegistryResponse::known(true, removed)
         }
         // ── Per-tenant call slots ───────────────────────────────────────────────
-        RegistryCommand::AcquireCallSlot { call_id, tenant_id, max, at_ms } => {
+        RegistryCommand::AcquireCallSlot {
+            call_id,
+            tenant_id,
+            max,
+            trunk_name,
+            trunk_max,
+            at_ms,
+        } => {
             let slots = &mut data.call_slots;
             // Idempotent: re-acquiring an existing call_id is always granted.
             if slots.contains_key(&call_id) {
                 let count = tenant_slots(slots, tenant_id);
-                return RegistryResponse { known: true, removed: 0, granted: true, count };
+                let trunk_count = trunk_name
+                    .as_deref()
+                    .map(|name| trunk_slots(slots, tenant_id, name))
+                    .unwrap_or(0);
+                return RegistryResponse {
+                    known: true,
+                    removed: 0,
+                    granted: true,
+                    count,
+                    trunk_count,
+                };
             }
             let current = tenant_slots(slots, tenant_id);
             // Enforce the cap (evaluated here, in log order, so it's linearizable).
@@ -178,10 +212,45 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                 && m > 0
                 && current >= m
             {
-                return RegistryResponse { known: true, removed: 0, granted: false, count: current };
+                return RegistryResponse {
+                    known: true,
+                    removed: 0,
+                    granted: false,
+                    count: current,
+                    trunk_count: 0,
+                };
             }
-            slots.insert(call_id, CallSlotRecord { tenant_id, at_ms });
-            RegistryResponse { known: true, removed: 0, granted: true, count: current + 1 }
+            let trunk_current = trunk_name
+                .as_deref()
+                .map(|name| trunk_slots(slots, tenant_id, name))
+                .unwrap_or(0);
+            if let Some(m) = trunk_max
+                && m > 0
+                && trunk_current >= m
+            {
+                return RegistryResponse {
+                    known: true,
+                    removed: 0,
+                    granted: false,
+                    count: current,
+                    trunk_count: trunk_current,
+                };
+            }
+            slots.insert(
+                call_id,
+                CallSlotRecord {
+                    tenant_id,
+                    trunk_name,
+                    at_ms,
+                },
+            );
+            RegistryResponse {
+                known: true,
+                removed: 0,
+                granted: true,
+                count: current + 1,
+                trunk_count: trunk_current + 1,
+            }
         }
         RegistryCommand::ReleaseCallSlot { call_id } => {
             let removed = data.call_slots.remove(&call_id).is_some() as u32;
@@ -225,8 +294,8 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             edges,
             call_slots,
         };
-        let bytes = serde_json::to_vec(&stored)
-            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        let bytes =
+            serde_json::to_vec(&stored).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
 
         let meta = SnapshotMeta {
             last_log_id: last_applied,
@@ -250,8 +319,13 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, openraft::BasicNode>), StorageError<NodeId>>
-    {
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
         let data = self.data.lock().await;
         Ok((data.last_applied, data.last_membership.clone()))
     }

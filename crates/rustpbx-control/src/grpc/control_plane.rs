@@ -351,24 +351,42 @@ impl ControlPlane for ControlPlaneService {
         } else {
             None
         };
-        let (granted, active) = self
+        let trunk_name = req
+            .trunk_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let trunk_max = req.trunk_max_calls.filter(|m| *m > 0);
+        let (granted, active, trunk_active) = self
             .workers
-            .acquire_call_slot(&req.call_id, req.tenant_id, max)
+            .acquire_call_slot(
+                &req.call_id,
+                req.tenant_id,
+                max,
+                trunk_name.clone(),
+                trunk_max,
+            )
             .await
             .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
         if !granted {
             warn!(
                 tenant = req.tenant_id,
+                trunk = ?trunk_name,
                 call_id = %req.call_id,
                 active,
                 max = ?max,
-                "call slot denied — tenant at concurrency cap"
+                trunk_active,
+                trunk_max = ?trunk_max,
+                "call slot denied — tenant or trunk concurrency cap reached"
             );
         }
         Ok(Response::new(AcquireSlotResponse {
             granted,
             active,
             max: max.unwrap_or(0),
+            trunk_active,
+            trunk_max: trunk_max.unwrap_or(0),
         }))
     }
 
@@ -410,6 +428,7 @@ impl ControlPlane for ControlPlaneService {
                 removed: resp.removed,
                 granted: resp.granted,
                 count: resp.count,
+                trunk_count: resp.trunk_count,
             },
         ))
     }

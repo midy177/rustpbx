@@ -110,6 +110,9 @@ impl EdgeRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallSlotRecord {
     pub tenant_id: i64,
+    /// Optional source trunk name for trunk-level concurrency accounting.
+    #[serde(default)]
+    pub trunk_name: Option<String>,
     /// Unix-millis when the slot was reserved (for the TTL reaper backstop).
     pub at_ms: i64,
 }
@@ -162,6 +165,8 @@ pub enum RegistryCommand {
         call_id: String,
         tenant_id: i64,
         max: Option<u32>,
+        trunk_name: Option<String>,
+        trunk_max: Option<u32>,
         at_ms: i64,
     },
     /// Release the slot held by `call_id` (called when its CDR arrives).
@@ -188,6 +193,9 @@ pub struct RegistryResponse {
     /// AcquireCallSlot: the tenant's active-call count after applying.
     #[serde(default)]
     pub count: u32,
+    /// AcquireCallSlot: source-trunk active-call count after applying.
+    #[serde(default)]
+    pub trunk_count: u32,
 }
 
 fn default_true() -> bool {
@@ -202,6 +210,7 @@ impl RegistryResponse {
             removed,
             granted: true,
             count: 0,
+            trunk_count: 0,
         }
     }
 }
