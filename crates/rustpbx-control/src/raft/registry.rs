@@ -243,6 +243,7 @@ impl RaftRegistry {
             granted: resp.granted,
             count: resp.count,
             trunk_count: resp.trunk_count,
+            trunk_cps_count: resp.trunk_cps_count,
         })
     }
 
@@ -371,7 +372,8 @@ impl RaftRegistry {
         max: Option<u32>,
         trunk_name: Option<String>,
         trunk_max: Option<u32>,
-    ) -> Result<(bool, u32, u32)> {
+        trunk_max_cps: Option<u32>,
+    ) -> Result<(bool, u32, u32, u32)> {
         let resp = self
             .propose(RegistryCommand::AcquireCallSlot {
                 call_id: call_id.to_string(),
@@ -379,10 +381,16 @@ impl RaftRegistry {
                 max,
                 trunk_name,
                 trunk_max,
+                trunk_max_cps,
                 at_ms: now_ms(),
             })
             .await?;
-        Ok((resp.granted, resp.count, resp.trunk_count))
+        Ok((
+            resp.granted,
+            resp.count,
+            resp.trunk_count,
+            resp.trunk_cps_count,
+        ))
     }
 
     /// Release a call slot (on CDR). Returns whether a slot was held.
@@ -533,25 +541,25 @@ mod tests {
         let reg = start().await;
 
         // Tenant 1 capped at 2; tenant 2 capped at 1.
-        let (g, n, _) = reg
-            .acquire_call_slot("t1-a", 1, Some(2), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t1-a", 1, Some(2), None, None, None)
             .await
             .unwrap();
         assert!(g && n == 1);
-        let (g, n, _) = reg
-            .acquire_call_slot("t1-b", 1, Some(2), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t1-b", 1, Some(2), None, None, None)
             .await
             .unwrap();
         assert!(g && n == 2, "second call fills the cap");
-        let (g, n, _) = reg
-            .acquire_call_slot("t1-c", 1, Some(2), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t1-c", 1, Some(2), None, None, None)
             .await
             .unwrap();
         assert!(!g && n == 2, "third call is denied — tenant at cap");
 
         // A different tenant has its own independent count.
-        let (g, n, _) = reg
-            .acquire_call_slot("t2-a", 2, Some(1), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t2-a", 2, Some(1), None, None, None)
             .await
             .unwrap();
         assert!(g && n == 1, "tenant 2 is independent of tenant 1");
@@ -560,8 +568,8 @@ mod tests {
 
         // Idempotent re-acquire of an existing call_id is always granted and
         // does not double-count.
-        let (g, n, _) = reg
-            .acquire_call_slot("t1-a", 1, Some(2), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t1-a", 1, Some(2), None, None, None)
             .await
             .unwrap();
         assert!(g && n == 2, "re-acquiring an existing slot is idempotent");
@@ -569,8 +577,8 @@ mod tests {
         // Releasing one frees capacity for a new call.
         assert!(reg.release_call_slot("t1-a").await.unwrap());
         assert_eq!(reg.tenant_active_calls(1).await, 1);
-        let (g, n, _) = reg
-            .acquire_call_slot("t1-d", 1, Some(2), None, None)
+        let (g, n, _, _) = reg
+            .acquire_call_slot("t1-d", 1, Some(2), None, None, None)
             .await
             .unwrap();
         assert!(g && n == 2, "a freed slot can be re-used");
@@ -579,8 +587,8 @@ mod tests {
         assert!(!reg.release_call_slot("nope").await.unwrap());
 
         // No limit (None) → always granted.
-        let (g, _, _) = reg
-            .acquire_call_slot("nolimit", 9, None, None, None)
+        let (g, _, _, _) = reg
+            .acquire_call_slot("nolimit", 9, None, None, None, None)
             .await
             .unwrap();
         assert!(g, "tenants with no cap are never denied");
@@ -590,24 +598,45 @@ mod tests {
     async fn call_slots_enforce_per_trunk_limit() {
         let reg = start().await;
 
-        let (g, tenant_n, trunk_n) = reg
-            .acquire_call_slot("a-1", 1, Some(10), Some("carrier-a".to_string()), Some(1))
+        let (g, tenant_n, trunk_n, _) = reg
+            .acquire_call_slot(
+                "a-1",
+                1,
+                Some(10),
+                Some("carrier-a".to_string()),
+                Some(1),
+                None,
+            )
             .await
             .unwrap();
         assert!(g);
         assert_eq!(tenant_n, 1);
         assert_eq!(trunk_n, 1);
 
-        let (g, tenant_n, trunk_n) = reg
-            .acquire_call_slot("a-2", 1, Some(10), Some("carrier-a".to_string()), Some(1))
+        let (g, tenant_n, trunk_n, _) = reg
+            .acquire_call_slot(
+                "a-2",
+                1,
+                Some(10),
+                Some("carrier-a".to_string()),
+                Some(1),
+                None,
+            )
             .await
             .unwrap();
         assert!(!g, "second call on same capped trunk is denied");
         assert_eq!(tenant_n, 1);
         assert_eq!(trunk_n, 1);
 
-        let (g, tenant_n, trunk_n) = reg
-            .acquire_call_slot("b-1", 1, Some(10), Some("carrier-b".to_string()), Some(1))
+        let (g, tenant_n, trunk_n, _) = reg
+            .acquire_call_slot(
+                "b-1",
+                1,
+                Some(10),
+                Some("carrier-b".to_string()),
+                Some(1),
+                None,
+            )
             .await
             .unwrap();
         assert!(g, "different trunk has its own cap");
@@ -616,9 +645,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_slots_enforce_per_trunk_cps() {
+        let reg = start().await;
+
+        let (g, _, _, cps_n) = reg
+            .acquire_call_slot(
+                "cps-a-1",
+                1,
+                Some(10),
+                Some("carrier-a".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(g);
+        assert_eq!(cps_n, 1);
+
+        let (g, _, _, cps_n) = reg
+            .acquire_call_slot(
+                "cps-a-2",
+                1,
+                Some(10),
+                Some("carrier-a".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(!g, "second start on same trunk in the 1s window is denied");
+        assert_eq!(cps_n, 1);
+
+        let (g, _, _, cps_n) = reg
+            .acquire_call_slot(
+                "cps-b-1",
+                1,
+                Some(10),
+                Some("carrier-b".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(g, "different trunk has its own CPS window");
+        assert_eq!(cps_n, 1);
+    }
+
+    #[tokio::test]
     async fn call_slots_reaper_frees_leaked_slots() {
         let reg = start().await;
-        reg.acquire_call_slot("live", 1, Some(10), None, None)
+        reg.acquire_call_slot("live", 1, Some(10), None, None, None)
             .await
             .unwrap();
         // Inject a slot with an ancient timestamp (simulating a leaked reservation).
@@ -629,6 +705,7 @@ mod tests {
                 max: Some(10),
                 trunk_name: None,
                 trunk_max: None,
+                trunk_max_cps: None,
                 at_ms: 1, // 1970
             })
             .await

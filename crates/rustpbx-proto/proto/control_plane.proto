@@ -58,6 +58,7 @@ message ProposeWriteResponse {
   bool granted = 3;
   uint32 count = 4;
   uint32 trunk_count = 5;
+  uint32 trunk_cps_count = 6;
 }
 
 // ─── Call queues ──────────────────────────────────────────────────────────────
@@ -96,6 +97,7 @@ message AcquireSlotRequest {
   // Optional source trunk context for trunk-level concurrency enforcement.
   optional string trunk_name = 3;
   optional uint32 trunk_max_calls = 4;
+  optional uint32 trunk_max_cps = 5;
 }
 message AcquireSlotResponse {
   // Whether a slot was reserved. false → the tenant is at its concurrency cap.
@@ -107,6 +109,8 @@ message AcquireSlotResponse {
   // Trunk active-call count and configured trunk limit; 0 limit = unlimited.
   uint32 trunk_active = 4;
   uint32 trunk_max    = 5;
+  uint32 trunk_cps_active = 6;
+  uint32 trunk_cps_max    = 7;
 }
 
 // ─── Trunk ───────────────────────────────────────────────────────────────────

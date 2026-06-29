@@ -110,7 +110,8 @@ impl GrpcControlClient {
         call_id: &str,
         trunk_name: Option<&str>,
         trunk_max_calls: Option<u32>,
-    ) -> Result<(bool, u32, u32, u32, u32)> {
+        trunk_max_cps: Option<u32>,
+    ) -> Result<(bool, u32, u32, u32, u32, u32, u32)> {
         use crate::proto::control::AcquireSlotRequest;
         let resp = self
             .client
@@ -119,6 +120,7 @@ impl GrpcControlClient {
                 call_id: call_id.to_string(),
                 trunk_name: trunk_name.map(str::to_string),
                 trunk_max_calls,
+                trunk_max_cps,
             })
             .await?
             .into_inner();
@@ -128,6 +130,8 @@ impl GrpcControlClient {
             resp.max,
             resp.trunk_active,
             resp.trunk_max,
+            resp.trunk_cps_active,
+            resp.trunk_cps_max,
         ))
     }
 

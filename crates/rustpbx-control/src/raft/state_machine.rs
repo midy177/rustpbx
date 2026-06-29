@@ -22,8 +22,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::types::{
-    CallSlotRecord, EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord,
+    CallSlotRecord, CallStartRecord, EdgeRecord, NodeId, RegistryCommand, RegistryResponse,
+    TypeConfig, WorkerRecord,
 };
+
+const CPS_WINDOW_MS: i64 = 1_000;
 
 /// The data captured in a snapshot: the full state machine contents.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -38,6 +41,9 @@ pub struct StoredSnapshot {
     /// Per-tenant call slots keyed by call_id (defaulted for older snapshots).
     #[serde(default)]
     pub call_slots: BTreeMap<String, CallSlotRecord>,
+    /// Recently accepted call starts keyed by call_id (for CPS enforcement).
+    #[serde(default)]
+    pub call_starts: BTreeMap<String, CallStartRecord>,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -51,6 +57,8 @@ struct StateMachineData {
     edges: BTreeMap<String, EdgeRecord>,
     /// call_id -> reserved call slot (per-tenant concurrency control)
     call_slots: BTreeMap<String, CallSlotRecord>,
+    /// call_id -> recent accepted start (trunk CPS control)
+    call_starts: BTreeMap<String, CallStartRecord>,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -107,6 +115,23 @@ fn trunk_slots(slots: &BTreeMap<String, CallSlotRecord>, tenant_id: i64, trunk_n
     slots
         .values()
         .filter(|s| s.tenant_id == tenant_id && s.trunk_name.as_deref() == Some(trunk_name))
+        .count() as u32
+}
+
+/// Count a tenant+trunk's accepted starts in the current CPS window.
+fn trunk_cps(
+    starts: &BTreeMap<String, CallStartRecord>,
+    tenant_id: i64,
+    trunk_name: &str,
+    since_ms: i64,
+) -> u32 {
+    starts
+        .values()
+        .filter(|s| {
+            s.at_ms >= since_ms
+                && s.tenant_id == tenant_id
+                && s.trunk_name.as_deref() == Some(trunk_name)
+        })
         .count() as u32
 }
 
@@ -188,9 +213,13 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             max,
             trunk_name,
             trunk_max,
+            trunk_max_cps,
             at_ms,
         } => {
+            data.call_starts
+                .retain(|_, start| start.at_ms >= at_ms.saturating_sub(CPS_WINDOW_MS));
             let slots = &mut data.call_slots;
+            let starts = &mut data.call_starts;
             // Idempotent: re-acquiring an existing call_id is always granted.
             if slots.contains_key(&call_id) {
                 let count = tenant_slots(slots, tenant_id);
@@ -198,12 +227,19 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                     .as_deref()
                     .map(|name| trunk_slots(slots, tenant_id, name))
                     .unwrap_or(0);
+                let trunk_cps_count = trunk_name
+                    .as_deref()
+                    .map(|name| {
+                        trunk_cps(starts, tenant_id, name, at_ms.saturating_sub(CPS_WINDOW_MS))
+                    })
+                    .unwrap_or(0);
                 return RegistryResponse {
                     known: true,
                     removed: 0,
                     granted: true,
                     count,
                     trunk_count,
+                    trunk_cps_count,
                 };
             }
             let current = tenant_slots(slots, tenant_id);
@@ -218,11 +254,16 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                     granted: false,
                     count: current,
                     trunk_count: 0,
+                    trunk_cps_count: 0,
                 };
             }
             let trunk_current = trunk_name
                 .as_deref()
                 .map(|name| trunk_slots(slots, tenant_id, name))
+                .unwrap_or(0);
+            let trunk_cps_current = trunk_name
+                .as_deref()
+                .map(|name| trunk_cps(starts, tenant_id, name, at_ms.saturating_sub(CPS_WINDOW_MS)))
                 .unwrap_or(0);
             if let Some(m) = trunk_max
                 && m > 0
@@ -234,11 +275,33 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                     granted: false,
                     count: current,
                     trunk_count: trunk_current,
+                    trunk_cps_count: trunk_cps_current,
+                };
+            }
+            if let Some(m) = trunk_max_cps
+                && m > 0
+                && trunk_cps_current >= m
+            {
+                return RegistryResponse {
+                    known: true,
+                    removed: 0,
+                    granted: false,
+                    count: current,
+                    trunk_count: trunk_current,
+                    trunk_cps_count: trunk_cps_current,
                 };
             }
             slots.insert(
-                call_id,
+                call_id.clone(),
                 CallSlotRecord {
+                    tenant_id,
+                    trunk_name: trunk_name.clone(),
+                    at_ms,
+                },
+            );
+            starts.insert(
+                call_id,
+                CallStartRecord {
                     tenant_id,
                     trunk_name,
                     at_ms,
@@ -250,6 +313,7 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                 granted: true,
                 count: current + 1,
                 trunk_count: trunk_current + 1,
+                trunk_cps_count: trunk_cps_current + 1,
             }
         }
         RegistryCommand::ReleaseCallSlot { call_id } => {
@@ -267,7 +331,7 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (last_applied, last_membership, workers, edges, call_slots) = {
+        let (last_applied, last_membership, workers, edges, call_slots, call_starts) = {
             let data = self.data.lock().await;
             (
                 data.last_applied,
@@ -275,6 +339,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
                 data.workers.clone(),
                 data.edges.clone(),
                 data.call_slots.clone(),
+                data.call_starts.clone(),
             )
         };
 
@@ -293,6 +358,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             workers,
             edges,
             call_slots,
+            call_starts,
         };
         let bytes =
             serde_json::to_vec(&stored).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -381,6 +447,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.workers = stored.workers;
         data.edges = stored.edges;
         data.call_slots = stored.call_slots;
+        data.call_starts = stored.call_starts;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {

@@ -385,6 +385,11 @@ impl EdgeCallRouter {
                 .get_trunk(&trunk_ctx.name)
                 .and_then(|trunk| trunk.max_calls)
                 .filter(|max| *max > 0);
+            let trunk_max_cps = self
+                .data_context
+                .get_trunk(&trunk_ctx.name)
+                .and_then(|trunk| trunk.max_cps)
+                .filter(|max| *max > 0);
             match self
                 .control
                 .write()
@@ -394,10 +399,19 @@ impl EdgeCallRouter {
                     &session_id,
                     Some(&trunk_ctx.name),
                     trunk_max_calls,
+                    trunk_max_cps,
                 )
                 .await
             {
-                Ok((true, active, max, trunk_active, trunk_max)) => {
+                Ok((
+                    true,
+                    active,
+                    max,
+                    trunk_active,
+                    trunk_max,
+                    trunk_cps_active,
+                    trunk_cps_max,
+                )) => {
                     debug!(
                         tenant_id,
                         trunk = %trunk_ctx.name,
@@ -405,10 +419,20 @@ impl EdgeCallRouter {
                         max,
                         trunk_active,
                         trunk_max,
+                        trunk_cps_active,
+                        trunk_cps_max,
                         "call slot acquired"
                     );
                 }
-                Ok((false, active, max, trunk_active, trunk_max)) => {
+                Ok((
+                    false,
+                    active,
+                    max,
+                    trunk_active,
+                    trunk_max,
+                    trunk_cps_active,
+                    trunk_cps_max,
+                )) => {
                     warn!(
                         tenant_id,
                         trunk = %trunk_ctx.name,
@@ -416,11 +440,13 @@ impl EdgeCallRouter {
                         max,
                         trunk_active,
                         trunk_max,
+                        trunk_cps_active,
+                        trunk_cps_max,
                         "rejecting call — tenant or trunk concurrency cap reached"
                     );
                     return Err(RouteError::from((
                         anyhow!(
-                            "concurrency limit reached: tenant {active}/{max}, trunk {trunk_active}/{trunk_max}"
+                            "concurrency limit reached: tenant {active}/{max}, trunk {trunk_active}/{trunk_max}, cps {trunk_cps_active}/{trunk_cps_max}"
                         ),
                         Some(rsipstack::sip::StatusCode::ServiceUnavailable),
                     )));

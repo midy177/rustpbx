@@ -117,6 +117,15 @@ pub struct CallSlotRecord {
     pub at_ms: i64,
 }
 
+/// A recently accepted call start, used for trunk CPS enforcement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallStartRecord {
+    pub tenant_id: i64,
+    #[serde(default)]
+    pub trunk_name: Option<String>,
+    pub at_ms: i64,
+}
+
 /// Commands applied to the replicated worker registry (the Raft `AppData`).
 ///
 /// Every mutation of the registry goes through `Raft::client_write` with one of
@@ -167,6 +176,7 @@ pub enum RegistryCommand {
         max: Option<u32>,
         trunk_name: Option<String>,
         trunk_max: Option<u32>,
+        trunk_max_cps: Option<u32>,
         at_ms: i64,
     },
     /// Release the slot held by `call_id` (called when its CDR arrives).
@@ -196,6 +206,9 @@ pub struct RegistryResponse {
     /// AcquireCallSlot: source-trunk active-call count after applying.
     #[serde(default)]
     pub trunk_count: u32,
+    /// AcquireCallSlot: source-trunk starts in the current 1s CPS window.
+    #[serde(default)]
+    pub trunk_cps_count: u32,
 }
 
 fn default_true() -> bool {
@@ -211,6 +224,7 @@ impl RegistryResponse {
             granted: true,
             count: 0,
             trunk_count: 0,
+            trunk_cps_count: 0,
         }
     }
 }
