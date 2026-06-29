@@ -301,6 +301,7 @@ message WorkerInfo {
   string edge_worker_addr = 9;
   // Detected NAT type (open/cone/symmetric/nat/blocked/unknown), from STUN.
   string nat_type = 10;
+  repeated string capabilities = 11;
 }
 
 message RegisterAck    { bool accepted = 1; }
@@ -315,6 +316,8 @@ message GetWorkersRequest  {
   optional int64 tenant_id = 1;
   // All requested labels must be present with the same value on the worker.
   map<string, string> required_labels = 2;
+  // All requested capabilities must be advertised by the worker.
+  repeated string required_capabilities = 3;
 }
 message WorkerList         { repeated WorkerInfo workers = 1; }
 

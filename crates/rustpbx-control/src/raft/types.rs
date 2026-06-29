@@ -55,6 +55,8 @@ pub struct WorkerRecord {
     pub cpu_usage: f32,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// EdgeWorker gRPC address (host:port) for AllocateCall; empty if absent.
     #[serde(default)]
     pub edge_worker_addr: String,

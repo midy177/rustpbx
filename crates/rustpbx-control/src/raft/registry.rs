@@ -425,13 +425,14 @@ impl RaftRegistry {
     /// Healthy workers with spare capacity, most-available first.
     #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
-        self.available_with_labels(&HashMap::new()).await
+        self.available_with_constraints(&HashMap::new(), &[]).await
     }
 
-    /// Healthy workers matching all required labels, most-available first.
-    pub async fn available_with_labels(
+    /// Healthy workers matching all required labels and capabilities, most-available first.
+    pub async fn available_with_constraints(
         &self,
         required_labels: &HashMap<String, String>,
+        required_capabilities: &[String],
     ) -> Vec<WorkerRecord> {
         let now = now_ms();
         let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
@@ -445,6 +446,11 @@ impl RaftRegistry {
                 required_labels
                     .iter()
                     .all(|(k, v)| w.labels.get(k) == Some(v))
+            })
+            .filter(|w| {
+                required_capabilities
+                    .iter()
+                    .all(|cap| w.capabilities.iter().any(|c| c == cap))
             })
             .collect();
         workers.sort_by_key(|w| std::cmp::Reverse(w.available_capacity()));
@@ -467,6 +473,7 @@ mod tests {
             active_calls: 0,
             cpu_usage: 0.0,
             labels: Default::default(),
+            capabilities: Default::default(),
             edge_worker_addr: String::new(),
             nat_type: String::new(),
             registered_at_ms: 0,
@@ -737,6 +744,37 @@ mod tests {
 
         let avail = reg.available().await;
         assert_eq!(avail.len(), 2, "fresh workers are healthy and available");
+    }
+
+    #[tokio::test]
+    async fn available_filters_by_labels_and_capabilities() {
+        let reg = start().await;
+        let mut labels = HashMap::new();
+        labels.insert("region".to_string(), "us-east".to_string());
+
+        let mut media = rec("media");
+        media.labels = labels.clone();
+        media.capabilities = vec!["rtp-gateway".to_string(), "recording".to_string()];
+
+        let mut basic = rec("basic");
+        basic.labels = labels.clone();
+        basic.capabilities = vec!["rtp-gateway".to_string()];
+
+        let mut west = rec("west");
+        west.labels
+            .insert("region".to_string(), "us-west".to_string());
+        west.capabilities = vec!["rtp-gateway".to_string(), "recording".to_string()];
+
+        reg.register(media).await.unwrap();
+        reg.register(basic).await.unwrap();
+        reg.register(west).await.unwrap();
+
+        let required_capabilities = vec!["recording".to_string()];
+        let avail = reg
+            .available_with_constraints(&labels, &required_capabilities)
+            .await;
+        let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(ids, vec!["media".to_string()]);
     }
 
     #[tokio::test]

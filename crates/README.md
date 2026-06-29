@@ -98,6 +98,7 @@ rtp_start_port     = 12000
 rtp_end_port       = 12100
 trusted_edges      = ["127.0.0.1"] # 信任来自 Edge 的内部 INVITE
 labels             = { region = "local", tier = "default" }
+capabilities       = ["rtp-gateway", "recording"]
 edge_sip_addr      = "127.0.0.1:5060"  # 出站起呼转发目标（Edge）
 edge_worker_addr   = "127.0.0.1:9092"  # Edge → Worker AllocateCall
 advertise_sip_addr = "127.0.0.1:5070"  # AllocateCall 返回给 Edge 的 SIP contact
@@ -118,6 +119,7 @@ udp_port           = 5060
 edge_id            = "edge-local"
 trusted_workers    = ["127.0.0.1"]  # 信任来自 Worker 的出站内部 INVITE
 worker_required_labels = { region = "local", tier = "default" }
+worker_required_capabilities = ["rtp-gateway"]
 edge_worker_addr   = "127.0.0.1:9093"  # 接收 Worker CallStateUpdate
 config_poll_secs   = 30
 log                = "info"
@@ -140,7 +142,8 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
 ### 调度与配额示例
 
 - Worker 通过 `labels = { region = "local", tier = "default" }` 注册调度标签。
-- Edge 通过 `worker_required_labels` 只选择标签完全匹配的 Worker。
+- Worker 通过 `capabilities = ["rtp-gateway", "recording"]` 注册能力。
+- Edge 通过 `worker_required_labels` 和 `worker_required_capabilities` 只选择完全匹配的 Worker。
 - Trunk 的 `max_concurrent` 会作为 trunk 级并发限制下发；`max_cps` 会作为
   trunk 级每秒新呼叫限制下发。两者都在 Control Raft 状态机里线性化执行，
   与租户 `max_concurrent_calls` 一起生效。
@@ -260,8 +263,8 @@ Worker → Edge 的 CDR 时间线状态上报。
    供单体和 Worker 共同调用，避免两套路由行为分叉。
 2. **RTP Gateway Phase 2**：把 PCM 注入和 SDP renegotiate 从 Phase-1 stub 接入
    真实 media-thread sink，并通过 `MediaEvent` 返回成功/失败。
-3. **调度增强**：Worker 注册补充 region、labels、capabilities；Control 按健康、
-   draining、容量、租户亲和、NAT 可达性进行打分选择。
+3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities 筛选；
+   后续继续补租户亲和、NAT 可达性打分选择。
 4. **状态流**：如果需要实时观测，继续补 Worker 呼叫过程中的 ringing/answered
    中间态 hook，而不是仅在 CDR 完成时回放时间线。
 

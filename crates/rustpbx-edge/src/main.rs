@@ -127,6 +127,7 @@ async fn main() -> Result<()> {
     let worker_selector = Arc::new(WorkerSelector::new(
         Arc::clone(&grpc_client),
         cfg.worker_required_labels.clone(),
+        cfg.worker_required_capabilities.clone(),
     ));
 
     // ── CancellationToken ─────────────────────────────────────────────────────

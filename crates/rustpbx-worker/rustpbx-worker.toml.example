@@ -33,6 +33,9 @@ worker_id = "worker-1"
 # Optional scheduling labels advertised to the Control Plane.
 labels = { region = "local", tier = "default" }
 
+# Optional scheduling capabilities advertised to the Control Plane.
+capabilities = ["rtp-gateway", "recording"]
+
 # Optional DB for IVR/queue state (empty → stateless) and recording root.
 # database_url = "sqlite://rustpbx-worker.sqlite3?mode=rwc"
 # recording_path = "/var/lib/rustpbx/recordings"

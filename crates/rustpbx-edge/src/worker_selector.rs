@@ -25,16 +25,19 @@ pub struct WorkerEndpoint {
 pub struct WorkerSelector {
     client: Arc<RwLock<GrpcControlClient>>,
     required_labels: HashMap<String, String>,
+    required_capabilities: Vec<String>,
 }
 
 impl WorkerSelector {
     pub fn new(
         client: Arc<RwLock<GrpcControlClient>>,
         required_labels: HashMap<String, String>,
+        required_capabilities: Vec<String>,
     ) -> Self {
         Self {
             client,
             required_labels,
+            required_capabilities,
         }
     }
 
@@ -42,13 +45,18 @@ impl WorkerSelector {
     pub async fn select(&self, tenant_id: Option<i64>) -> Result<WorkerEndpoint> {
         let mut client = self.client.write().await;
         let list = client
-            .get_available_workers(tenant_id, self.required_labels.clone())
+            .get_available_workers(
+                tenant_id,
+                self.required_labels.clone(),
+                self.required_capabilities.clone(),
+            )
             .await?;
 
         if list.workers.is_empty() {
             return Err(anyhow!(
-                "no available workers matching labels {:?}",
-                self.required_labels
+                "no available workers matching labels {:?} and capabilities {:?}",
+                self.required_labels,
+                self.required_capabilities
             ));
         }
 
@@ -62,6 +70,7 @@ impl WorkerSelector {
             active = best.active_calls,
             max = best.max_concurrent,
             labels = ?best.labels,
+            capabilities = ?best.capabilities,
             "selected worker"
         );
 

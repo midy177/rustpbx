@@ -37,6 +37,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub labels: HashMap<String, String>,
 
+    /// Worker capabilities advertised to the Control Plane for scheduling.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+
     /// Worker instance ID (defaults to hostname:pid)
     #[serde(default = "default_worker_id")]
     pub worker_id: String,
@@ -194,6 +198,7 @@ impl Default for WorkerConfig {
             rtp_end_port: default_rtp_end(),
             max_concurrent: default_max_concurrent(),
             labels: HashMap::new(),
+            capabilities: Vec::new(),
             worker_id: default_worker_id(),
             database_url: default_database_url(),
             recording_path: default_recording_path(),

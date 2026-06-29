@@ -88,12 +88,14 @@ impl GrpcControlClient {
         &mut self,
         tenant_id: Option<i64>,
         required_labels: HashMap<String, String>,
+        required_capabilities: Vec<String>,
     ) -> Result<WorkerList> {
         let resp = self
             .client
             .get_available_workers(GetWorkersRequest {
                 tenant_id,
                 required_labels,
+                required_capabilities,
             })
             .await?;
         Ok(resp.into_inner())

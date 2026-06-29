@@ -33,6 +33,7 @@ pub struct ControlClient {
     rtp_end_port: u32,
     max_concurrent: u32,
     labels: HashMap<String, String>,
+    capabilities: Vec<String>,
     /// EdgeWorker gRPC addr advertised for AllocateCall (empty if disabled).
     edge_worker_addr: String,
     /// Detected NAT type (STUN), reported at registration. Set by main.
@@ -64,6 +65,7 @@ impl ControlClient {
             rtp_end_port: cfg.rtp_end_port as u32,
             max_concurrent: cfg.max_concurrent,
             labels: cfg.labels.clone(),
+            capabilities: cfg.capabilities.clone(),
             edge_worker_addr: cfg.edge_worker_addr.clone().unwrap_or_default(),
             nat_type: String::new(),
             active_calls: Arc::new(AtomicU32::new(0)),
@@ -121,6 +123,7 @@ impl ControlClient {
                 max_concurrent: self.max_concurrent,
                 active_calls: self.active_calls.load(Ordering::Relaxed),
                 labels: self.labels.clone(),
+                capabilities: self.capabilities.clone(),
                 edge_worker_addr: self.edge_worker_addr.clone(),
                 nat_type: self.nat_type.clone(),
             })

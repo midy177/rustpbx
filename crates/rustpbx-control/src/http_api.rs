@@ -2044,6 +2044,7 @@ struct WorkerView {
     available_capacity: u32,
     cpu_usage: f32,
     labels: HashMap<String, String>,
+    capabilities: Vec<String>,
     nat_type: String,
     registered_at: String,
     last_heartbeat_secs_ago: u64,
@@ -2078,6 +2079,7 @@ async fn list_workers(
             max_concurrent: w.max_concurrent,
             cpu_usage: w.cpu_usage,
             labels: w.labels,
+            capabilities: w.capabilities,
             nat_type: w.nat_type,
             draining: w.draining,
         })

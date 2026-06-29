@@ -72,6 +72,11 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub worker_required_labels: HashMap<String, String>,
 
+    /// Capabilities a Worker must advertise before this Edge will dispatch calls to it.
+    /// Example: `["rtp-gateway", "recording"]`.
+    #[serde(default)]
+    pub worker_required_capabilities: Vec<String>,
+
     /// EdgeWorker gRPC listen address (`host:port`). When set, the Edge serves
     /// `CallStateUpdate` so Workers can report call state out-of-band. Empty →
     /// no control channel (state still flows over SIP).
@@ -161,6 +166,7 @@ impl Default for EdgeConfig {
             log: default_log(),
             trusted_workers: Vec::new(),
             worker_required_labels: HashMap::new(),
+            worker_required_capabilities: Vec::new(),
             edge_worker_addr: None,
             health_addr: None,
             tls: TlsClientConfig::default(),

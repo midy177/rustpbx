@@ -232,6 +232,7 @@ impl ControlPlane for ControlPlaneService {
                 active_calls: info.active_calls,
                 cpu_usage: 0.0,
                 labels: info.labels,
+                capabilities: info.capabilities,
                 edge_worker_addr: info.edge_worker_addr,
                 nat_type: info.nat_type,
                 // Timestamps are stamped by the registry at propose time.
@@ -313,7 +314,7 @@ impl ControlPlane for ControlPlaneService {
 
         let workers = self
             .workers
-            .available_with_labels(&req.required_labels)
+            .available_with_constraints(&req.required_labels, &req.required_capabilities)
             .await
             .into_iter()
             .map(|w| WorkerInfo {
@@ -325,6 +326,7 @@ impl ControlPlane for ControlPlaneService {
                 max_concurrent: w.max_concurrent,
                 active_calls: w.active_calls,
                 labels: w.labels,
+                capabilities: w.capabilities,
                 edge_worker_addr: w.edge_worker_addr,
                 nat_type: w.nat_type,
             })
