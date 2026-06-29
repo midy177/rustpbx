@@ -19,7 +19,6 @@ use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::Transport;
 use rsipstack::sip::Uri;
 use rsipstack::sip::prelude::HeadersExt;
-use rustpbx::call::cookie::{TenantId, TrunkContext};
 use rustpbx::call::{
     DialDirection, DialStrategy, Dialplan, Location, RouteInvite, RoutingState, TransactionCookie,
     user::SipUser,
@@ -33,7 +32,7 @@ use rustpbx_core::internal::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct WorkerCallRouter {
     pub data_context: Arc<ProxyDataContext>,
@@ -98,101 +97,32 @@ impl WorkerCallRouter {
             "worker received internal call from edge"
         );
 
-        // ── Resolve caller / callee URIs ──────────────────────────────────────
-        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
-        let caller_uri = caller
-            .from
-            .clone()
-            .or_else(|| original.from_header().ok().and_then(|h| h.uri().ok()))
-            .unwrap_or_else(|| callee_uri.clone());
-
         let session_id = original
             .call_id_header()
             .map(|h| h.value().to_string())
             .unwrap_or_else(|_| format!("worker-{}", std::process::id()));
 
-        // ── Build the base dialplan ───────────────────────────────────────────
-        let dial_direction = match ctx.direction {
-            InternalDirection::Inbound => DialDirection::Inbound,
-            InternalDirection::Outbound => DialDirection::Outbound,
-            InternalDirection::Internal => DialDirection::Internal,
-        };
-
-        let mut dialplan = Dialplan::new(session_id.clone(), original.clone(), dial_direction)
-            .with_caller(caller_uri.clone());
-
-        // ── Build flow based on routing action ────────────────────────────────
-        match ctx.action {
-            RouteAction::Forward => {
-                let locations = self.build_locations(&ctx, &callee_uri);
-                if locations.is_empty() {
-                    return Err(RouteError::from((
-                        anyhow!("forward action with no targets"),
-                        Some(rsipstack::sip::StatusCode::ServerInternalError),
-                    )));
-                }
-                let strategy = match ctx.dial_strategy {
-                    DialStrategyKind::Parallel => DialStrategy::Parallel(locations),
-                    DialStrategyKind::Sequential => DialStrategy::Sequential(locations),
-                };
-                dialplan = dialplan.with_targets(strategy);
-                debug!(targets = ctx.targets.len(), "built forward dialplan");
-            }
-            RouteAction::Application => {
-                let app_name = ctx.app_name.clone().ok_or_else(|| {
-                    RouteError::from((
-                        anyhow!("application action without app_name"),
-                        Some(rsipstack::sip::StatusCode::ServerInternalError),
-                    ))
-                })?;
-                dialplan = dialplan.with_application(app_name, ctx.app_params.clone(), true);
-                debug!(app = ?ctx.app_name, "built application dialplan");
-            }
-            RouteAction::Queue => {
-                let queue_name = ctx.queue_name.clone().ok_or_else(|| {
-                    RouteError::from((
-                        anyhow!("queue action without queue_name"),
-                        Some(rsipstack::sip::StatusCode::ServerInternalError),
-                    ))
-                })?;
-                let queue_plan = self.load_queue_plan(&queue_name).map_err(|e| {
-                    RouteError::from((
-                        anyhow!("failed to load queue '{}': {}", queue_name, e),
-                        Some(rsipstack::sip::StatusCode::ServerInternalError),
-                    ))
-                })?;
-                dialplan = dialplan.with_queue(queue_plan);
-                debug!(queue = %queue_name, "built queue dialplan");
-            }
-        }
-
-        // ── Configure media (Worker handles full RTP) ─────────────────────────
-        dialplan.media.proxy_mode = MediaProxyMode::All;
-        dialplan.media.external_ip = self.rtp_config.external_ip.clone();
-        dialplan.media.rtp_start_port = self.rtp_config.start_port;
-        dialplan.media.rtp_end_port = self.rtp_config.end_port;
-
-        // ── Recording ─────────────────────────────────────────────────────────
-        if ctx.record {
-            dialplan.recording.enabled = true;
-            dialplan.recording.auto_start = true;
-        }
-
-        // ── Max duration ──────────────────────────────────────────────────────
-        if let Some(secs) = ctx.max_duration_secs {
-            dialplan.max_call_duration = Some(std::time::Duration::from_secs(secs));
-        }
-
-        // ── Inject trunk context + tenant for CDR attribution ─────────────────
-        let trunk_ctx = TrunkContext {
-            id: ctx.trunk_id,
-            name: ctx.trunk_name.clone(),
-            tenant_id: ctx.tenant_id,
-            did_numbers: Vec::new(),
-        };
-        dialplan = dialplan.with_extension(trunk_ctx);
-        if let Some(tid) = ctx.tenant_id {
-            dialplan = dialplan.with_extension(TenantId(tid));
+        let action = ctx.action;
+        let target_count = ctx.targets.len();
+        let app_name = ctx.app_name.clone();
+        let queue_name = ctx.queue_name.clone();
+        let dialplan = crate::dialplan_resolver::build_internal_dialplan(
+            original,
+            &ctx,
+            caller,
+            &self.rtp_config,
+            |queue_name| self.load_queue_plan(queue_name),
+        )
+        .map_err(|e| {
+            RouteError::from((
+                anyhow!("internal dialplan build failed: {e}"),
+                Some(rsipstack::sip::StatusCode::ServerInternalError),
+            ))
+        })?;
+        match action {
+            RouteAction::Forward => debug!(targets = target_count, "built forward dialplan"),
+            RouteAction::Application => debug!(app = ?app_name, "built application dialplan"),
+            RouteAction::Queue => debug!(queue = ?queue_name, "built queue dialplan"),
         }
 
         // ── Track active calls ────────────────────────────────────────────────
@@ -221,7 +151,8 @@ impl WorkerCallRouter {
         caller: &SipUser,
         cookie: &TransactionCookie,
     ) -> std::result::Result<Dialplan, RouteError> {
-        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
+        let callee_uri = crate::dialplan_resolver::resolve_callee_uri(original)
+            .map_err(|e| RouteError::from((e, None)))?;
         let caller_uri = caller
             .from
             .clone()
@@ -257,10 +188,7 @@ impl WorkerCallRouter {
             .with_caller(caller_uri)
             .with_route_invite(route_invite)
             .with_passthrough_failure(true);
-        dialplan.media.proxy_mode = MediaProxyMode::All;
-        dialplan.media.external_ip = self.rtp_config.external_ip.clone();
-        dialplan.media.rtp_start_port = self.rtp_config.start_port;
-        dialplan.media.rtp_end_port = self.rtp_config.end_port;
+        crate::dialplan_resolver::apply_worker_media(&mut dialplan, &self.rtp_config);
         dialplan.recording = self
             .data_context
             .config()
@@ -368,7 +296,8 @@ impl WorkerCallRouter {
         // edge_sip_addr presence is guaranteed by the caller.
         let edge_addr = self.edge_sip_addr.as_deref().unwrap_or_default();
 
-        let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
+        let callee_uri = crate::dialplan_resolver::resolve_callee_uri(original)
+            .map_err(|e| RouteError::from((e, None)))?;
         let caller_uri = caller
             .from
             .clone()
@@ -494,10 +423,7 @@ impl WorkerCallRouter {
             .with_targets(DialStrategy::Sequential(vec![edge_location]));
 
         // Worker anchors media: Extension ↔ Worker ↔ Edge(bypass) ↔ Carrier.
-        dialplan.media.proxy_mode = MediaProxyMode::All;
-        dialplan.media.external_ip = self.rtp_config.external_ip.clone();
-        dialplan.media.rtp_start_port = self.rtp_config.start_port;
-        dialplan.media.rtp_end_port = self.rtp_config.end_port;
+        crate::dialplan_resolver::apply_worker_media(&mut dialplan, &self.rtp_config);
         // Let SIP failure codes from the Edge/carrier pass back to the extension.
         dialplan = dialplan.with_passthrough_failure(true);
 
@@ -509,29 +435,6 @@ impl WorkerCallRouter {
         );
 
         Ok(dialplan)
-    }
-
-    /// Build `Location` list from the context's targets, falling back to the
-    /// original callee URI if no explicit targets were provided.
-    fn build_locations(&self, ctx: &InternalCallContext, fallback_callee: &Uri) -> Vec<Location> {
-        if ctx.targets.is_empty() {
-            return vec![Location {
-                aor: fallback_callee.clone(),
-                ..Default::default()
-            }];
-        }
-        ctx.targets
-            .iter()
-            .filter_map(|uri_str| {
-                Uri::try_from(uri_str.as_str())
-                    .map(|uri| Location {
-                        aor: uri,
-                        ..Default::default()
-                    })
-                    .map_err(|e| warn!(uri = %uri_str, error = %e, "invalid target URI, skipping"))
-                    .ok()
-            })
-            .collect()
     }
 
     /// Resolve a queue plan by name from the data context.
@@ -547,21 +450,4 @@ impl WorkerCallRouter {
             .ok_or_else(|| anyhow!("queue '{}' not found", name))?;
         queue_cfg.to_queue_plan()
     }
-}
-
-/// Extract the callee URI: prefer Request-URI's user part, fall back to To header.
-fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<Uri> {
-    if origin
-        .uri
-        .user()
-        .map(|user| !user.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(origin.uri.clone());
-    }
-    origin
-        .to_header()
-        .map_err(anyhow::Error::from)?
-        .uri()
-        .map_err(anyhow::Error::from)
 }

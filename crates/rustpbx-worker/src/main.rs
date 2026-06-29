@@ -3,6 +3,7 @@ mod call_router;
 mod cdr_hook;
 mod config;
 mod control_client;
+mod dialplan_resolver;
 mod edge_worker;
 mod headers;
 mod internal_peer;

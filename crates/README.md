@@ -260,9 +260,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 后续按以下顺序推进：
 
-1. **抽共享 Dialplan Resolver**：把单体 `CallModule::default_resolve` 中的完整
-   same-realm、locator、forwarding、route hint、recording 逻辑抽成可复用组件，
-   供单体和 Worker 共同调用，避免两套路由行为分叉。
+1. **抽共享 Dialplan Resolver**：Worker 已抽出 `dialplan_resolver` 边界承载内部
+   INVITE → `Dialplan` 构建；单体 `CallModule::default_resolve` 接入需等根 `src/`
+   允许修改后再做，避免两套路由行为分叉。
 2. **RTP Gateway Phase 2**：把 PCM 注入和 SDP renegotiate 从 Phase-1 stub 接入
    真实 media-thread sink，并通过 `MediaEvent` 返回成功/失败。
 3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities、
