@@ -310,11 +310,14 @@ impl ControlPlane for ControlPlaneService {
         request: Request<GetWorkersRequest>,
     ) -> Result<Response<WorkerList>, Status> {
         let req = request.into_inner();
-        let _ = req.tenant_id;
 
         let workers = self
             .workers
-            .available_with_constraints(&req.required_labels, &req.required_capabilities)
+            .available_with_constraints(
+                req.tenant_id,
+                &req.required_labels,
+                &req.required_capabilities,
+            )
             .await
             .into_iter()
             .map(|w| WorkerInfo {

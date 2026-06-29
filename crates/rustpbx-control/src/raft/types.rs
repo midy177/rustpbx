@@ -75,6 +75,33 @@ impl WorkerRecord {
         self.max_concurrent.saturating_sub(self.active_calls)
     }
 
+    pub fn tenant_affinity_score(&self, tenant_id: Option<i64>) -> u8 {
+        let Some(tenant_id) = tenant_id else {
+            return 0;
+        };
+        let tenant_id = tenant_id.to_string();
+        let tenant_key = format!("tenant:{tenant_id}");
+        (self.labels.get("tenant_id") == Some(&tenant_id)
+            || self.labels.get("tenant") == Some(&tenant_id)
+            || self
+                .labels
+                .get(&tenant_key)
+                .is_some_and(|v| v == "true" || v == "1"))
+        .into()
+    }
+
+    pub fn nat_reachability_score(&self) -> u8 {
+        match self.nat_type.as_str() {
+            "open" => 5,
+            "cone" => 4,
+            "nat" => 3,
+            "" | "unknown" => 2,
+            "symmetric" => 1,
+            "blocked" => 0,
+            _ => 2,
+        }
+    }
+
     /// Healthy = not draining and heartbeat within `timeout_ms` of `now_ms`.
     pub fn is_healthy(&self, now_ms: i64, timeout_ms: i64) -> bool {
         !self.draining && now_ms.saturating_sub(self.last_heartbeat_ms) < timeout_ms

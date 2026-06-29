@@ -144,6 +144,8 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
 - Worker 通过 `labels = { region = "local", tier = "default" }` 注册调度标签。
 - Worker 通过 `capabilities = ["rtp-gateway", "recording"]` 注册能力。
 - Edge 通过 `worker_required_labels` 和 `worker_required_capabilities` 只选择完全匹配的 Worker。
+- 同容量时，Control 会优先选择带有 `tenant_id = "<id>"`、`tenant = "<id>"`
+  或 `tenant:<id> = "true"` 标签的 Worker，并按 NAT 可达性排序。
 - Trunk 的 `max_concurrent` 会作为 trunk 级并发限制下发；`max_cps` 会作为
   trunk 级每秒新呼叫限制下发。两者都在 Control Raft 状态机里线性化执行，
   与租户 `max_concurrent_calls` 一起生效。
@@ -263,8 +265,8 @@ Worker → Edge 的 CDR 时间线状态上报。
    供单体和 Worker 共同调用，避免两套路由行为分叉。
 2. **RTP Gateway Phase 2**：把 PCM 注入和 SDP renegotiate 从 Phase-1 stub 接入
    真实 media-thread sink，并通过 `MediaEvent` 返回成功/失败。
-3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities 筛选；
-   后续继续补租户亲和、NAT 可达性打分选择。
+3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities、
+   租户亲和、NAT 可达性筛选/排序；后续可继续补更细的跨 AZ/成本权重。
 4. **状态流**：如果需要实时观测，继续补 Worker 呼叫过程中的 ringing/answered
    中间态 hook，而不是仅在 CDR 完成时回放时间线。
 

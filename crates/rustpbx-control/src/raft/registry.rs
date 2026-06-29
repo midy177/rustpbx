@@ -425,12 +425,14 @@ impl RaftRegistry {
     /// Healthy workers with spare capacity, most-available first.
     #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
-        self.available_with_constraints(&HashMap::new(), &[]).await
+        self.available_with_constraints(None, &HashMap::new(), &[])
+            .await
     }
 
     /// Healthy workers matching all required labels and capabilities, most-available first.
     pub async fn available_with_constraints(
         &self,
+        tenant_id: Option<i64>,
         required_labels: &HashMap<String, String>,
         required_capabilities: &[String],
     ) -> Vec<WorkerRecord> {
@@ -453,7 +455,13 @@ impl RaftRegistry {
                     .all(|cap| w.capabilities.iter().any(|c| c == cap))
             })
             .collect();
-        workers.sort_by_key(|w| std::cmp::Reverse(w.available_capacity()));
+        workers.sort_by_key(|w| {
+            std::cmp::Reverse((
+                w.available_capacity(),
+                w.tenant_affinity_score(tenant_id),
+                w.nat_reachability_score(),
+            ))
+        });
         workers
     }
 }
@@ -771,10 +779,47 @@ mod tests {
 
         let required_capabilities = vec!["recording".to_string()];
         let avail = reg
-            .available_with_constraints(&labels, &required_capabilities)
+            .available_with_constraints(None, &labels, &required_capabilities)
             .await;
         let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
         assert_eq!(ids, vec!["media".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn available_scores_tenant_affinity_and_nat_after_capacity() {
+        let reg = start().await;
+
+        let mut generic = rec("generic");
+        generic.active_calls = 90;
+        generic.nat_type = "open".to_string();
+
+        let mut tenant_match = rec("tenant-match");
+        tenant_match.active_calls = 90;
+        tenant_match
+            .labels
+            .insert("tenant_id".to_string(), "42".to_string());
+        tenant_match.nat_type = "blocked".to_string();
+
+        let mut higher_capacity = rec("higher-capacity");
+        higher_capacity.active_calls = 80;
+        higher_capacity.nat_type = "symmetric".to_string();
+
+        reg.register(generic).await.unwrap();
+        reg.register(tenant_match).await.unwrap();
+        reg.register(higher_capacity).await.unwrap();
+
+        let avail = reg
+            .available_with_constraints(Some(42), &HashMap::new(), &[])
+            .await;
+        let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "higher-capacity".to_string(),
+                "tenant-match".to_string(),
+                "generic".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
