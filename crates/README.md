@@ -99,6 +99,9 @@ rtp_end_port       = 12100
 trusted_edges      = ["127.0.0.1"] # 信任来自 Edge 的内部 INVITE
 labels             = { region = "local", tier = "default" }
 edge_sip_addr      = "127.0.0.1:5060"  # 出站起呼转发目标（Edge）
+edge_worker_addr   = "127.0.0.1:9092"  # Edge → Worker AllocateCall
+advertise_sip_addr = "127.0.0.1:5070"  # AllocateCall 返回给 Edge 的 SIP contact
+edge_state_addr    = "127.0.0.1:9093"  # Worker → Edge CallStateUpdate
 heartbeat_secs     = 10
 log                = "info"
 ```
@@ -114,6 +117,8 @@ sip_addr           = "0.0.0.0"
 udp_port           = 5060
 edge_id            = "edge-local"
 trusted_workers    = ["127.0.0.1"]  # 信任来自 Worker 的出站内部 INVITE
+worker_required_labels = { region = "local", tier = "default" }
+edge_worker_addr   = "127.0.0.1:9093"  # 接收 Worker CallStateUpdate
 config_poll_secs   = 30
 log                = "info"
 ```
@@ -128,7 +133,17 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
 | Control HTTP（API + 控制台 UI） | 9080 |
 | Edge SIP | UDP 5060 |
 | Worker SIP | UDP 5070 |
+| Worker EdgeWorker gRPC（AllocateCall） | 9092 |
+| Edge EdgeWorker gRPC（CallStateUpdate） | 9093 |
 | Worker RTP | 12000+ |
+
+### 调度与配额示例
+
+- Worker 通过 `labels = { region = "local", tier = "default" }` 注册调度标签。
+- Edge 通过 `worker_required_labels` 只选择标签完全匹配的 Worker。
+- Trunk 的 `max_concurrent` 会作为 trunk 级并发限制下发；`max_cps` 会作为
+  trunk 级每秒新呼叫限制下发。两者都在 Control Raft 状态机里线性化执行，
+  与租户 `max_concurrent_calls` 一起生效。
 
 ---
 
