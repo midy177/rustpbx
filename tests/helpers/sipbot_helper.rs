@@ -37,18 +37,14 @@ struct BuildCallee {
 /// A SIP UA backed by `sipbot`.
 pub struct TestUa {
     pub cancel_token: CancellationToken,
-    #[allow(dead_code)]
     pub domain: String,
     /// Shared call statistics for RTP validation
-    #[allow(dead_code)]
     pub stats: Arc<CallStats>,
     /// WAV file path where sipbot records RX/TX audio (stereo 16kHz, L=RX, R=TX)
-    #[allow(dead_code)]
     pub record_path: Option<String>,
 }
 
 impl TestUa {
-    #[allow(dead_code)]
     pub async fn callee(sip_port: u16, ring_secs: u64) -> Self {
         Self::callee_with_username(sip_port, ring_secs, "bob").await
     }
@@ -122,23 +118,49 @@ impl TestUa {
     /// Create a callee that immediately rejects with the given SIP code (e.g. 486 Busy, 480 Temporarily Unavailable).
     pub async fn callee_reject(sip_port: u16, username: &str, reject_code: u16) -> Self {
         Self::build_callee(BuildCallee {
-            sip_port, username: username.to_string(), ring_secs: 0, refer_reject: None, record_path: None,
-            reject_code: Some(reject_code), answer: None, hangup_after_secs: None,
-        }).await
+            sip_port,
+            username: username.to_string(),
+            ring_secs: 0,
+            refer_reject: None,
+            record_path: None,
+            reject_code: Some(reject_code),
+            answer: None,
+            hangup_after_secs: None,
+        })
+        .await
     }
 
     pub async fn callee_no_answer(sip_port: u16, username: &str, ring_secs: u64) -> Self {
         Self::build_callee(BuildCallee {
-            sip_port, username: username.to_string(), ring_secs, refer_reject: None, record_path: None,
-            reject_code: None, answer: Some(None), hangup_after_secs: None,
-        }).await
+            sip_port,
+            username: username.to_string(),
+            ring_secs,
+            refer_reject: None,
+            record_path: None,
+            reject_code: None,
+            answer: Some(None),
+            hangup_after_secs: None,
+        })
+        .await
     }
 
-    pub async fn callee_answer_then_hangup(sip_port: u16, ring_secs: u64, username: &str, after_secs: u64) -> Self {
+    pub async fn callee_answer_then_hangup(
+        sip_port: u16,
+        ring_secs: u64,
+        username: &str,
+        after_secs: u64,
+    ) -> Self {
         Self::build_callee(BuildCallee {
-            sip_port, username: username.to_string(), ring_secs, refer_reject: None, record_path: None,
-            reject_code: None, answer: Some(Some(AnswerConfig::Echo)), hangup_after_secs: Some(after_secs),
-        }).await
+            sip_port,
+            username: username.to_string(),
+            ring_secs,
+            refer_reject: None,
+            record_path: None,
+            reject_code: None,
+            answer: Some(Some(AnswerConfig::Echo)),
+            hangup_after_secs: Some(after_secs),
+        })
+        .await
     }
 
     async fn build_callee(opts: BuildCallee) -> Self {
@@ -156,7 +178,11 @@ impl TestUa {
             password: None,
             register: Some(false),
             ring: if opts.ring_secs > 0 {
-                Some(RingConfig { duration_secs: opts.ring_secs, ringback: None, local: None })
+                Some(RingConfig {
+                    duration_secs: opts.ring_secs,
+                    ringback: None,
+                    local: None,
+                })
             } else {
                 None
             },
@@ -164,8 +190,22 @@ impl TestUa {
             refer_reject: opts.refer_reject,
             record: opts.record_path,
             reject_prob: opts.reject_code.map(|_| 100),
-            hangup: opts.reject_code.map(|code| HangupConfig { code, after_secs: None }).or_else(|| opts.hangup_after_secs.map(|after| HangupConfig { code: 200, after_secs: Some(after) })),
-            audio_quality: Some(AudioQualityConfig { enabled: true, ..Default::default() }),
+            hangup: opts
+                .reject_code
+                .map(|code| HangupConfig {
+                    code,
+                    after_secs: None,
+                })
+                .or_else(|| {
+                    opts.hangup_after_secs.map(|after| HangupConfig {
+                        code: 200,
+                        after_secs: Some(after),
+                    })
+                }),
+            audio_quality: Some(AudioQualityConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -192,7 +232,12 @@ impl TestUa {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        Self { cancel_token, domain, stats, record_path: None }
+        Self {
+            cancel_token,
+            domain,
+            stats,
+            record_path: None,
+        }
     }
 
     /// Create and start an outbound caller UA that will place calls to `target_uri`.
@@ -268,7 +313,6 @@ impl TestUa {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn callee_with_refer_reject(
         sip_port: u16,
         ring_secs: u64,
@@ -368,13 +412,11 @@ impl TestUa {
     }
 
     /// Return a `sip:<user>@<host>:<port>` URI for this UA.
-    #[allow(dead_code)]
     pub fn sip_uri(&self, user: &str) -> String {
         format!("sip:{}@{}", user, self.domain)
     }
 
     /// Get RTP statistics summary as a string
-    #[allow(dead_code)]
     pub fn rtp_stats_summary(&self) -> String {
         use std::sync::atomic::Ordering;
         let tx_p = self.stats.tx_packets.load(Ordering::Relaxed);
@@ -385,35 +427,18 @@ impl TestUa {
     }
 
     /// Check if any RTP packets were received (RX > 0)
-    #[allow(dead_code)]
     pub fn has_rtp_rx(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.stats.rx_packets.load(Ordering::Relaxed) > 0
     }
 
     /// Check if any RTP packets were transmitted (TX > 0)
-    #[allow(dead_code)]
     pub fn has_rtp_tx(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.stats.tx_packets.load(Ordering::Relaxed) > 0
     }
 
-    /// Get the number of received DTMF events
-    #[allow(dead_code)]
-    pub fn rx_dtmf_count(&self) -> u64 {
-        use std::sync::atomic::Ordering;
-        self.stats.rx_dtmf_events.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of transmitted DTMF events
-    #[allow(dead_code)]
-    pub fn tx_dtmf_count(&self) -> u64 {
-        use std::sync::atomic::Ordering;
-        self.stats.tx_dtmf_events.load(Ordering::Relaxed)
-    }
-
     /// Get audio quality summary for assertions
-    #[allow(dead_code)]
     pub fn audio_quality_summary(&self) -> AudioQualitySummary {
         use std::sync::atomic::Ordering;
         AudioQualitySummary {

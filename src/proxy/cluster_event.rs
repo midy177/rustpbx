@@ -115,10 +115,15 @@ struct ClusterPresenceMessage {
 impl ClusterPresenceMessage {
     fn to_state(&self) -> Option<PresenceState> {
         let status = match self.status.as_str() {
-            "available" => PresenceStatus::Available,
+            "idle" | "available" => PresenceStatus::Idle,
             "busy" => PresenceStatus::Busy,
-            "away" => PresenceStatus::Away,
-            _ => PresenceStatus::Offline,
+            "ringing" => PresenceStatus::Ringing,
+            "wrapup" => PresenceStatus::Wrapup,
+            "away" => PresenceStatus::Away(String::new()),
+            "dnd" => PresenceStatus::Dnd,
+            "offline" => PresenceStatus::Offline,
+            "" => PresenceStatus::Offline,
+            other => PresenceStatus::Away(other.to_string()),
         };
         Some(PresenceState {
             status,
@@ -183,6 +188,8 @@ pub struct ClusterEventHub {
     local_sip_addr: SocketAddr,
     peers: Vec<SocketAddr>,
     handlers: RwLock<Vec<Arc<dyn ClusterEventHandler>>>,
+    /// Child of the SIP server's cancel token; used to stop the dispatcher.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ClusterEventHub {
@@ -192,6 +199,7 @@ impl ClusterEventHub {
         endpoint_inner: EndpointInnerRef,
         local_sip_addr: SocketAddr,
         peers: Vec<SocketAddr>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             locator_events,
@@ -200,6 +208,7 @@ impl ClusterEventHub {
             local_sip_addr,
             peers,
             handlers: RwLock::new(Vec::new()),
+            cancel,
         }
     }
 
@@ -208,20 +217,30 @@ impl ClusterEventHub {
     }
 
     /// Subscribe to local locator events and forward to peers.
+    ///
+    /// The dispatcher loop listens on `self.cancel` so it stops
+    /// deterministically when the server shuts down instead of waiting for
+    /// the underlying broadcast channel to close.
     pub async fn start(self: Arc<Self>) {
         let mut rx = self.locator_events.subscribe();
+        let cancel = self.cancel.clone();
         let this = self.clone();
         crate::utils::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        this.dispatch_local_locator_event(event).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("cluster event hub: lagged, missed {} locator events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    res = rx.recv() => {
+                        match res {
+                            Ok(event) => {
+                                this.dispatch_local_locator_event(event).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("cluster event hub: lagged, missed {} locator events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -231,27 +250,27 @@ impl ClusterEventHub {
     async fn dispatch_local_locator_event(&self, event: LocatorEvent) {
         let source = EventSource::Local;
 
-        // Notify addon handlers
-        self.notify_locator_handlers(&event, &source).await;
-
-        // Forward to peers
+        // Forward to peers and notify addon handlers.
+        //
+        // For Offline events (batch of locations), split into individual
+        // Unregistered events so that handlers and peers each process every
+        // location exactly once.  Previously the full Offline batch was sent
+        // to handlers *and* then each location again as Unregistered, causing
+        // double-processing.
         if let LocatorEvent::Offline(locs) = &event {
             if !locs.is_empty() {
                 for loc in locs.iter() {
                     let single = LocatorEvent::Unregistered(loc.clone());
-                    self.notify_locator_handlers_for_offline(loc, &single).await;
+                    self.notify_locator_handlers(&single, &source).await;
                     self.send_locator_to_peers(&single).await;
                 }
                 return;
             }
         }
-        self.send_locator_to_peers(&event).await;
-    }
 
-    /// For Offline events, also notify handlers with the Unregistered event
-    async fn notify_locator_handlers_for_offline(&self, _loc: &Location, event: &LocatorEvent) {
-        let source = EventSource::Local;
-        self.notify_locator_handlers(event, &source).await;
+        // For Registered / Unregistered (and empty Offline) events.
+        self.notify_locator_handlers(&event, &source).await;
+        self.send_locator_to_peers(&event).await;
     }
 
     /// Remote locator event (from peer MESSAGE).
@@ -453,11 +472,15 @@ impl ProxyModule for ClusterEventModule {
     }
 
     async fn on_start(&mut self) -> Result<()> {
+        // The dispatcher must stop when the server shuts down. The hub holds
+        // a child of the server's cancel_token for this purpose.
         self.hub.clone().start().await;
         Ok(())
     }
 
     async fn on_stop(&self) -> Result<()> {
+        // Cancellation is driven by the server's cancel_token (the hub holds
+        // a child token), so spawned tasks exit when the server shuts down.
         Ok(())
     }
 
@@ -787,18 +810,53 @@ mod tests {
     // ── ClusterPresenceMessage → PresenceState conversion ───────────────────
 
     #[test]
-    fn test_presence_message_to_state_available() {
+    fn test_presence_message_to_state_idle() {
         let msg = ClusterPresenceMessage {
             identity: "1001".to_string(),
-            status: "available".to_string(),
+            status: "idle".to_string(),
             note: Some("hello".to_string()),
             activity: None,
             last_updated: 100,
         };
         let state = msg.to_state().unwrap();
-        assert_eq!(state.status, PresenceStatus::Available);
+        assert_eq!(state.status, PresenceStatus::Idle);
         assert_eq!(state.note.as_deref(), Some("hello"));
         assert_eq!(state.last_updated, 100);
+    }
+
+    #[test]
+    fn test_presence_message_to_state_available_backcompat() {
+        // Legacy "available" string must still map to Idle.
+        let msg = ClusterPresenceMessage {
+            identity: "1001".to_string(),
+            status: "available".to_string(),
+            note: None,
+            activity: None,
+            last_updated: 0,
+        };
+        let state = msg.to_state().unwrap();
+        assert_eq!(state.status, PresenceStatus::Idle);
+    }
+
+    #[test]
+    fn test_presence_message_to_state_ringing_wrapup() {
+        let ringing = ClusterPresenceMessage {
+            identity: "1001".to_string(),
+            status: "ringing".to_string(),
+            note: None,
+            activity: None,
+            last_updated: 0,
+        };
+        assert_eq!(ringing.to_state().unwrap().status, PresenceStatus::Ringing);
+
+        let wrapup = ClusterPresenceMessage {
+            identity: "1001".to_string(),
+            status: "wrapup".to_string(),
+            note: None,
+            activity: None,
+            last_updated: 0,
+        };
+        assert_eq!(wrapup.to_state().unwrap().status, PresenceStatus::Wrapup);
     }
 
     #[test]
@@ -824,7 +882,7 @@ mod tests {
             last_updated: 0,
         };
         let state = msg.to_state().unwrap();
-        assert_eq!(state.status, PresenceStatus::Away);
+        assert_eq!(state.status, PresenceStatus::Away(String::new()));
     }
 
     #[test]
@@ -841,16 +899,16 @@ mod tests {
     }
 
     #[test]
-    fn test_presence_message_to_state_unknown_falls_to_offline() {
+    fn test_presence_message_to_state_custom_falls_to_away() {
         let msg = ClusterPresenceMessage {
             identity: "test".to_string(),
-            status: "dnd".to_string(),
+            status: "lunch".to_string(),
             note: None,
             activity: None,
             last_updated: 0,
         };
         let state = msg.to_state().unwrap();
-        assert_eq!(state.status, PresenceStatus::Offline);
+        assert_eq!(state.status, PresenceStatus::Away("lunch".to_string()));
     }
 
     // ── LocatorEvent → ClusterLocatorMessage conversion ─────────────────────
@@ -918,14 +976,14 @@ mod tests {
     #[test]
     fn test_presence_state_to_message() {
         let state = PresenceState {
-            status: PresenceStatus::Available,
+            status: PresenceStatus::Idle,
             note: Some("online".to_string()),
             activity: Some("idle".to_string()),
             last_updated: 1714001000,
         };
         let msg = ClusterPresenceMessage::from(("1001", &state));
         assert_eq!(msg.identity, "1001");
-        assert_eq!(msg.status, "available");
+        assert_eq!(msg.status, "idle");
         assert_eq!(msg.note.as_deref(), Some("online"));
         assert_eq!(msg.activity.as_deref(), Some("idle"));
         assert_eq!(msg.last_updated, 1714001000);
@@ -1012,6 +1070,7 @@ mod tests {
             endpoint.inner.clone(),
             "127.0.0.1:5060".parse().unwrap(),
             vec![],
+            tokio_util::sync::CancellationToken::new(),
         ))
     }
 
@@ -1046,7 +1105,7 @@ mod tests {
         hub.register_handler(handler.clone());
 
         let state = PresenceState {
-            status: PresenceStatus::Available,
+            status: PresenceStatus::Idle,
             ..Default::default()
         };
         hub.emit_presence_change("1001", &state).await;
@@ -1075,7 +1134,7 @@ mod tests {
         let hub = make_test_hub();
         let identity = "1001";
         let state = PresenceState {
-            status: PresenceStatus::Available,
+            status: PresenceStatus::Idle,
             note: Some("remote-test".to_string()),
             ..Default::default()
         };
@@ -1090,7 +1149,7 @@ mod tests {
 
         // Memory state should be updated
         let stored = hub.presence_manager.get_state(identity);
-        assert_eq!(stored.status, PresenceStatus::Available);
+        assert_eq!(stored.status, PresenceStatus::Idle);
         assert_eq!(stored.note.as_deref(), Some("remote-test"));
     }
 
@@ -1111,9 +1170,9 @@ mod tests {
         ));
         hub.on_remote_locator_event(event, remote_source).await;
 
-        // After receipt, presence should be Available (Registered from peer)
+        // After receipt, presence should be Idle (Registered from peer)
         let stored = hub.presence_manager.get_state("3001");
-        assert_eq!(stored.status, PresenceStatus::Available);
+        assert_eq!(stored.status, PresenceStatus::Idle);
     }
 
     #[tokio::test]
@@ -1141,6 +1200,58 @@ mod tests {
         assert_eq!(
             hub.presence_manager.get_state("4001").status,
             PresenceStatus::Offline
+        );
+    }
+
+    #[tokio::test]
+    async fn test_offline_event_no_double_notification() {
+        // Regression test: Offline events with N locations must notify
+        // handlers exactly N times (once per location), NOT N+1.
+        // Previously the full Offline batch was sent to handlers AND then
+        // each location was sent individually, causing double-processing.
+        let (locator_tx, _) = tokio::sync::broadcast::channel(4);
+        let presence_manager = Arc::new(PresenceManager::new(None));
+        let transport_layer =
+            rsipstack::transport::TransportLayer::new(tokio_util::sync::CancellationToken::new());
+        let endpoint = rsipstack::EndpointBuilder::new()
+            .with_transport_layer(transport_layer)
+            .build();
+        let hub = Arc::new(ClusterEventHub::new(
+            locator_tx.clone(),
+            presence_manager,
+            endpoint.inner.clone(),
+            "127.0.0.1:5060".parse().unwrap(),
+            vec![],
+            tokio_util::sync::CancellationToken::new(),
+        ));
+
+        let handler = Arc::new(CountingHandler::new());
+        hub.register_handler(handler.clone());
+
+        // Start the hub's broadcast subscriber loop.
+        hub.clone().start().await;
+
+        // Send an Offline event with 2 locations.
+        let loc1 = Location {
+            aor: "sip:5001@pbx.local".parse().unwrap(),
+            ..Default::default()
+        };
+        let loc2 = Location {
+            aor: "sip:5002@pbx.local".parse().unwrap(),
+            ..Default::default()
+        };
+        let _ = locator_tx.send(LocatorEvent::Offline(vec![loc1, loc2]));
+
+        // Give the async dispatch loop time to process.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Each location should be delivered exactly once as Unregistered.
+        // Before the fix this would be 3 (1 Offline batch + 2 individual).
+        let count = *handler.locator_count.lock().unwrap();
+        assert_eq!(
+            count, 2,
+            "Offline event with 2 locations must notify handlers exactly 2 times, got {}",
+            count
         );
     }
 
@@ -1196,7 +1307,7 @@ mod tests {
     #[test]
     fn test_presence_state_full_round_trip() {
         let original = PresenceState {
-            status: PresenceStatus::Away,
+            status: PresenceStatus::Away(String::new()),
             note: Some("Lunch".to_string()),
             activity: Some("meal".to_string()),
             last_updated: 1715000000,
@@ -1215,7 +1326,7 @@ mod tests {
         };
 
         // Assert
-        assert_eq!(reconstructed.status, PresenceStatus::Away);
+        assert_eq!(reconstructed.status, PresenceStatus::Away(String::new()));
         assert_eq!(reconstructed.note.as_deref(), Some("Lunch"));
         assert_eq!(reconstructed.activity.as_deref(), Some("meal"));
         assert_eq!(reconstructed.last_updated, 1715000000);

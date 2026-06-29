@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::console::ConsoleState;
+use crate::console::config_helpers::json_error;
 use crate::console::middleware::AuthRequired;
 use axum::{
     Router,
@@ -36,8 +37,8 @@ pub async fn index(
     AuthRequired(user): AuthRequired,
 ) -> impl IntoResponse {
     // Permission check - system:read required for addon management
-    if !state.has_permission(&user, "system", "read").await {
-        return (StatusCode::FORBIDDEN, "Permission denied").into_response();
+    if let Err(resp) = state.require_permission(&user, "system", "read").await {
+        return resp;
     }
 
     let addons = if let Some(app_state) = state.app_state() {
@@ -130,8 +131,8 @@ pub async fn verify_addon(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     // Permission check - system:write required to verify licenses
-    if !state.has_permission(&user, "system", "write").await {
-        return (StatusCode::FORBIDDEN, "Permission denied").into_response();
+    if let Err(resp) = state.require_permission(&user, "system", "write").await {
+        return resp;
     }
 
     // Extract license_key from the payload regardless of whether the caller
@@ -158,8 +159,8 @@ pub async fn toggle_addon(
     Json(payload): Json<ToggleAddonPayload>,
 ) -> Response {
     // Permission check - system:write required to modify addon state
-    if !state.has_permission(&user, "system", "write").await {
-        return (StatusCode::FORBIDDEN, "Permission denied").into_response();
+    if let Err(resp) = state.require_permission(&user, "system", "write").await {
+        return resp;
     }
 
     let config_path = match get_config_path(&state) {
@@ -237,8 +238,8 @@ pub async fn detail(
     AuthRequired(user): AuthRequired,
 ) -> impl IntoResponse {
     // Permission check - system:read required for addon management
-    if !state.has_permission(&user, "system", "read").await {
-        return (StatusCode::FORBIDDEN, "Permission denied").into_response();
+    if let Err(resp) = state.require_permission(&user, "system", "read").await {
+        return resp;
     }
 
     let addon = if let Some(app_state) = state.app_state() {
@@ -374,17 +375,6 @@ fn ensure_table_mut<'doc>(doc: &'doc mut DocumentMut, key: &str) -> &'doc mut Ta
         .get_mut(key)
         .and_then(Item::as_table_mut)
         .expect("table")
-}
-
-pub(super) fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({
-            "success": false,
-            "message": message.into(),
-        })),
-    )
-        .into_response()
 }
 
 /// Convert a `LicenseStatus` to a human-readable label for the UI.

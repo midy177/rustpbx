@@ -423,9 +423,12 @@ async fn test_pcm_frame_does_not_break_session_state() {
     // Verify subscription still works by pushing an event
     {
         let gw = gateway.read();
-        let event = rustpbx::rwi::event::to_legacy_event(&rustpbx::rwi::CallRinging  { 
-            call_id: "test".to_string(),
-        }, None);
+        let event = rustpbx::rwi::event::to_legacy_event(
+            &rustpbx::rwi::CallRinging {
+                call_id: "test".to_string(),
+            },
+            None,
+        );
         gw.fan_out_event_to_context("pcm-test", &event, &"test".to_string());
     }
 
@@ -445,7 +448,8 @@ async fn test_pcm_frame_does_not_break_session_state() {
                 || v.get("call_id").is_some()
                 || v.get("call_ringing").is_some()
                 || v.get("call_answered").is_some()
-                || v.get("dtmf").is_some();
+                || v.get("dtmf").is_some()
+                || v.get("event_type").is_some();
             assert!(is_event, "Should receive an event: {}", v);
         }
         _ => panic!("Expected text message"),

@@ -3,11 +3,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Local};
 use flowdb::{Config as FlowDbConfig, Engine, Record, ScanRange};
-use futures::FutureExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::sipflow::flowdb_codec::{
     SIP_PREFIX, decode_rtp_value, decode_sip_value, encode_rtp_value, encode_sip_value,
@@ -24,15 +24,10 @@ pub struct FlowDbBackend {
     engine: Arc<Engine>,
     counter: AtomicU64,
     ttl_micros: Option<i64>,
-    _maintenance: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for FlowDbBackend {
-    fn drop(&mut self) {
-        if let Some(handle) = self._maintenance.take() {
-            handle.abort();
-        }
-    }
+    batch: Mutex<Vec<Record>>,
+    flush_count: usize,
+    flush_interval: std::time::Duration,
+    last_flush: Mutex<Instant>,
 }
 
 impl FlowDbBackend {
@@ -41,30 +36,55 @@ impl FlowDbBackend {
         ttl_secs: Option<u64>,
         memtable_size_mb: usize,
         block_cache_capacity_mb: usize,
+        flush_count: usize,
+        flush_interval_secs: u64,
     ) -> Result<Self> {
         let config = FlowDbConfig {
             data_dir: data_dir.into(),
             default_ttl_secs: ttl_secs,
             memtable_size_mb,
             block_cache_capacity_mb,
+            auto_background: true,
             ..Default::default()
         };
 
-        let engine = Engine::open(config)
-            .now_or_never()
-            .ok_or_else(|| anyhow::anyhow!("Engine::open did not complete synchronously"))??;
+        let engine = Engine::open(config)?;
 
         let engine = Arc::new(engine);
         let ttl_micros = ttl_secs.map(|s| s as i64 * 1_000_000);
-
-        let maintenance = engine.spawn_background_maintenance();
 
         Ok(Self {
             engine,
             counter: AtomicU64::new(0),
             ttl_micros,
-            _maintenance: maintenance,
+            batch: Mutex::new(Vec::with_capacity(flush_count)),
+            flush_count,
+            flush_interval: std::time::Duration::from_secs(flush_interval_secs),
+            last_flush: Mutex::new(Instant::now()),
         })
+    }
+
+    fn should_flush(&self) -> bool {
+        let batch_len = self.batch.lock().unwrap().len();
+        if batch_len >= self.flush_count {
+            return true;
+        }
+        if batch_len > 0 && self.last_flush.lock().unwrap().elapsed() >= self.flush_interval {
+            return true;
+        }
+        false
+    }
+
+    fn flush_batch(&self) -> Result<()> {
+        let mut batch = self.batch.lock().unwrap();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let records = std::mem::take(&mut *batch);
+        drop(batch);
+        self.engine.write_batch_sync(records)?;
+        *self.last_flush.lock().unwrap() = Instant::now();
+        Ok(())
     }
 
     fn next_counter(&self) -> u64 {
@@ -78,11 +98,7 @@ impl FlowDbBackend {
         }
     }
 
-    fn scan_sip_flow_in_range(
-        &self,
-        start_ts: i64,
-        end_ts: i64,
-    ) -> Result<Vec<SipFlowItem>> {
+    fn scan_sip_flow_in_range(&self, start_ts: i64, end_ts: i64) -> Result<Vec<SipFlowItem>> {
         let iter = self
             .engine
             .scan(ScanRange::prefix_time_range(SIP_PREFIX, start_ts, end_ts))?;
@@ -177,7 +193,9 @@ impl FlowDbBackend {
         let leg_sources = self
             .scan_media_sources(call_id, start_ts, end_ts, leg_filter)
             .unwrap_or_default();
-        let flow = self.scan_sip_flow_in_range(start_ts, end_ts).unwrap_or_default();
+        let flow = self
+            .scan_sip_flow_in_range(start_ts, end_ts)
+            .unwrap_or_default();
         let payload_map = build_payload_type_map(&flow);
         let leg_payload_map = build_payload_type_map_by_leg(&flow, &leg_sources);
         (payload_map, leg_payload_map)
@@ -217,22 +235,36 @@ impl SipFlowBackend for FlowDbBackend {
             SipFlowMsgType::Sip => {
                 let key = make_sip_key(call_id, counter);
                 let value = encode_sip_value(&item.src_addr, &item.dst_addr, &item.payload);
-                Record { key, ts, expire_at, value }
+                Record {
+                    key: key.into(),
+                    ts,
+                    expire_at,
+                    value,
+                }
             }
             SipFlowMsgType::Rtp => {
                 let leg = item.leg.unwrap_or(0);
                 let key = make_rtp_key(call_id, leg, counter);
                 let value = encode_rtp_value(leg, &item.src_addr, &item.payload);
-                Record { key, ts, expire_at, value }
+                Record {
+                    key: key.into(),
+                    ts,
+                    expire_at,
+                    value,
+                }
             }
         };
 
-        self.engine.write_batch_sync(vec![record])?;
+        self.batch.lock().unwrap().push(record);
+        if self.should_flush() {
+            self.flush_batch()?;
+        }
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
-        self.engine.flush().await.map_err(|e| anyhow::anyhow!(e))
+        self.flush_batch()?;
+        self.engine.flush().map_err(|e| anyhow::anyhow!(e))
     }
 
     async fn query_flow(
@@ -245,7 +277,9 @@ impl SipFlowBackend for FlowDbBackend {
         let end_ts = end_time.timestamp_micros();
         let prefix = sip_call_prefix(call_id);
 
-        let iter = self.engine.scan_prefix_time_range(&prefix, start_ts, end_ts)?;
+        let iter = self
+            .engine
+            .scan_prefix_time_range(&prefix, start_ts, end_ts)?;
 
         let mut items: Vec<SipFlowItem> = iter
             .filter_map(|result| {
@@ -420,22 +454,16 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_record_and_query_flow() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-flow-1";
         let base = chrono::Utc::now().timestamp_micros();
         let t0 = (base + 1_000) as u64;
         let t1 = (base + 2_000) as u64;
         let t2 = (base + 3_000) as u64;
 
-        backend
-            .record(call_id, make_sip_item(t0, call_id))
-            .unwrap();
-        backend
-            .record(call_id, make_sip_item(t1, call_id))
-            .unwrap();
-        backend
-            .record(call_id, make_sip_item(t2, call_id))
-            .unwrap();
+        backend.record(call_id, make_sip_item(t0, call_id)).unwrap();
+        backend.record(call_id, make_sip_item(t1, call_id)).unwrap();
+        backend.record(call_id, make_sip_item(t2, call_id)).unwrap();
         backend.flush().await.unwrap();
 
         let items = backend
@@ -457,22 +485,16 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_query_flow_time_range() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-flow-range";
         let base = chrono::Utc::now().timestamp_micros();
         let t0 = (base + 1_000) as u64;
         let t1 = (base + 2_000) as u64;
         let t2 = (base + 3_000) as u64;
 
-        backend
-            .record(call_id, make_sip_item(t0, call_id))
-            .unwrap();
-        backend
-            .record(call_id, make_sip_item(t1, call_id))
-            .unwrap();
-        backend
-            .record(call_id, make_sip_item(t2, call_id))
-            .unwrap();
+        backend.record(call_id, make_sip_item(t0, call_id)).unwrap();
+        backend.record(call_id, make_sip_item(t1, call_id)).unwrap();
+        backend.record(call_id, make_sip_item(t2, call_id)).unwrap();
         backend.flush().await.unwrap();
 
         let items = backend
@@ -491,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_record_rtp_and_query_media() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-rtp-1";
         let base = chrono::Utc::now().timestamp_micros();
 
@@ -519,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_query_media_stats() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-stats-1";
         let base = chrono::Utc::now().timestamp_micros();
 
@@ -550,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_query_media_stats_with_loss() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-stats-loss";
         let base = chrono::Utc::now().timestamp_micros();
 
@@ -580,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_media_stream_leg_filter() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let call_id = "test-leg-filter";
         let base = chrono::Utc::now().timestamp_micros();
 
@@ -614,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_empty_query() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let base = chrono::Utc::now().timestamp_micros();
 
         let items = backend
@@ -643,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_isolation_between_calls() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         let base = chrono::Utc::now().timestamp_micros();
 
         backend
@@ -680,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_flush_no_error() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
         backend.flush().await.unwrap();
     }
 
@@ -692,7 +714,7 @@ mod tests {
         let path = dir.path().to_path_buf();
 
         {
-            let backend = FlowDbBackend::new(&path, None, 1, 16).unwrap();
+            let backend = FlowDbBackend::new(&path, None, 1, 16, 1000, 5).unwrap();
             backend
                 .record(call_id, make_sip_item(base as u64, call_id))
                 .unwrap();
@@ -700,7 +722,7 @@ mod tests {
         }
 
         {
-            let backend = FlowDbBackend::new(&path, None, 1, 16).unwrap();
+            let backend = FlowDbBackend::new(&path, None, 1, 16, 1000, 5).unwrap();
             let items = backend
                 .query_flow(
                     call_id,
@@ -716,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn test_flowdb_skip_empty_call_id() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FlowDbBackend::new(dir.path(), None, 1, 16).unwrap();
+        let backend = FlowDbBackend::new(dir.path(), None, 1, 16, 1000, 5).unwrap();
 
         // Empty call_id should be silently skipped
         backend.record("", make_sip_item(1000, "")).unwrap();

@@ -50,7 +50,9 @@ class IvrSession:
             self._step = "wait_menu"
             return action_prompt(
                 tts_text=WELCOME_TEXT,
+                #file="http://127.0.0.1:28080/ivr.wav",
                 interruptible=True,
+                next={"type": "queue", "target": "sales"},
             )
 
         if self._step == "wait_menu":
@@ -62,7 +64,7 @@ class IvrSession:
                         tts_text=f"The current time is {now}",
                     )
                 elif digit == "2":
-                    return action_transfer("agent")
+                    return {"type": "queue", "target": "sales"}
                 else:
                     self._menu_retries += 1
                     if self._menu_retries >= 3:
@@ -175,7 +177,7 @@ class IvrStepHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
     def log_message(self, format, *args):
-        sys.stderr.write(f"[IVR Provider] {args[0]} {args[1]} {args[2]}\n")
+        sys.stderr.write(f"[IVR Provider] {args}\n")
 
 
 # ── Server Start ─────────────────────────────────────────────────────────────
@@ -223,11 +225,11 @@ class TestIvrSession(unittest.TestCase):
         self.assertEqual(node["type"], "prompt")
         self.assertIn("current time", node.get("tts_text", ""))
 
-    def test_dtmf_2_returns_transfer(self):
+    def test_dtmf_2_returns_queue(self):
         self.sess.next_action({"type": "session_start"})
         node = self.sess.next_action({"type": "dtmf", "digit": "2"})
-        self.assertEqual(node["type"], "transfer")
-        self.assertEqual(node["target"], "agent")
+        self.assertEqual(node["type"], "queue")
+        self.assertEqual(node["target"], "sales")
 
     def test_invalid_digit_returns_prompt(self):
         self.sess.next_action({"type": "session_start"})

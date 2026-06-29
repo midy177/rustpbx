@@ -12,9 +12,10 @@ use rsipstack::{
 };
 use rustrtc::IceServer;
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -28,7 +29,8 @@ pub mod runtime;
 pub mod sip;
 pub mod user;
 pub use cookie::{
-    CalleeDisplayName, CalleeOfflineMarker, TenantId, TransactionCookie, TrunkContext,
+    CalleeDisplayName, CalleeOfflineMarker, SourceAddress, TenantId, TransactionCookie,
+    TrunkContext,
 };
 pub use user::SipUser;
 
@@ -101,6 +103,33 @@ pub struct VoicePrompts {
     /// Audio file to play for estimated-wait-time announcement.
     #[serde(default)]
     pub wait_time_prompt: Option<String>,
+    /// Audio file played before the final destination (voicemail/external number)
+    /// when all escalation timeouts are exhausted.
+    #[serde(default)]
+    pub final_destination_prompt: Option<String>,
+    /// Audio file played to offer the callback option (e.g. "Press 2 for a callback").
+    #[serde(default)]
+    pub callback_offer_prompt: Option<String>,
+    /// Audio file played after the caller confirms callback request.
+    #[serde(default)]
+    pub callback_confirm_prompt: Option<String>,
+    /// Multi-stage comfort/reassurance prompts played during wait.
+    #[serde(default)]
+    pub comfort_prompts: Vec<ComfortPrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComfortPrompt {
+    pub audio_file: String,
+    /// Interval in seconds between consecutive plays of this prompt.
+    #[serde(default = "default_comfort_interval")]
+    pub interval_secs: u32,
+    /// Sort order for drag-and-drop reordering.
+    pub order: u32,
+}
+
+fn default_comfort_interval() -> u32 {
+    30
 }
 
 impl VoicePrompts {
@@ -112,6 +141,10 @@ impl VoicePrompts {
             no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH.to_string()),
             position_prompt: None,
             wait_time_prompt: None,
+            final_destination_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+            comfort_prompts: Vec::new(),
         }
     }
 
@@ -123,6 +156,10 @@ impl VoicePrompts {
             no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN.to_string()),
             position_prompt: None,
             wait_time_prompt: None,
+            final_destination_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+            comfort_prompts: Vec::new(),
         }
     }
 }
@@ -233,41 +270,47 @@ pub enum DialStrategy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferEndpoint {
+    /// Raw SIP URI or plain extension number.
     Uri(String),
     Queue(String),
     /// Forward to an IVR project by name (config/ivr/<name>.toml).
     Ivr(String),
+    /// Forward to a voicemail mailbox identified by extension.
+    Voicemail(String),
+    /// Conference room identified by ID.
+    Conference(String),
 }
 
 impl TransferEndpoint {
+    /// Parse a prefix‑based destination string.
+    ///
+    /// Handles `queue:`, `ivr:`, `voicemail:`, `conference:`.
+    /// Plain strings (no recognised prefix) are returned as `Uri(String)`.
+    /// Does **not** add a `sip:` scheme – callers that need it should use
+    /// [`build_sip_uri`] afterwards.
     pub fn parse(value: &str) -> Option<Self> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
         }
 
-        const QUEUE_PREFIX: &str = "queue:";
-        const IVR_PREFIX: &str = "ivr:";
+        let prefixes: &[(&str, fn(String) -> TransferEndpoint)] = &[
+            ("queue:", |v| TransferEndpoint::Queue(v)),
+            ("ivr:", |v| TransferEndpoint::Ivr(v)),
+            ("voicemail:", |v| TransferEndpoint::Voicemail(v)),
+            ("conference:", |v| TransferEndpoint::Conference(v)),
+        ];
 
-        if trimmed.len() >= QUEUE_PREFIX.len()
-            && trimmed[..QUEUE_PREFIX.len()].eq_ignore_ascii_case(QUEUE_PREFIX)
-        {
-            let name = trimmed[QUEUE_PREFIX.len()..].trim();
-            if name.is_empty() {
-                return None;
+        for (prefix, ctor) in prefixes {
+            if trimmed.len() >= prefix.len()
+                && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            {
+                let name = trimmed[prefix.len()..].trim();
+                if name.is_empty() {
+                    return None;
+                }
+                return Some(ctor(name.to_string()));
             }
-            // If name is numeric, it's likely an ID, but we store it as string in TransferEndpoint::Queue
-            return Some(TransferEndpoint::Queue(name.to_string()));
-        }
-
-        if trimmed.len() >= IVR_PREFIX.len()
-            && trimmed[..IVR_PREFIX.len()].eq_ignore_ascii_case(IVR_PREFIX)
-        {
-            let name = trimmed[IVR_PREFIX.len()..].trim();
-            if name.is_empty() {
-                return None;
-            }
-            return Some(TransferEndpoint::Ivr(name.to_string()));
         }
 
         Some(TransferEndpoint::Uri(trimmed.to_string()))
@@ -280,7 +323,44 @@ impl std::fmt::Display for TransferEndpoint {
             TransferEndpoint::Uri(uri) => write!(f, "{}", uri),
             TransferEndpoint::Queue(name) => write!(f, "queue:{}", name),
             TransferEndpoint::Ivr(name) => write!(f, "ivr:{}", name),
+            TransferEndpoint::Voicemail(ext) => write!(f, "voicemail:{}", ext),
+            TransferEndpoint::Conference(id) => write!(f, "conference:{}", id),
         }
+    }
+}
+
+/// Normalize a SIP URI target string by adding the `sip:` scheme and default
+/// realm when the host part is missing.
+///
+/// Rules:
+/// - `"sip:user@host"` → unchanged
+/// - `"sip:user"`      → `"sip:user@<realm>"`
+/// - `"user@host"`     → `"sip:user@host"`
+/// - `"user"`          → `"sip:user@<realm>"`
+/// - `"tel:+"`         → unchanged
+pub fn build_sip_uri(target: &str, realm: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return format!("sip:anonymous@{}", realm);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("sip:") {
+        if rest.contains('@') {
+            // "sip:user@host" → pass through
+            trimmed.to_string()
+        } else {
+            // "sip:user" → "sip:user@realm"
+            format!("sip:{}@{}", rest, realm)
+        }
+    } else if let Some(_rest) = trimmed.strip_prefix("tel:") {
+        // tel: URIs are passed as-is
+        trimmed.to_string()
+    } else if trimmed.contains('@') {
+        // "user@host" → "sip:user@host"
+        format!("sip:{}", trimmed)
+    } else {
+        // "user" → "sip:user@realm"
+        format!("sip:{}@{}", trimmed, realm)
     }
 }
 
@@ -460,7 +540,6 @@ pub struct QueuePlan {
     pub fallback: Option<QueueFallbackAction>,
     pub dial_strategy: Option<DialStrategy>,
     pub ring_timeout: Option<Duration>,
-    pub acd_policy: Option<String>,
     pub label: Option<String>,
     pub retry_codes: Option<Vec<u16>>,
     pub no_trying_timeout: Option<Duration>,
@@ -491,7 +570,6 @@ impl Default for QueuePlan {
             )),
             dial_strategy: None,
             ring_timeout: None,
-            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
@@ -1185,7 +1263,7 @@ impl RoutingState {
             return 0;
         }
 
-        let mut counters = self.round_robin_counters.lock().unwrap();
+        let mut counters = self.round_robin_counters.lock();
         let counter = counters
             .entry(destination_key.to_string())
             .or_insert_with(|| 0);

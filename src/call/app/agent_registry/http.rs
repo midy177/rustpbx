@@ -69,15 +69,13 @@ impl HttpRegistry {
     async fn fetch_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
         let url = format!("{}/agents/{}", self.base_url, agent_id);
 
-        let opts = crate::http_util::HttpFetchOptions::new()
-            .with_headers(self.headers_map());
+        let opts = crate::http_util::HttpFetchOptions::new().with_headers(self.headers_map());
         let req = self.client.get(&url);
-        let resp =
-            match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
-                Ok(r) => r,
-                Err(e) if e.to_string().contains("404") => return Ok(None),
-                Err(e) => return Err(e),
-            };
+        let resp = match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+            Ok(r) => r,
+            Err(e) if e.to_string().contains("404") => return Ok(None),
+            Err(e) => return Err(e),
+        };
 
         let data: serde_json::Value = resp
             .json()
@@ -167,7 +165,7 @@ impl AgentRegistry for HttpRegistry {
             "uri": uri,
             "skills": skills,
             "max_concurrency": max_concurrency,
-            "presence": "available",
+            "presence": "idle",
         });
 
         let req = self.client.post(&url).json(&payload);
@@ -352,7 +350,7 @@ mod tests {
             "skills": ["support", "sales"],
             "max_concurrency": 2,
             "current_calls": 0,
-            "presence": "available",
+            "presence": "idle",
             "total_calls_handled": 10,
             "total_talk_time_secs": 3600,
         });
@@ -362,6 +360,6 @@ mod tests {
         assert_eq!(agent.display_name, "Alice");
         assert_eq!(agent.skills, vec!["support", "sales"]);
         assert_eq!(agent.max_concurrency, 2);
-        assert!(matches!(agent.presence, PresenceState::Available));
+        assert!(matches!(agent.presence, PresenceState::Idle));
     }
 }

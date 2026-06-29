@@ -20,12 +20,6 @@ async fn ws_connect(rwi_url: &str) -> WsStream {
     ws
 }
 
-#[allow(dead_code)]
-async fn ws_send_recv(ws: &mut WsStream, json: &str) -> serde_json::Value {
-    ws.send(Message::Text(json.into())).await.unwrap();
-    recv_next(ws).await
-}
-
 /// Send a request with an auto-generated action_id and wait for the matching response.
 async fn ws_send_recv_with_id(
     ws: &mut WsStream,
@@ -60,19 +54,6 @@ async fn ws_send_recv_with_id(
     }
 }
 
-#[allow(dead_code)]
-async fn recv_next(ws: &mut WsStream) -> serde_json::Value {
-    let msg = timeout(Duration::from_secs(10), ws.next())
-        .await
-        .expect("recv timeout")
-        .expect("stream closed")
-        .expect("ws error");
-    match msg {
-        Message::Text(t) => serde_json::from_str(&t).expect("invalid json"),
-        _ => panic!("unexpected msg type"),
-    }
-}
-
 /// Wait for a specific event type (snake_case variant name)
 async fn wait_for_event(
     ws: &mut WsStream,
@@ -90,9 +71,12 @@ async fn wait_for_event(
 
         if let Message::Text(t) = msg {
             let json: serde_json::Value = serde_json::from_str(&t).expect("invalid json");
-            // RWI events are serialized as {event_type: {...}}, not {event: "type"}
+            // RWI events are serialized as {event_type: {...}} (legacy) or {..., event_type: "..."} (modern)
             if json.get(event_type).is_some() {
                 return json;
+            }
+            if json["event_type"].as_str() == Some(event_type) {
+                return serde_json::json!({ event_type: json });
             }
         }
     }
@@ -118,6 +102,14 @@ async fn wait_for_any_event(
             for event_type in event_types {
                 if json.get(*event_type).is_some() {
                     return ((*event_type).to_string(), json);
+                }
+                if json["event_type"].as_str() == Some(event_type) {
+                    let mut wrapped = serde_json::Map::new();
+                    wrapped.insert((*event_type).to_string(), json);
+                    return (
+                        (*event_type).to_string(),
+                        serde_json::Value::Object(wrapped),
+                    );
                 }
             }
         }

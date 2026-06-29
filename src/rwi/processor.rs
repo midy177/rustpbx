@@ -182,6 +182,12 @@ struct CommandCacheEntry {
     result: Option<String>,
 }
 
+/// Soft cap that triggers opportunistic eviction of expired dedup-cache
+/// entries inside [`CommandDeduplicationCache::record`]. Picked generously to
+/// avoid any per-command overhead in normal operation while still bounding
+/// memory for long-lived sessions.
+const COMMAND_DEDUP_SOFT_CAP: usize = 256;
+
 #[derive(Clone)]
 struct CommandDeduplicationCache {
     entries: Arc<RwLock<HashMap<String, CommandCacheEntry>>>,
@@ -213,6 +219,13 @@ impl CommandDeduplicationCache {
 
     async fn record(&self, action_id: String, result: Option<String>) {
         let mut entries = self.entries.write().await;
+        // Opportunistic GC: when the cache grows past a soft cap, evict expired
+        // entries before inserting the new one. Keeps memory bounded for
+        // long-lived sessions without adding a background task.
+        if entries.len() >= COMMAND_DEDUP_SOFT_CAP {
+            let now = Instant::now();
+            entries.retain(|_, entry| now.duration_since(entry.received_at) < self.ttl);
+        }
         entries.insert(
             action_id.clone(),
             CommandCacheEntry {
@@ -295,6 +308,11 @@ struct RingbackState {
     _target_call_id: String,
     _source_call_id: String,
 }
+
+/// Soft cap that triggers opportunistic eviction of stale [`RingbackState`]
+/// entries inside [`RwiCommandProcessor::set_ringback_source`]. RingbackState
+/// has no explicit stop path, so without this the map would grow unbounded.
+const RINGBACK_STATES_SOFT_CAP: usize = 64;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -673,7 +691,7 @@ impl RwiCommandProcessor {
         }
 
         if let Some(call_id) = self.extract_call_id(&command)
-            && let Some(result) = self.dispatch_unified_command(&call_id, command.clone())
+            && let Some(result) = self.dispatch_unified_command(call_id, command.clone())
         {
             tracing::debug!(
                 call_id = %call_id,
@@ -683,18 +701,24 @@ impl RwiCommandProcessor {
             match &command {
                 RwiCommandPayload::Bridge { leg_a, leg_b } => {
                     let gw = self.gateway.read();
-                    let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallBridged {
-                        leg_a: leg_a.clone(),
-                        leg_b: leg_b.clone(),
-                    }, None);
+                    let event = crate::rwi::event::to_legacy_event(
+                        &crate::rwi::CallBridged {
+                            leg_a: leg_a.clone(),
+                            leg_b: leg_b.clone(),
+                        },
+                        None,
+                    );
                     gw.send_event_to_call_owner(leg_a, &event);
                     gw.send_event_to_call_owner(leg_b, &event);
                 }
                 RwiCommandPayload::Unbridge { call_id } => {
                     let gw = self.gateway.read();
-                    let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallUnbridged {
-                        call_id: call_id.clone(),
-                    }, None);
+                    let event = crate::rwi::event::to_legacy_event(
+                        &crate::rwi::CallUnbridged {
+                            call_id: call_id.clone(),
+                        },
+                        None,
+                    );
                     gw.send_event_to_call_owner(call_id, &event);
                 }
                 _ => {}
@@ -991,12 +1015,12 @@ impl RwiCommandProcessor {
         }
 
         if let Some(call_id) = self.extract_call_id(&command) {
-            if self.call_registry.get_handle(&call_id).is_some() {
+            if self.call_registry.get_handle(call_id).is_some() {
                 return Err(CommandError::CommandFailed(
                     "command not implemented in unified runtime".to_string(),
                 ));
             } else {
-                return Err(CommandError::CallNotFound(call_id));
+                return Err(CommandError::CallNotFound(call_id.to_string()));
             }
         }
 
@@ -1005,66 +1029,66 @@ impl RwiCommandProcessor {
         ))
     }
 
-    fn extract_call_id(&self, command: &RwiCommandPayload) -> Option<String> {
+    fn extract_call_id<'a>(&self, command: &'a RwiCommandPayload) -> Option<&'a str> {
         match command {
-            RwiCommandPayload::Answer { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::Hangup { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::Reject { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::Ring { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::CallHold { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::CallUnhold { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::Bridge { leg_a, .. } => Some(leg_a.clone()),
-            RwiCommandPayload::Unbridge { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::Transfer { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::TransferReplace { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::TransferAttended { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::TransferComplete { call_id, .. } => Some(call_id.clone()),
+            RwiCommandPayload::Answer { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::Hangup { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::Reject { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::Ring { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::CallHold { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::CallUnhold { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::Bridge { leg_a, .. } => Some(leg_a.as_str()),
+            RwiCommandPayload::Unbridge { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::Transfer { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::TransferReplace { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::TransferAttended { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::TransferComplete { call_id, .. } => Some(call_id.as_str()),
             RwiCommandPayload::TransferCancel {
                 consultation_call_id,
-            } => Some(consultation_call_id.clone()),
+            } => Some(consultation_call_id.as_str()),
             RwiCommandPayload::SetRingbackSource { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
-            RwiCommandPayload::MediaPlay(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::MediaStop { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::MediaStreamStart(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::MediaStreamStop { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::MediaInjectStart(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::MediaInjectStop { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::Originate(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::AttachCall { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::DetachCall { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::RecordStart(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::RecordPause { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::RecordResume { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::RecordStop { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::QueueEnqueue(req) => Some(req.call_id.clone()),
-            RwiCommandPayload::QueueDequeue { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::QueueHold { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::QueueUnhold { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::QueueSetPriority { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::QueueAssignAgent { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::QueueRequeue { call_id, .. } => Some(call_id.clone()),
+            RwiCommandPayload::MediaPlay(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::MediaStop { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::MediaStreamStart(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::MediaStreamStop { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::MediaInjectStart(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::MediaInjectStop { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::Originate(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::AttachCall { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::DetachCall { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::RecordStart(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::RecordPause { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::RecordResume { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::RecordStop { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueEnqueue(req) => Some(req.call_id.as_str()),
+            RwiCommandPayload::QueueDequeue { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueHold { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueUnhold { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueSetPriority { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueAssignAgent { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::QueueRequeue { call_id, .. } => Some(call_id.as_str()),
             RwiCommandPayload::SupervisorListen { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
             RwiCommandPayload::SupervisorWhisper { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
             RwiCommandPayload::SupervisorBarge { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
             RwiCommandPayload::SupervisorTakeover { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
             RwiCommandPayload::SupervisorStop { target_call_id, .. } => {
-                Some(target_call_id.clone())
+                Some(target_call_id.as_str())
             }
-            RwiCommandPayload::SipMessage { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::SipNotify { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::SipOptionsPing { call_id } => Some(call_id.clone()),
-            RwiCommandPayload::LegAdd { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::LegRemove { call_id, .. } => Some(call_id.clone()),
+            RwiCommandPayload::SipMessage { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::SipNotify { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::SipOptionsPing { call_id } => Some(call_id.as_str()),
+            RwiCommandPayload::LegAdd { call_id, .. } => Some(call_id.as_str()),
+            RwiCommandPayload::LegRemove { call_id, .. } => Some(call_id.as_str()),
 
             RwiCommandPayload::ConferenceCreate(_) => None,
             RwiCommandPayload::ConferenceDestroy { .. } => None,
@@ -1168,6 +1192,11 @@ impl RwiCommandProcessor {
         let dialog_layer = server.dialog_layer.clone();
         let caller_display = req.caller_id.unwrap_or_else(|| caller_str.clone());
         let callee_display = req.destination.clone();
+
+        // CDR data for call completion reporting
+        let cdr_sender = server.callrecord_sender.clone();
+        let cdr_answered = std::sync::atomic::AtomicBool::new(false);
+        let cdr_start_time = chrono::Utc::now();
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let conference_manager = self.conference_manager.clone();
@@ -1618,6 +1647,11 @@ impl RwiCommandProcessor {
                                     }
                                     tracing::info!(%cmd_call_id, "App stopped in originate task");
                                 }
+                                CallCommand::Hangup(_) => {
+                                    tracing::info!(%cmd_call_id, "Hangup command received in originate task");
+                                    cmd_cancel.cancel();
+                                    break;
+                                }
                                 _ => {
                                     tracing::debug!(?cmd, "Unhandled command in originate task");
                                 }
@@ -1635,8 +1669,63 @@ impl RwiCommandProcessor {
             let cleanup = || {
                 let cancel = cancel_token.clone();
                 let aborted = cmd_aborted.clone();
+                let cdr_sender = cdr_sender.clone();
+                let cdr_answered = &cdr_answered;
+                let cdr_start_time = cdr_start_time;
+                let cdr_call_id = call_id.clone();
+                let cdr_caller = caller_display.clone();
+                let cdr_callee = callee_display.clone();
                 async move {
                     cancel.cancel();
+
+                    // Send CDR record when call completes
+                    if let Some(ref sender) = cdr_sender.as_ref() {
+                        use crate::callrecord::CallRecordHangupReason;
+                        let end_time = chrono::Utc::now();
+                        let duration = (end_time - cdr_start_time).num_seconds().max(0) as f64;
+                        let answered = cdr_answered.load(std::sync::atomic::Ordering::Relaxed);
+                        let record = crate::callrecord::CallRecord {
+                            call_id: cdr_call_id.clone(),
+                            caller: cdr_caller.clone(),
+                            callee: cdr_callee.clone(),
+                            start_time: cdr_start_time,
+                            ring_time: None,
+                            answer_time: if answered { Some(cdr_start_time) } else { None },
+                            end_time,
+                            status_code: if answered { 200 } else { 0 },
+                            hangup_reason: Some(if answered {
+                                CallRecordHangupReason::BySystem
+                            } else {
+                                CallRecordHangupReason::Canceled
+                            }),
+                            hangup_messages: vec![],
+                            recorder: vec![],
+                            sip_leg_roles: std::collections::HashMap::new(),
+                            leg_timeline: crate::callrecord::LegTimeline::default(),
+                            details: crate::callrecord::CallDetails {
+                                direction: "outbound".to_string(),
+                                status: if answered {
+                                    "answered".to_string()
+                                } else {
+                                    "no_answer".to_string()
+                                },
+                                from_number: Some(cdr_caller.clone()),
+                                to_number: Some(cdr_callee.clone()),
+                                ..Default::default()
+                            },
+                            extensions: http::Extensions::new(),
+                        };
+                        // Bounded channel: drop on Full to bound memory.
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            sender.try_send(record)
+                        {
+                            tracing::warn!(
+                                call_id = %cdr_call_id,
+                                "call record channel full; dropping RWI-originated CDR"
+                            );
+                        }
+                        tracing::debug!(call_id = %cdr_call_id, duration = %duration, answered, "CDR sent from RWI originate");
+                    }
 
                     match tokio::time::timeout(std::time::Duration::from_secs(5), &mut cmd_task)
                         .await
@@ -1701,6 +1790,8 @@ impl RwiCommandProcessor {
                 } => {
                     match result {
                         Ok((dialog_id, Some(resp))) if resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Successful => {
+
+                            cdr_answered.store(true, std::sync::atomic::Ordering::Relaxed);
 
                             let sdp_answer = if resp.body().is_empty() {
                                 None
@@ -1854,10 +1945,13 @@ impl RwiCommandProcessor {
             let gw = self.gateway.read();
             gw.send_event_to_call_owner(
                 &operation_id,
-                &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateStarted {
-                    operation_id: operation_id.clone(),
-                    leg_count,
-                }, None),
+                &crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ParallelOriginateStarted {
+                        operation_id: operation_id.clone(),
+                        leg_count,
+                    },
+                    None,
+                ),
             );
         }
 
@@ -1929,11 +2023,14 @@ impl RwiCommandProcessor {
                         let gw = self.gateway.read();
                         gw.send_event_to_call_owner(
                             &operation_id,
-                            &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateWinner {
-                                operation_id: operation_id.clone(),
-                                call_id: call_id.clone(),
-                                destination: targets[leg_idx].destination.clone(),
-                            }, None),
+                            &crate::rwi::event::to_legacy_event(
+                                &crate::rwi::ParallelOriginateWinner {
+                                    operation_id: operation_id.clone(),
+                                    call_id: call_id.clone(),
+                                    destination: targets[leg_idx].destination.clone(),
+                                },
+                                None,
+                            ),
                         );
 
                         for (i, _) in remaining.iter().enumerate() {
@@ -1941,11 +2038,14 @@ impl RwiCommandProcessor {
                             if let Some(target) = targets.get(actual_idx) {
                                 gw.send_event_to_call_owner(
                                     &operation_id,
-                                    &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateLegCancelled {
-                                        operation_id: operation_id.clone(),
-                                        call_id: target.call_id.clone(),
-                                        reason: "Cancelled - another leg won".to_string(),
-                                    }, None),
+                                    &crate::rwi::event::to_legacy_event(
+                                        &crate::rwi::ParallelOriginateLegCancelled {
+                                            operation_id: operation_id.clone(),
+                                            call_id: target.call_id.clone(),
+                                            reason: "Cancelled - another leg won".to_string(),
+                                        },
+                                        None,
+                                    ),
                                 );
                             }
                         }
@@ -1963,11 +2063,14 @@ impl RwiCommandProcessor {
                         let gw = self.gateway.read();
                         gw.send_event_to_call_owner(
                             &operation_id,
-                            &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateLegCancelled {
-                                operation_id: operation_id.clone(),
-                                call_id: targets[leg_idx].call_id.clone(),
-                                reason,
-                            }, None),
+                            &crate::rwi::event::to_legacy_event(
+                                &crate::rwi::ParallelOriginateLegCancelled {
+                                    operation_id: operation_id.clone(),
+                                    call_id: targets[leg_idx].call_id.clone(),
+                                    reason,
+                                },
+                                None,
+                            ),
                         );
                     }
                 }
@@ -1980,10 +2083,13 @@ impl RwiCommandProcessor {
                 let gw = self.gateway.read();
                 gw.send_event_to_call_owner(
                     &operation_id,
-                    &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateCompleted {
-                        operation_id: operation_id.clone(),
-                        winning_call_id: winning_call_id.clone(),
-                    }, None),
+                    &crate::rwi::event::to_legacy_event(
+                        &crate::rwi::ParallelOriginateCompleted {
+                            operation_id: operation_id.clone(),
+                            winning_call_id: winning_call_id.clone(),
+                        },
+                        None,
+                    ),
                 );
 
                 Ok(CommandResult::Originated {
@@ -1994,10 +2100,13 @@ impl RwiCommandProcessor {
                 let gw = self.gateway.read();
                 gw.send_event_to_call_owner(
                     &operation_id,
-                    &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateFailed {
-                        operation_id: operation_id.clone(),
-                        reason: reason.clone(),
-                    }, None),
+                    &crate::rwi::event::to_legacy_event(
+                        &crate::rwi::ParallelOriginateFailed {
+                            operation_id: operation_id.clone(),
+                            reason: reason.clone(),
+                        },
+                        None,
+                    ),
                 );
 
                 Err(CommandError::CommandFailed(reason))
@@ -2007,10 +2116,13 @@ impl RwiCommandProcessor {
                 let gw = self.gateway.read();
                 gw.send_event_to_call_owner(
                     &operation_id,
-                    &crate::rwi::event::to_legacy_event(&crate::rwi::ParallelOriginateFailed {
-                        operation_id: operation_id.clone(),
-                        reason: reason.clone(),
-                    }, None),
+                    &crate::rwi::event::to_legacy_event(
+                        &crate::rwi::ParallelOriginateFailed {
+                            operation_id: operation_id.clone(),
+                            reason: reason.clone(),
+                        },
+                        None,
+                    ),
                 );
 
                 Err(CommandError::CommandFailed(reason))
@@ -2179,9 +2291,12 @@ impl RwiCommandProcessor {
                 let gw = gateway.read();
                 gw.send_event_to_call_owner(
                     &call_id,
-                    &crate::rwi::event::to_legacy_event(&crate::rwi::CallAnswered {
-                        call_id: call_id.clone(),
-                    }, None),
+                    &crate::rwi::event::to_legacy_event(
+                        &crate::rwi::CallAnswered {
+                            call_id: call_id.clone(),
+                        },
+                        None,
+                    ),
                 );
 
                 let _ = caller_peer;
@@ -2356,11 +2471,14 @@ impl RwiCommandProcessor {
             })
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaPlayStarted {
-            call_id: call_id.to_string(),
-            leg_id: event_leg_id,
-            track_id: track_id.clone(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaPlayStarted {
+                call_id: call_id.to_string(),
+                leg_id: event_leg_id,
+                track_id: track_id.clone(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
 
@@ -2447,11 +2565,14 @@ impl RwiCommandProcessor {
                         if let Some(term) = terminator {
                             if digit == term {
                                 if collected.len() >= min_digits as usize {
-                                    let event = crate::rwi::event::to_legacy_event(&crate::rwi::DtmfCollected {
-                                        call_id: call_id.clone(),
-                                        leg_id: leg_id.clone(),
-                                        digits: collected,
-                                    }, None);
+                                    let event = crate::rwi::event::to_legacy_event(
+                                        &crate::rwi::DtmfCollected {
+                                            call_id: call_id.clone(),
+                                            leg_id: leg_id.clone(),
+                                            digits: collected,
+                                        },
+                                        None,
+                                    );
                                     let gw = gateway.read();
                                     gw.remove_dtmf_tap(&call_id);
                                     gw.send_event_to_call_owner(&call_id, &event);
@@ -2463,11 +2584,14 @@ impl RwiCommandProcessor {
                         collected.push(digit);
 
                         if collected.len() >= max_digits as usize {
-                            let event = crate::rwi::event::to_legacy_event(&crate::rwi::DtmfCollected {
-                                call_id: call_id.clone(),
-                                leg_id: leg_id.clone(),
-                                digits: collected,
-                            }, None);
+                            let event = crate::rwi::event::to_legacy_event(
+                                &crate::rwi::DtmfCollected {
+                                    call_id: call_id.clone(),
+                                    leg_id: leg_id.clone(),
+                                    digits: collected,
+                                },
+                                None,
+                            );
                             let gw = gateway.read();
                             gw.remove_dtmf_tap(&call_id);
                             gw.send_event_to_call_owner(&call_id, &event);
@@ -2483,17 +2607,23 @@ impl RwiCommandProcessor {
             let gw = gateway.read();
             gw.remove_dtmf_tap(&call_id);
             if collected.len() >= min_digits as usize {
-                let event = crate::rwi::event::to_legacy_event(&crate::rwi::DtmfCollected {
-                    call_id: call_id.clone(),
-                    leg_id: leg_id.clone(),
-                    digits: collected,
-                }, None);
+                let event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::DtmfCollected {
+                        call_id: call_id.clone(),
+                        leg_id: leg_id.clone(),
+                        digits: collected,
+                    },
+                    None,
+                );
                 gw.send_event_to_call_owner(&call_id, &event);
             } else {
-                let event = crate::rwi::event::to_legacy_event(&crate::rwi::DtmfCollectionTimeout {
-                    call_id: call_id.clone(),
-                    leg_id: leg_id.clone(),
-                }, None);
+                let event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::DtmfCollectionTimeout {
+                        call_id: call_id.clone(),
+                        leg_id: leg_id.clone(),
+                    },
+                    None,
+                );
                 gw.send_event_to_call_owner(&call_id, &event);
             }
         });
@@ -2513,10 +2643,13 @@ impl RwiCommandProcessor {
             mode: P2PMode::Audio,
         });
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::CallBridged {
-            leg_a: leg_a.to_string(),
-            leg_b: leg_b.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::CallBridged {
+                leg_a: leg_a.to_string(),
+                leg_b: leg_b.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&leg_a.to_string(), &event);
         gw.send_event_to_call_owner(&leg_b.to_string(), &event);
@@ -2557,19 +2690,25 @@ impl RwiCommandProcessor {
         states.insert(req.call_id.clone(), queue_state);
         drop(states);
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueJoined {
-            call_id: req.call_id.clone(),
-            queue_id: req.queue_id.clone(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::QueueJoined {
+                call_id: req.call_id.clone(),
+                queue_id: req.queue_id.clone(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&req.call_id, &event);
 
         if let Some(agent_id) = matched_agent {
-            let agent_event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueAgentOffered {
-                call_id: req.call_id.clone(),
-                queue_id: req.queue_id.clone(),
-                agent_id: agent_id.clone(),
-            }, None);
+            let agent_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::QueueAgentOffered {
+                    call_id: req.call_id.clone(),
+                    queue_id: req.queue_id.clone(),
+                    agent_id: agent_id.clone(),
+                },
+                None,
+            );
             gw.broadcast_event(&agent_event);
 
             info!(
@@ -2622,8 +2761,8 @@ impl RwiCommandProcessor {
         );
 
         match overflow.action.as_deref() {
-            Some("transfer") if overflow.target_queue.is_some() => {
-                let target_queue = overflow.target_queue.unwrap();
+            Some("transfer") => match overflow.target_queue.as_ref() {
+                Some(target_queue) => {
                 info!(
                     call_id = %req.call_id,
                     from_queue = %req.queue_id,
@@ -2646,30 +2785,44 @@ impl RwiCommandProcessor {
                 states.insert(req.call_id.clone(), queue_state);
                 drop(states);
 
-                let overflow_event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueOverflowed {
-                    call_id: req.call_id.clone(),
-                    original_queue_id: req.queue_id,
-                    overflow_queue_id: target_queue.clone(),
-                    reason: overflow.reason,
-                }, None);
+                let overflow_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::QueueOverflowed {
+                        call_id: req.call_id.clone(),
+                        original_queue_id: req.queue_id,
+                        overflow_queue_id: target_queue.clone(),
+                        reason: overflow.reason,
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.send_event_to_call_owner(&req.call_id, &overflow_event);
 
-                let joined_event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueJoined {
-                    call_id: req.call_id.clone(),
-                    queue_id: target_queue,
-                }, None);
+                let joined_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::QueueJoined {
+                        call_id: req.call_id.clone(),
+                        queue_id: target_queue.clone(),
+                    },
+                    None,
+                );
                 gw.send_event_to_call_owner(&req.call_id, &joined_event);
 
                 Ok(CommandResult::Success)
             }
-            Some("voicemail") => {
+            None => {
+                warn!("Queue overflow: transfer action but no target queue");
+                Ok(CommandResult::Success)
+            }
+        },
+        Some("voicemail") => {
                 info!(call_id = %req.call_id, "Redirecting to voicemail due to overflow");
-                let event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueVoicemailRedirected {
-                    call_id: req.call_id.clone(),
-                    queue_id: req.queue_id,
-                    reason: overflow.reason,
-                }, None);
+                let event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::QueueVoicemailRedirected {
+                        call_id: req.call_id.clone(),
+                        queue_id: req.queue_id,
+                        reason: overflow.reason,
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.send_event_to_call_owner(&req.call_id, &event);
                 Ok(CommandResult::Success)
@@ -2752,11 +2905,14 @@ impl RwiCommandProcessor {
         let mut states = self.queue_states.write().await;
         states.remove(call_id);
         if let Some(qid) = queue_id {
-            let event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueLeft {
-                call_id: call_id.to_string(),
-                queue_id: qid,
-                reason: None,
-            }, None);
+            let event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::QueueLeft {
+                    call_id: call_id.to_string(),
+                    queue_id: qid,
+                    reason: None,
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.send_event_to_call_owner(&call_id.to_string(), &event);
         }
@@ -2788,9 +2944,12 @@ impl RwiCommandProcessor {
                 }),
             })
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaHoldStarted {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaHoldStarted {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -2811,9 +2970,12 @@ impl RwiCommandProcessor {
                 leg_id: Some(LegId::new(call_id)),
             })
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaHoldStopped {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaHoldStopped {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -2860,11 +3022,14 @@ impl RwiCommandProcessor {
             }
         };
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueAgentOffered {
-            call_id: call_id.to_string(),
-            queue_id: queue_id.clone(),
-            agent_id: agent_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::QueueAgentOffered {
+                call_id: call_id.to_string(),
+                queue_id: queue_id.clone(),
+                agent_id: agent_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -2894,18 +3059,24 @@ impl RwiCommandProcessor {
             }
         };
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::QueueLeft {
-            call_id: call_id.to_string(),
-            queue_id: old_queue_id,
-            reason: Some("requeued".to_string()),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::QueueLeft {
+                call_id: call_id.to_string(),
+                queue_id: old_queue_id,
+                reason: Some("requeued".to_string()),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
-        let event2 = crate::rwi::event::to_legacy_event(&crate::rwi::QueueJoined {
-            call_id: call_id.to_string(),
-            queue_id: queue_id.to_string(),
-        }, None);
+        let event2 = crate::rwi::event::to_legacy_event(
+            &crate::rwi::QueueJoined {
+                call_id: call_id.to_string(),
+                queue_id: queue_id.to_string(),
+            },
+            None,
+        );
         gw.broadcast_event(&event2);
 
         info!(call_id = %call_id, new_queue = %queue_id, "Call requeued");
@@ -3034,9 +3205,12 @@ impl RwiCommandProcessor {
         };
         let mut states = self.record_states.write().await;
         states.insert(req.call_id.clone(), record_state);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::RecordStarted {
-            call_id: req.call_id.clone(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::RecordStarted {
+                call_id: req.call_id.clone(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&req.call_id, &event);
         Ok(CommandResult::Success)
@@ -3057,9 +3231,12 @@ impl RwiCommandProcessor {
         handle
             .send_command(CallCommand::PauseRecording)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::RecordPaused {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::RecordPaused {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -3080,9 +3257,12 @@ impl RwiCommandProcessor {
         handle
             .send_command(CallCommand::ResumeRecording)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::RecordResumed {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::RecordResumed {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -3108,25 +3288,28 @@ impl RwiCommandProcessor {
                 ),
                 None => (None, None, None, None),
             };
-            let event = crate::rwi::event::to_legacy_event(&crate::rwi::RecordStopped {
-                call_id: call_id.to_string(),
-                duration_secs: None,
-                filename: None,
-                unique_id: Some(call_id.to_string()),
-                file_size: None,
-                download_url: None,
-                caller_name: ani,
-                callee_name: dnis,
-                called_phone: None,
-                call_type: None,
-                agent_id,
-                agent_name,
-                call_start_time: None,
-                call_end_time: None,
-                upload_time: None,
-                switch_flag: None,
-                root_call_id: None,
-            }, None);
+            let event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::RecordStopped {
+                    call_id: call_id.to_string(),
+                    duration_secs: None,
+                    filename: None,
+                    unique_id: Some(call_id.to_string()),
+                    file_size: None,
+                    download_url: None,
+                    caller_name: ani,
+                    callee_name: dnis,
+                    called_phone: None,
+                    call_type: None,
+                    agent_id,
+                    agent_name,
+                    call_start_time: None,
+                    call_end_time: None,
+                    upload_time: None,
+                    switch_flag: None,
+                    root_call_id: None,
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.send_event_to_call_owner(&call_id.to_string(), &event);
         }
@@ -3151,11 +3334,14 @@ impl RwiCommandProcessor {
                 body: body.to_string(),
             })
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SipMessageReceived {
-            call_id: call_id.to_string(),
-            content_type: content_type.to_string(),
-            body: body.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SipMessageReceived {
+                call_id: call_id.to_string(),
+                content_type: content_type.to_string(),
+                body: body.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -3181,12 +3367,15 @@ impl RwiCommandProcessor {
                 body: body.to_string(),
             })
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SipNotifyReceived {
-            call_id: call_id.to_string(),
-            event: event.to_string(),
-            content_type: content_type.to_string(),
-            body: body.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SipNotifyReceived {
+                call_id: call_id.to_string(),
+                event: event.to_string(),
+                content_type: content_type.to_string(),
+                body: body.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -3231,18 +3420,24 @@ impl RwiCommandProcessor {
             )
             .await
         {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.clone(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.clone(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceCreated {
-            conf_id: conf_id.clone(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceCreated {
+                conf_id: conf_id.clone(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3262,19 +3457,25 @@ impl RwiCommandProcessor {
             .add_participant(&conf_id.into(), LegId::new(call_id))
             .await
         {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.to_string(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.to_string(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberJoined {
-            conf_id: conf_id.to_string(),
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceMemberJoined {
+                conf_id: conf_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3295,19 +3496,25 @@ impl RwiCommandProcessor {
             .remove_participant(&conf_id.into(), &LegId::new(call_id))
             .await
         {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.to_string(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.to_string(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberLeft {
-            conf_id: conf_id.to_string(),
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceMemberLeft {
+                conf_id: conf_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3328,19 +3535,25 @@ impl RwiCommandProcessor {
             .mute_participant(&conf_id.into(), &LegId::new(call_id))
             .await
         {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.to_string(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.to_string(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberMuted {
-            conf_id: conf_id.to_string(),
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceMemberMuted {
+                conf_id: conf_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3361,19 +3574,25 @@ impl RwiCommandProcessor {
             .unmute_participant(&conf_id.into(), &LegId::new(call_id))
             .await
         {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.to_string(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.to_string(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberUnmuted {
-            conf_id: conf_id.to_string(),
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceMemberUnmuted {
+                conf_id: conf_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3387,18 +3606,24 @@ impl RwiCommandProcessor {
     async fn conference_destroy(&self, conf_id: &str) -> Result<CommandResult, CommandError> {
         let manager = self.conference_manager();
         if let Err(e) = manager.destroy_conference(&conf_id.into()).await {
-            let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                conf_id: conf_id.to_string(),
-                error: e.to_string(),
-            }, None);
+            let err_event = crate::rwi::event::to_legacy_event(
+                &crate::rwi::ConferenceError {
+                    conf_id: conf_id.to_string(),
+                    error: e.to_string(),
+                },
+                None,
+            );
             let gw = self.gateway.read();
             gw.broadcast_event(&err_event);
             return Err(CommandError::CommandFailed(e.to_string()));
         }
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceDestroyed {
-            conf_id: conf_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceDestroyed {
+                conf_id: conf_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3420,21 +3645,27 @@ impl RwiCommandProcessor {
         let removed = match manager.end_by_host(&conf_id_obj, &host_leg).await {
             Ok(legs) => legs,
             Err(e) => {
-                let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                    conf_id: conf_id.to_string(),
-                    error: e.to_string(),
-                }, None);
+                let err_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceError {
+                        conf_id: conf_id.to_string(),
+                        error: e.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&err_event);
                 return Err(CommandError::CommandFailed(e.to_string()));
             }
         };
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceEndedByHost {
-            conf_id: conf_id.to_string(),
-            host_call_id: host_call_id.to_string(),
-            removed_call_ids: removed.iter().map(|l| l.to_string()).collect(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceEndedByHost {
+                conf_id: conf_id.to_string(),
+                host_call_id: host_call_id.to_string(),
+                removed_call_ids: removed.iter().map(|l| l.to_string()).collect(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.broadcast_event(&event);
 
@@ -3461,10 +3692,13 @@ impl RwiCommandProcessor {
         self.get_handle(call_id).await?;
         self.get_handle(consultation_call_id).await?;
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMergeRequested {
-            call_id: call_id.to_string(),
-            consultation_call_id: consultation_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceMergeRequested {
+                call_id: call_id.to_string(),
+                consultation_call_id: consultation_call_id.to_string(),
+            },
+            None,
+        );
         {
             let gw = self.gateway.read();
             gw.broadcast_event(&event);
@@ -3499,10 +3733,13 @@ impl RwiCommandProcessor {
                     });
                 }
 
-                let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMerged {
-                    conf_id: conf_id.to_string(),
-                    call_id: call_id.to_string(),
-                }, None);
+                let event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceMerged {
+                        conf_id: conf_id.to_string(),
+                        call_id: call_id.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&event);
 
@@ -3510,18 +3747,24 @@ impl RwiCommandProcessor {
                 Ok(CommandResult::Success)
             }
             Err(e) => {
-                let err_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceError {
-                    conf_id: conf_id.to_string(),
-                    error: e.to_string(),
-                }, None);
+                let err_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceError {
+                        conf_id: conf_id.to_string(),
+                        error: e.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&err_event);
 
-                let event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMergeFailed {
-                    conf_id: conf_id.to_string(),
-                    call_id: call_id.to_string(),
-                    reason: e.to_string(),
-                }, None);
+                let event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceMergeFailed {
+                        conf_id: conf_id.to_string(),
+                        call_id: call_id.to_string(),
+                        reason: e.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&event);
 
@@ -3551,11 +3794,14 @@ impl RwiCommandProcessor {
         self.get_handle(old_call_id).await?;
         self.get_handle(new_call_id).await?;
 
-        let started_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceSeatReplaceStarted {
-            conf_id: conf_id.to_string(),
-            old_call_id: old_call_id.to_string(),
-            new_call_id: new_call_id.to_string(),
-        }, None);
+        let started_event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::ConferenceSeatReplaceStarted {
+                conf_id: conf_id.to_string(),
+                old_call_id: old_call_id.to_string(),
+                new_call_id: new_call_id.to_string(),
+            },
+            None,
+        );
         {
             let gw = self.gateway.read();
             gw.broadcast_event(&started_event);
@@ -3571,10 +3817,13 @@ impl RwiCommandProcessor {
             .await
         {
             Ok(_) => {
-                let joined_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberJoined {
-                    conf_id: conf_id.to_string(),
-                    call_id: new_call_id.to_string(),
-                }, None);
+                let joined_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceMemberJoined {
+                        conf_id: conf_id.to_string(),
+                        call_id: new_call_id.to_string(),
+                    },
+                    None,
+                );
                 {
                     let gw = self.gateway.read();
                     gw.broadcast_event(&joined_event);
@@ -3586,10 +3835,13 @@ impl RwiCommandProcessor {
                         warn!(conf_id = %conf_id, old_call_id = %old_call_id, error = %e, "Failed to remove old participant during seat replace");
                     }
 
-                    let left_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceMemberLeft {
-                        conf_id: conf_id.to_string(),
-                        call_id: old_call_id.to_string(),
-                    }, None);
+                    let left_event = crate::rwi::event::to_legacy_event(
+                        &crate::rwi::ConferenceMemberLeft {
+                            conf_id: conf_id.to_string(),
+                            call_id: old_call_id.to_string(),
+                        },
+                        None,
+                    );
                     {
                         let gw = self.gateway.read();
                         gw.broadcast_event(&left_event);
@@ -3608,11 +3860,14 @@ impl RwiCommandProcessor {
                         .await;
                 }
 
-                let success_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceSeatReplaceSucceeded {
-                    conf_id: conf_id.to_string(),
-                    old_call_id: old_call_id.to_string(),
-                    new_call_id: new_call_id.to_string(),
-                }, None);
+                let success_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceSeatReplaceSucceeded {
+                        conf_id: conf_id.to_string(),
+                        old_call_id: old_call_id.to_string(),
+                        new_call_id: new_call_id.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&success_event);
 
@@ -3621,12 +3876,15 @@ impl RwiCommandProcessor {
             Err(e) => {
                 // New participant could not be added; old one was never removed,
                 // so no rollback is needed
-                let failed_event = crate::rwi::event::to_legacy_event(&crate::rwi::ConferenceSeatReplaceFailed {
-                    conf_id: conf_id.to_string(),
-                    old_call_id: old_call_id.to_string(),
-                    new_call_id: new_call_id.to_string(),
-                    reason: e.to_string(),
-                }, None);
+                let failed_event = crate::rwi::event::to_legacy_event(
+                    &crate::rwi::ConferenceSeatReplaceFailed {
+                        conf_id: conf_id.to_string(),
+                        old_call_id: old_call_id.to_string(),
+                        new_call_id: new_call_id.to_string(),
+                        reason: e.to_string(),
+                    },
+                    None,
+                );
                 let gw = self.gateway.read();
                 gw.broadcast_event(&failed_event);
 
@@ -3650,11 +3908,25 @@ impl RwiCommandProcessor {
             _source_call_id: source_call_id.to_string(),
         };
         let mut states = self.ringback_states.write().await;
+        // Opportunistic GC: drop entries whose target/source call has already
+        // left the registry. RingbackState has no explicit "stop" path, so
+        // without this the map would grow unbounded inside a long-lived
+        // session. Behaviour is unchanged because such entries are stale.
+        if states.len() >= RINGBACK_STATES_SOFT_CAP {
+            let registry = self.call_registry.clone();
+            states.retain(|id, state| {
+                registry.get_handle(id).is_some()
+                    || registry.get_handle(&state._source_call_id).is_some()
+            });
+        }
         states.insert(target_call_id.to_string(), ringback_state);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaRingbackPassthroughStarted {
-            source: source_call_id.to_string(),
-            target: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaRingbackPassthroughStarted {
+                source: source_call_id.to_string(),
+                target: target_call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&target_call_id.to_string(), &event);
         gw.send_event_to_call_owner(&source_call_id.to_string(), &event);
@@ -3710,10 +3982,13 @@ impl RwiCommandProcessor {
             },
         );
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SupervisorListenStarted {
-            supervisor_call_id: supervisor_call_id.to_string(),
-            target_call_id: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SupervisorListenStarted {
+                supervisor_call_id: supervisor_call_id.to_string(),
+                target_call_id: target_call_id.to_string(),
+            },
+            None,
+        );
         self.gateway
             .read()
             .send_event_to_call_owner(&supervisor_call_id.to_string(), &event);
@@ -3788,10 +4063,13 @@ impl RwiCommandProcessor {
             },
         );
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SupervisorWhisperStarted {
-            supervisor_call_id: supervisor_call_id.to_string(),
-            target_call_id: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SupervisorWhisperStarted {
+                supervisor_call_id: supervisor_call_id.to_string(),
+                target_call_id: target_call_id.to_string(),
+            },
+            None,
+        );
         self.gateway
             .read()
             .send_event_to_call_owner(&supervisor_call_id.to_string(), &event);
@@ -3871,10 +4149,13 @@ impl RwiCommandProcessor {
             },
         );
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SupervisorBargeStarted {
-            supervisor_call_id: supervisor_call_id.to_string(),
-            target_call_id: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SupervisorBargeStarted {
+                supervisor_call_id: supervisor_call_id.to_string(),
+                target_call_id: target_call_id.to_string(),
+            },
+            None,
+        );
         self.gateway
             .read()
             .send_event_to_call_owner(&supervisor_call_id.to_string(), &event);
@@ -3940,10 +4221,13 @@ impl RwiCommandProcessor {
             },
         );
 
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SupervisorTakeoverStarted {
-            supervisor_call_id: supervisor_call_id.to_string(),
-            target_call_id: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SupervisorTakeoverStarted {
+                supervisor_call_id: supervisor_call_id.to_string(),
+                target_call_id: target_call_id.to_string(),
+            },
+            None,
+        );
         self.gateway
             .read()
             .send_event_to_call_owner(&supervisor_call_id.to_string(), &event);
@@ -3987,10 +4271,13 @@ impl RwiCommandProcessor {
 
         let mut states = self.supervisor_states.write().await;
         states.remove(supervisor_call_id);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::SupervisorModeStopped {
-            supervisor_call_id: supervisor_call_id.to_string(),
-            target_call_id: target_call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::SupervisorModeStopped {
+                supervisor_call_id: supervisor_call_id.to_string(),
+                target_call_id: target_call_id.to_string(),
+            },
+            None,
+        );
         self.gateway
             .read()
             .send_event_to_call_owner(&supervisor_call_id.to_string(), &event);
@@ -4015,9 +4302,12 @@ impl RwiCommandProcessor {
         tracing::debug!(call_id, "media_stream_start: tracking state, firing event");
         let mut states = self.media_stream_states.write().await;
         states.insert(call_id.to_string(), MediaStreamState);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaStreamStarted {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaStreamStarted {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -4028,9 +4318,12 @@ impl RwiCommandProcessor {
         tracing::debug!(call_id, "media_stream_stop: clearing state, firing event");
         let mut states = self.media_stream_states.write().await;
         states.remove(call_id);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaStreamStopped {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaStreamStopped {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -4049,9 +4342,12 @@ impl RwiCommandProcessor {
         tracing::debug!(call_id, "media_inject_start: tracking state, firing event");
         let mut states = self.media_inject_states.write().await;
         states.insert(call_id.to_string(), MediaInjectState);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaStreamStarted {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaStreamStarted {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -4062,9 +4358,12 @@ impl RwiCommandProcessor {
         tracing::debug!(call_id, "media_inject_stop: clearing state, firing event");
         let mut states = self.media_inject_states.write().await;
         states.remove(call_id);
-        let event = crate::rwi::event::to_legacy_event(&crate::rwi::MediaStreamStopped {
-            call_id: call_id.to_string(),
-        }, None);
+        let event = crate::rwi::event::to_legacy_event(
+            &crate::rwi::MediaStreamStopped {
+                call_id: call_id.to_string(),
+            },
+            None,
+        );
         let gw = self.gateway.read();
         gw.send_event_to_call_owner(&call_id.to_string(), &event);
         Ok(CommandResult::Success)
@@ -5358,6 +5657,112 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Call not found"));
+    }
+
+    /// Verifies the opportunistic GC inside `set_ringback_source`: when the
+    /// soft cap is exceeded, entries whose target/source call has left the
+    /// registry must be evicted while live entries are preserved. This locks
+    /// in the leak fix without changing observable behaviour for live calls.
+    #[tokio::test]
+    async fn test_set_ringback_source_evicts_stale_entries_above_soft_cap() {
+        // Use the public soft-cap constant so the test tracks the production
+        // threshold. We deliberately insert *stale* entries (call ids that are
+        // not registered) directly into the underlying map, then add one live
+        // target/source pair plus one extra insert that should trigger GC.
+        let registry = Arc::new(ActiveProxyCallRegistry::new());
+
+        // Seed one live call pair that must survive GC.
+        let _target = create_test_call(
+            &registry,
+            "live-target",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+        );
+        let _source = create_test_call(
+            &registry,
+            "live-source",
+            "1002",
+            "2001",
+            DialDirection::Inbound,
+        );
+
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
+
+        // Pre-populate ringback_states with stale entries above the soft cap.
+        {
+            let mut states = processor.ringback_states.write().await;
+            for i in 0..(RINGBACK_STATES_SOFT_CAP + 1) {
+                states.insert(
+                    format!("stale-target-{i}"),
+                    RingbackState {
+                        _target_call_id: format!("stale-target-{i}"),
+                        _source_call_id: format!("stale-source-{i}"),
+                    },
+                );
+            }
+            assert!(states.len() > RINGBACK_STATES_SOFT_CAP);
+        }
+
+        // Triggering insert: target/source both live, must succeed and run GC.
+        let result = processor
+            .process_command(RwiCommandPayload::SetRingbackSource {
+                target_call_id: "live-target".into(),
+                source_call_id: "live-source".into(),
+            })
+            .await;
+        assert!(result.is_ok(), "{:?}", result);
+
+        // After GC: only the live entry we just inserted must remain.
+        let states = processor.ringback_states.read().await;
+        assert_eq!(
+            states.len(),
+            1,
+            "stale ringback entries were not evicted, remaining: {}",
+            states.len()
+        );
+        assert!(states.contains_key("live-target"));
+        // Sanity: registry still reports the live handles.
+        assert!(registry.get_handle("live-target").is_some());
+        assert!(registry.get_handle("live-source").is_some());
+    }
+
+    /// `CommandDeduplicationCache::record` must opportunistically evict
+    /// expired entries once the soft cap is exceeded, so dedup correctness is
+    /// preserved without unbounded growth.
+    #[tokio::test]
+    async fn test_command_dedup_cache_evicts_expired_entries_above_soft_cap() {
+        let cache = CommandDeduplicationCache::new(60);
+        // Use a backdated `received_at` for inserted entries so they are
+        // already expired when GC runs. We achieve this by inserting normally
+        // then mutating `received_at` through the public API is not possible,
+        // so instead we drive eviction through sheer count: cap is 256; we
+        // insert 256 fresh entries (which are NOT yet expired) plus one more,
+        // then verify the cache size stays bounded by the soft cap.
+        for i in 0..COMMAND_DEDUP_SOFT_CAP {
+            cache
+                .record(format!("action-{i}"), Some(format!("result-{i}")))
+                .await;
+        }
+        // None are expired yet, so the cache must hold all of them.
+        assert_eq!(cache.len().await, COMMAND_DEDUP_SOFT_CAP);
+        // Recording one more triggers cleanup_expired; since nothing is
+        // expired, size grows to SOFT_CAP + 1.
+        cache.record("action-trigger".into(), None).await;
+        assert_eq!(cache.len().await, COMMAND_DEDUP_SOFT_CAP + 1);
+
+        // Now wait past TTL so subsequent records evict everything old.
+        // Use a fresh short-TTL cache to keep the test fast and deterministic.
+        let short = CommandDeduplicationCache::new(0);
+        // TTL of 0 means any entry is immediately expired; record once to
+        // populate, then push past the cap and confirm eviction occurs.
+        for i in 0..(COMMAND_DEDUP_SOFT_CAP + 1) {
+            short.record(format!("old-{i}"), None).await;
+        }
+        // With TTL=0 every entry is expired by the time we cross the cap,
+        // so after the final record the cache must contain only that record.
+        let len = short.len().await;
+        assert!(len <= 1, "expected at most 1 entry after GC, got {}", len);
     }
 
     #[tokio::test]

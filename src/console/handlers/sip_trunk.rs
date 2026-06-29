@@ -8,8 +8,9 @@ use crate::addons::wholesale::models::{
     },
 };
 use crate::{
+    console::config_helpers::{find_or_404, internal_error},
     console::handlers::forms::{self, ListQuery, SipTrunkForm},
-    console::{ConsoleState, middleware::AuthRequired},
+    console::{ConsoleState, ReloadTarget, middleware::AuthRequired},
     models::routing::{Entity as RoutingEntity, Model as RoutingModel},
     models::sip_trunk::{
         ActiveModel as SipTrunkActiveModel, Column as SipTrunkColumn, Entity as SipTrunkEntity,
@@ -19,7 +20,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Form, Path as AxumPath, State},
+    extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, put},
@@ -69,10 +70,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
 
 pub fn api_urls() -> Router<Arc<ConsoleState>> {
     Router::new()
-        .route(
-            "/sip-trunk",
-            put(create_sip_trunk).post(query_sip_trunks),
-        )
+        .route("/sip-trunk", put(create_sip_trunk).post(query_sip_trunks))
         .route(
             "/sip-trunk/{id}",
             patch(update_sip_trunk).delete(delete_sip_trunk),
@@ -243,14 +241,10 @@ async fn page_sip_trunk_detail(
 async fn create_sip_trunk(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
-    Form(form): Form<SipTrunkForm>,
+    Json(form): Json<SipTrunkForm>,
 ) -> Response {
-    if !state.has_permission(&user, "trunks", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "trunks", "write").await {
+        return resp;
     }
     let db = state.db();
     let now = Utc::now();
@@ -278,16 +272,12 @@ async fn create_sip_trunk(
                 );
             }
 
-            state.mark_pending_reload();
+            state.mark_pending_reload(ReloadTarget::Trunks);
             Json(json!({"status": "ok", "id": model.id})).into_response()
         }
         Err(err) => {
             warn!("failed to create sip trunk: {}", err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to create SIP trunk: {}", err)})),
-            )
-                .into_response()
+            internal_error(format!("Failed to create SIP trunk: {}", err))
         }
     }
 }
@@ -296,34 +286,13 @@ async fn update_sip_trunk(
     AxumPath(id): AxumPath<i64>,
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
-    Form(form): Form<SipTrunkForm>,
+    Json(form): Json<SipTrunkForm>,
 ) -> Response {
-    if !state.has_permission(&user, "trunks", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "trunks", "write").await {
+        return resp;
     }
     let db = state.db();
-    let model = match SipTrunkEntity::find_by_id(id).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "SIP trunk not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load sip trunk {} for update: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to update SIP trunk: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = find_or_404!(SipTrunkEntity, id, db, "SIP trunk");
 
     let mut active: SipTrunkActiveModel = model.into();
     let now = Utc::now();
@@ -347,16 +316,12 @@ async fn update_sip_trunk(
                 );
             }
 
-            state.mark_pending_reload();
+            state.mark_pending_reload(ReloadTarget::Trunks);
             Json(json!({"status": "ok"})).into_response()
         }
         Err(err) => {
             warn!("failed to update sip trunk {}: {}", id, err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to update SIP trunk: {}", err)})),
-            )
-                .into_response()
+            internal_error(format!("Failed to update SIP trunk: {}", err))
         }
     }
 }
@@ -376,24 +341,7 @@ async fn trunk_dependencies(
 ) -> Response {
     let db = state.db();
 
-    let trunk = match SipTrunkEntity::find_by_id(id).one(db).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "SIP trunk not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load trunk {} for dependency check: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to check dependencies: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let trunk = find_or_404!(SipTrunkEntity, id, db, "SIP trunk");
 
     let trunk_name = trunk.name.clone();
 
@@ -401,11 +349,7 @@ async fn trunk_dependencies(
         Ok(routes) => routes,
         Err(err) => {
             warn!("failed to load routes for trunk dependency check: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to check dependencies: {}", err)})),
-            )
-                .into_response();
+            return internal_error(format!("Failed to check dependencies: {}", err));
         }
     };
 
@@ -459,46 +403,21 @@ async fn delete_sip_trunk(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    if !state.has_permission(&user, "trunks", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "trunks", "write").await {
+        return resp;
     }
     let db = state.db();
-    let model = match SipTrunkEntity::find_by_id(id).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "SIP trunk not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load sip trunk {} for delete: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to delete SIP trunk: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = find_or_404!(SipTrunkEntity, id, db, "SIP trunk");
 
     let active: SipTrunkActiveModel = model.into();
     match active.delete(db).await {
         Ok(_) => {
-            state.mark_pending_reload();
+            state.mark_pending_reload(ReloadTarget::Trunks);
             Json(json!({"status": "ok"})).into_response()
         }
         Err(err) => {
             warn!("failed to delete sip trunk {}: {}", id, err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to delete SIP trunk: {}", err)})),
-            )
-                .into_response()
+            internal_error(format!("Failed to delete SIP trunk: {}", err))
         }
     }
 }
@@ -995,71 +914,11 @@ fn parse_json_field(value: &Option<String>, field: &str) -> Result<Option<Value>
 
 #[cfg(test)]
 mod tests {
+    use crate::console::handlers::test_helpers::{setup_state, superuser, unprivileged_user};
+
     use super::*;
-    use crate::{
-        config::ConsoleConfig, console::middleware::AuthRequired, models::migration::Migrator,
-    };
+    use crate::console::middleware::AuthRequired;
     use axum::{extract::State, http::StatusCode};
-    use chrono::Utc;
-    use sea_orm::Database;
-    use sea_orm_migration::MigratorTrait;
-    use std::sync::Arc;
-
-    fn superuser() -> crate::models::user::Model {
-        let now = Utc::now();
-        crate::models::user::Model {
-            id: 1,
-            email: "admin@rustpbx.com".into(),
-            username: "admin".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: true,
-            is_superuser: true,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
-
-    fn unprivileged_user() -> crate::models::user::Model {
-        let now = Utc::now();
-        crate::models::user::Model {
-            id: 99,
-            email: "limited@rustpbx.com".into(),
-            username: "limited".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: false,
-            is_superuser: false,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
-
-    async fn setup_state() -> Arc<ConsoleState> {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(db,
-            ConsoleConfig::default(),
-        )
-        .await
-        .expect("initialize console state")
-    }
 
     #[tokio::test]
     async fn create_sip_trunk_denied_without_permission() {
@@ -1067,7 +926,7 @@ mod tests {
         let user = unprivileged_user();
         let form = SipTrunkForm::default();
         let resp =
-            create_sip_trunk(State(state), AuthRequired(user), axum::extract::Form(form)).await;
+            create_sip_trunk(State(state), AuthRequired(user), axum::Json(form)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1080,7 +939,7 @@ mod tests {
             AxumPath(999i64),
             State(state),
             AuthRequired(user),
-            axum::extract::Form(form),
+            axum::Json(form),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1102,7 +961,7 @@ mod tests {
         form.name = Some("test-trunk".into());
         form.sip_server = Some("sip.example.com".into());
         let resp =
-            create_sip_trunk(State(state), AuthRequired(user), axum::extract::Form(form)).await;
+            create_sip_trunk(State(state), AuthRequired(user), axum::Json(form)).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

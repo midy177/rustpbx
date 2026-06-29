@@ -12,6 +12,7 @@ use crate::{
         CALL_RECORD_HTTP_CONNECT_TIMEOUT, CALL_RECORD_HTTP_TIMEOUT, CallRecord, CallRecordHook,
     },
     config::{RecordingPolicy, RecordingType},
+    models::call_record::extract_sip_username,
     rwi::RwiGatewayRef,
     storage::{Storage, StorageConfig},
 };
@@ -25,7 +26,8 @@ pub struct RecordingUploadHook {
 
 impl RecordingUploadHook {
     pub fn new(policy: RecordingPolicy) -> Result<Self> {
-        let s3_storage = if policy.recording_type == RecordingType::S3 {
+        let recording_type = policy.recording_type.unwrap_or_default();
+        let s3_storage = if recording_type == RecordingType::S3 {
             let bucket = Self::required(&policy.bucket, "bucket")?;
             let region = Self::required(&policy.region, "region")?;
             let access_key = Self::required(&policy.access_key, "access_key")?;
@@ -76,18 +78,12 @@ impl RecordingUploadHook {
             .ok_or_else(|| anyhow!("recording.{name} is required"))
     }
 
-    fn storage_key(&self, record: &CallRecord, track_id: &str, media_path: &str) -> String {
+    fn storage_key(&self, record: &CallRecord, _track_id: &str, media_path: &str) -> String {
         let file_name = Path::new(media_path)
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("recording.wav"))
             .to_string_lossy();
-        let key = format!(
-            "{}/{}_{}_{}",
-            record.start_time.format("%Y%m%d"),
-            record.call_id,
-            track_id,
-            file_name
-        );
+        let key = format!("{}/{}", record.start_time.format("%Y%m%d"), file_name);
         match self
             .policy
             .root
@@ -207,7 +203,7 @@ impl CallRecordHook for RecordingUploadHook {
             };
             let data_len = data.len();
             let key = self.storage_key(record, &track_id, &path);
-            let upload = match self.policy.recording_type {
+            let upload = match self.policy.recording_type.unwrap_or_default() {
                 RecordingType::Local => Ok(path.clone()),
                 RecordingType::Http => self.upload_http(record, &track_id, &path, data).await,
                 RecordingType::S3 => self.upload_s3(&key, data).await,
@@ -266,15 +262,11 @@ impl CallRecordHook for RecordingUploadHook {
                         })
                         .unwrap_or_default(),
                     unique_id: record.call_id.clone(),
-                    file_size: record
-                        .recorder
-                        .first()
-                        .map(|m| m.size)
-                        .unwrap_or(0),
+                    file_size: record.recorder.first().map(|m| m.size).unwrap_or(0),
                     download_url: Some(url.clone()),
-                    caller_name: Some(record.caller.clone()),
-                    callee_name: Some(record.callee.clone()),
-                    called_phone: Some(record.callee.clone()),
+                    caller_name: extract_sip_username(&record.caller),
+                    callee_name: extract_sip_username(&record.callee),
+                    called_phone: extract_sip_username(&record.callee),
                     call_type: record.details.direction.clone(),
                     agent_id: None,
                     agent_name: None,

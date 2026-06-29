@@ -5,7 +5,7 @@ use crate::addons::queue::models::{
 use crate::addons::queue::services::{exporter::QueueExporter, utils as queue_utils};
 use crate::config::ProxyConfig;
 use crate::console::handlers::{bad_request, forms, normalize_optional_string, require_field};
-use crate::console::{ConsoleState, middleware::AuthRequired};
+use crate::console::{ConsoleState, ReloadTarget, middleware::AuthRequired};
 use crate::proxy::routing::{ConfigOrigin, RouteQueueConfig};
 use axum::{
     Json, Router,
@@ -53,10 +53,7 @@ pub fn api_urls() -> Router<Arc<ConsoleState>> {
         .route("/queues/reload", post(reload_queues_handler))
         .route("/queues/download-audio", post(download_audio_handler))
         .route("/queues/sound/{*file_path}", get(serve_sound_handler))
-        .route(
-            "/queues/{id}",
-            patch(update_queue).delete(delete_queue),
-        )
+        .route("/queues/{id}", patch(update_queue).delete(delete_queue))
         .route("/queues/{id}/export", post(export_queue))
 }
 
@@ -234,6 +231,13 @@ pub async fn page_queue_create(
     AuthRequired(_): AuthRequired,
 ) -> Response {
     let script_path = format!("{}/queues/new", state.base_path());
+    let forwarding_catalog = if let Some(proxy_config) =
+        crate::console::catalog::load_proxy_config(state.app_state().as_ref())
+    {
+        crate::console::catalog::build_forwarding_catalog(&proxy_config)
+    } else {
+        crate::console::catalog::ForwardingCatalog::empty()
+    };
     state.render_with_headers(
         "queue_detail.html",
         json!({
@@ -245,6 +249,7 @@ pub async fn page_queue_create(
                 "tags": Vec::<String>::new(),
                 "metadata_text": "",
             },
+            "forwarding_catalog": forwarding_catalog,
             "create_url": state.url_for("/queues"),
             "update_url": Value::Null,
             "list_url": state.url_for("/queues"),
@@ -279,6 +284,13 @@ pub async fn page_queue_edit(
     let tags = queue_tags(model.metadata.as_ref());
 
     let script_path = format!("{}/queues/{}", state.base_path(), model.id);
+    let forwarding_catalog = if let Some(proxy_config) =
+        crate::console::catalog::load_proxy_config(state.app_state().as_ref())
+    {
+        crate::console::catalog::build_forwarding_catalog(&proxy_config)
+    } else {
+        crate::console::catalog::ForwardingCatalog::empty()
+    };
     state.render_with_headers(
         "queue_detail.html",
         json!({
@@ -294,6 +306,7 @@ pub async fn page_queue_edit(
                 "metadata_text": metadata_text,
                 "updated_at": model.updated_at.to_rfc3339(),
             },
+            "forwarding_catalog": forwarding_catalog,
             "create_url": state.url_for("/queues"),
             "update_url": state.url_for(&format!("/queues/{}", model.id)),
             "list_url": state.url_for("/queues"),
@@ -684,7 +697,7 @@ pub async fn reload_queues_handler(
         Ok(metrics) => {
             let total = metrics.total;
             let generated_entries = metrics.generated.as_ref().map(|g| g.entries).unwrap_or(0);
-            state.clear_pending_reload();
+            state.clear_pending_reload(ReloadTarget::Queues);
             Json(json!({
                 "status": "ok",
                 "queues_reloaded": total,
@@ -747,15 +760,10 @@ pub async fn download_audio_handler(
     let dest_path = sounds_dir.join(&filename);
 
     // Download
-    let opts = crate::http_util::HttpFetchOptions::new()
-        .with_timeout(std::time::Duration::from_secs(30));
-    match crate::http_util::fetch_bytes(
-        &reqwest::Client::new(),
-        reqwest::Method::GET,
-        &url,
-        &opts,
-    )
-    .await
+    let opts =
+        crate::http_util::HttpFetchOptions::new().with_timeout(std::time::Duration::from_secs(30));
+    match crate::http_util::fetch_bytes(&reqwest::Client::new(), reqwest::Method::GET, &url, &opts)
+        .await
     {
         Ok(bytes) => {
             if let Err(e) = tokio::fs::write(&dest_path, &bytes).await {

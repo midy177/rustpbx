@@ -42,6 +42,7 @@
 //! 4. The bridge's RTP side connects to the SIP/RTP endpoint
 
 use crate::media::ReceiveTimestampClock;
+use crate::media::engine::command::SharedMediaSample;
 use crate::media::recorder::{Leg as RecLeg, Recorder};
 use crate::media::transcoder::{RtpTiming, Transcoder, rewrite_dtmf_duration};
 use anyhow::Result;
@@ -341,7 +342,7 @@ pub struct BridgePeer {
     /// When true, the bridge skips writing to the recorder (recording paused).
     recording_paused: Arc<AtomicBool>,
     /// Non-blocking RTP capture tee for SipFlow.
-    sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+    sipflow_tx: Option<mpsc::Sender<(RecLeg, SharedMediaSample, u64)>>,
     receive_clock: ReceiveTimestampClock,
     dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
     /// Audio sender channels for forwarding — fast-path aliases
@@ -1771,7 +1772,7 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
-        sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+        sipflow_tx: Option<mpsc::Sender<(RecLeg, SharedMediaSample, u64)>>,
         receive_clock: ReceiveTimestampClock,
         recording_paused: Arc<AtomicBool>,
         dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
@@ -1860,7 +1861,13 @@ impl BridgePeer {
                                 }
 
                                 if let (Some(tx), Some(leg)) = (&sipflow_tx, recorder_leg) {
-                                    let _ = tx.try_send((leg, sample.clone(), received_at_micros));
+                                    // Share the sample via Arc instead of deep-cloning
+                                    // the `raw_packet.payload` Vec<u8> per packet.
+                                    let _ = tx.try_send((
+                                        leg,
+                                        Arc::new(sample.clone()),
+                                        received_at_micros,
+                                    ));
                                 }
                             }
                             if !is_video {
@@ -2188,7 +2195,7 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
-        sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+        sipflow_tx: Option<mpsc::Sender<(RecLeg, SharedMediaSample, u64)>>,
         receive_clock: ReceiveTimestampClock,
         recording_paused: Arc<AtomicBool>,
         dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
@@ -2287,7 +2294,7 @@ pub struct BridgePeerBuilder {
     ice_servers: Vec<IceServer>,
     recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
     recording_paused: Arc<AtomicBool>,
-    sipflow_tx: Option<mpsc::Sender<(RecLeg, MediaSample, u64)>>,
+    sipflow_tx: Option<mpsc::Sender<(RecLeg, SharedMediaSample, u64)>>,
     cname: Option<String>,
     rtp_timeout: Option<std::time::Duration>,
     rtp_timeout_tx: Option<mpsc::Sender<String>>,
@@ -2440,7 +2447,7 @@ impl BridgePeerBuilder {
 
     pub fn with_sipflow_capture(
         mut self,
-        sipflow_tx: mpsc::Sender<(RecLeg, MediaSample, u64)>,
+        sipflow_tx: mpsc::Sender<(RecLeg, SharedMediaSample, u64)>,
     ) -> Self {
         self.sipflow_tx = Some(sipflow_tx);
         self
@@ -4031,7 +4038,6 @@ mod tests {
 
     /// Verify Opus → PCMU transcoding via Transcoder produces correct output.
     #[tokio::test]
-    #[cfg(feature = "opus")]
     async fn test_transcoder_opus_to_pcmu() {
         use audio_codec::create_encoder;
         // Generate 20ms of 48kHz mono PCM (960 samples)
@@ -4110,7 +4116,6 @@ mod tests {
 
     /// Verify Opus → G.722 transcoding via Transcoder produces correct output.
     #[tokio::test]
-    #[cfg(feature = "opus")]
     async fn test_transcoder_opus_to_g722() {
         use audio_codec::create_encoder;
 
@@ -4147,7 +4152,6 @@ mod tests {
 
     /// Run full Opus→PCMU round-trip: encode PCM → Opus → transcode → PCMU → decode → verify PCM correlation.
     #[tokio::test]
-    #[cfg(feature = "opus")]
     async fn test_transcoder_opus_to_pcmu_roundtrip_quality() {
         use audio_codec::{create_decoder, create_encoder};
 

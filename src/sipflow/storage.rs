@@ -14,6 +14,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const GZIP_MAGIC: [u8; 2] = [0x1F, 0x8B];
 const RAW_RECORD_HEADER_LEN: u64 = 10;
 const RAW_READ_THROUGH_GAP: u64 = 64 * 1024;
 
@@ -105,9 +106,14 @@ pub fn process_packet(packet: Packet) -> ProcessedPacket {
 
     let orig_size = payload.len();
     let (payload, comp_size, _compressed) = if orig_size >= 96 {
-        if let Ok(data) = zstd::encode_all(&payload[..], 3) {
-            let size = data.len();
-            (data.into(), size, true)
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        if encoder.write_all(&payload).is_ok() {
+            if let Ok(data) = encoder.finish() {
+                let size = data.len();
+                (data.into(), size, true)
+            } else {
+                (payload, orig_size, false)
+            }
         } else {
             (payload, orig_size, false)
         }
@@ -167,7 +173,16 @@ fn read_raw_payload(
     *current_pos = Some(payload_offset + size as u64);
 
     if buf.starts_with(&ZSTD_MAGIC) {
-        zstd::decode_all(&buf[..])
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(&buf[..])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result)?;
+        Ok(result)
+    } else if buf.starts_with(&GZIP_MAGIC) {
+        let mut decoder = flate2::read::GzDecoder::new(&buf[..]);
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result)?;
+        Ok(result)
     } else {
         Ok(buf)
     }
@@ -209,7 +224,10 @@ impl StorageManager {
             self.call_id_cache.clear();
         }
 
-        let file = self.raw_file.as_mut().ok_or_else(|| anyhow::anyhow!("raw_file not initialized after rotate"))?;
+        let file = self
+            .raw_file
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("raw_file not initialized after rotate"))?;
         let offset = file.metadata()?.len();
 
         file.write_all(&0x5346u16.to_be_bytes())?; // Magic
@@ -235,6 +253,11 @@ impl StorageManager {
         }
 
         Ok(())
+    }
+
+    /// Number of items waiting to be flushed.
+    pub fn batch_len(&self) -> usize {
+        self.batch.len()
     }
 
     pub async fn check_flush(&mut self) -> Result<()> {
@@ -557,11 +580,7 @@ impl StorageManager {
             results
                 .entry(key)
                 .or_insert_with(|| {
-                    MediaStatsAccumulator::new(
-                        packet.leg,
-                        packet.src,
-                        header.map(|h| h.ssrc),
-                    )
+                    MediaStatsAccumulator::new(packet.leg, packet.src, header.map(|h| h.ssrc))
                 })
                 .observe(packet.timestamp as u64, header);
         }
@@ -665,8 +684,7 @@ impl StorageManager {
             for row in rows {
                 let offset = u64::try_from(row.offset)?;
                 let size = usize::try_from(row.size)?;
-                let payload =
-                    read_raw_payload(&mut raw_file, &mut current_pos, offset, size)?;
+                let payload = read_raw_payload(&mut raw_file, &mut current_pos, offset, size)?;
 
                 results.push(StoredMediaPacket {
                     leg: row.leg,
@@ -926,33 +944,15 @@ mod tests {
         let p2 = b"rtp-payload-2";
 
         storage
-            .write_processed(make_rtp_processed(
-                t0,
-                call_id,
-                0,
-                "127.0.0.1:4000",
-                p0,
-            ))
+            .write_processed(make_rtp_processed(t0, call_id, 0, "127.0.0.1:4000", p0))
             .await
             .expect("write t0");
         storage
-            .write_processed(make_rtp_processed(
-                t1,
-                call_id,
-                0,
-                "127.0.0.1:4000",
-                p1,
-            ))
+            .write_processed(make_rtp_processed(t1, call_id, 0, "127.0.0.1:4000", p1))
             .await
             .expect("write t1");
         storage
-            .write_processed(make_rtp_processed(
-                t2,
-                call_id,
-                0,
-                "127.0.0.1:4000",
-                p2,
-            ))
+            .write_processed(make_rtp_processed(t2, call_id, 0, "127.0.0.1:4000", p2))
             .await
             .expect("write t2");
         storage.force_flush().await.expect("flush");
@@ -1042,7 +1042,11 @@ mod tests {
             .query_flow("call-0", start, end)
             .await
             .expect("query_flow");
-        assert_eq!(one_call.len(), 10, "query_flow returns only call-0's 10 SIP msgs");
+        assert_eq!(
+            one_call.len(),
+            10,
+            "query_flow returns only call-0's 10 SIP msgs"
+        );
 
         // query_flow_in_range WITHOUT call_id filter → ALL calls' SIP messages!
         let all_calls = storage

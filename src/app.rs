@@ -304,15 +304,12 @@ impl AppStateBuilder {
         let mut callrecord_manager = None;
         let callrecord_sender = if let Some(sender) = self.callrecord_sender {
             Some(sender)
-        } else if config.callrecord.is_some()
-            || sipflow_upload_config.is_some()
-            || recording_upload_policy.is_some()
-        {
-            // Build a CallRecordManager when either:
-            //  - [callrecord] is configured (CDR JSON files / S3), or
-            //  - [sipflow.upload] is configured (post-call WAV upload)
-            //  - [recording].type exports live recorder WAV after call completion.
-            // DatabaseHook is always included so call records reach the DB.
+        } else {
+            // Always build a CallRecordManager — DatabaseHook persists every
+            // call to the rustpbx_call_records table unconditionally.
+            // [callrecord], [sipflow.upload], and [recording] only add
+            // optional extra sinks (JSON files, S3, HTTP, WAV upload, etc.)
+            // on top of the always-on database persistence.
             let mut builder =
                 CallRecordManagerBuilder::new().with_cancel_token(token.child_token());
 
@@ -355,15 +352,12 @@ impl AppStateBuilder {
             callrecord_stats = Some(manager.stats.clone());
             callrecord_manager = Some(manager);
             Some(sender)
-        } else {
-            None
         };
 
         #[cfg(feature = "console")]
         let console_state = match config.console.clone() {
             Some(console_config) => Some(
-                crate::console::ConsoleState::initialize(db_conn.clone(), console_config)
-                .await?,
+                crate::console::ConsoleState::initialize(db_conn.clone(), console_config).await?,
             ),
             None => None,
         };
@@ -585,13 +579,33 @@ pub async fn run(state: AppState, mut router: Router) -> Result<()> {
         );
         let endpoint_ref = state.sip_server().inner.endpoint.inner.clone();
         let token = token.clone();
+        let jwt_config = state.sip_server().inner.proxy_config.jwt_auth.clone();
+        let pre_auth_registry = state.sip_server().inner.pre_auth_registry.clone();
         router = router.route(
             ws_handler,
             axum::routing::get(
-                async move |client_ip: ClientAddr, ws: WebSocketUpgrade| -> Response {
+                async move |client_ip: ClientAddr,
+                            ws: WebSocketUpgrade,
+                            axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >,
+                            headers: axum::http::HeaderMap|
+                            -> Response {
                     let token = token.clone();
+
+                    // Path B: Extract JWT from query param or Authorization header
+                    let pre_authed_agent = extract_ws_jwt(&params, &headers, &jwt_config);
+
                     ws.protocols(["sip"]).on_upgrade(async move |socket| {
-                        sip_ws_handler(token, client_ip, socket, endpoint_ref.clone()).await
+                        sip_ws_handler(
+                            token,
+                            client_ip,
+                            socket,
+                            endpoint_ref.clone(),
+                            pre_authed_agent,
+                            pre_auth_registry.clone(),
+                        )
+                        .await
                     })
                 },
             ),
@@ -726,6 +740,41 @@ pub async fn run(state: AppState, mut router: Router) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn extract_ws_jwt(
+    params: &std::collections::HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+    jwt_config: &Option<crate::config::JwtAuthConfig>,
+) -> Option<String> {
+    let cfg = jwt_config.as_ref()?;
+    if !cfg.enabled {
+        return None;
+    }
+
+    let raw_token = params.get(&cfg.ws_token_param).cloned().or_else(|| {
+        headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|s| s.trim().to_string())
+    });
+
+    let token = raw_token?;
+    let validator = crate::auth::jwt_validator::JwtValidator::new(cfg);
+    match validator.validate(&token) {
+        Ok(claims) => {
+            let agent = validator.extract_user_id(&claims);
+            if agent.is_some() {
+                tracing::info!("WebSocket JWT pre-auth succeeded");
+            }
+            agent
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "WebSocket JWT pre-auth failed");
+            None
+        }
+    }
 }
 
 // ICE servers handler

@@ -1,5 +1,6 @@
-use crate::console::handlers::{bad_request, forms};
-use crate::console::{ConsoleState, middleware::AuthRequired};
+use crate::console::config_helpers::{find_or_404, internal_error};
+use crate::console::handlers::{bad_request, forms, sanitize_optional_string};
+use crate::console::{ConsoleState, ReloadTarget, middleware::AuthRequired};
 use crate::models::{
     routing::{
         ActiveModel as RoutingActiveModel, Column as RoutingColumn, Entity as RoutingEntity,
@@ -53,10 +54,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
 
 pub fn api_urls() -> Router<Arc<ConsoleState>> {
     Router::new()
-        .route(
-            "/routing",
-            post(query_routing).put(create_routing),
-        )
+        .route("/routing", post(query_routing).put(create_routing))
         .route(
             "/routing/{id}",
             patch(update_routing).delete(delete_routing),
@@ -415,12 +413,6 @@ fn default_priority_value() -> i32 {
     DEFAULT_PRIORITY
 }
 
-fn sanitize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn normalize_selection(value: Option<String>) -> RoutingSelectionStrategy {
     value
         .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
@@ -572,8 +564,7 @@ async fn load_trunks(db: &DatabaseConnection) -> Result<Vec<SipTrunkModel>, DbEr
 fn load_catalogs(state: &ConsoleState) -> crate::console::catalog::ForwardingCatalog {
     match crate::console::catalog::load_proxy_config(state.app_state().as_ref()) {
         Some(proxy_config) => {
-            let catalog =
-                crate::console::catalog::build_forwarding_catalog(&proxy_config);
+            let catalog = crate::console::catalog::build_forwarding_catalog(&proxy_config);
             tracing::info!(
                 queue_count = catalog.queues.len(),
                 ivr_count = catalog.ivr_projects.len(),
@@ -1062,18 +1053,7 @@ pub async fn page_routing_edit(
     AuthRequired(user): AuthRequired,
 ) -> Response {
     let db = state.db();
-    let model = match RoutingEntity::find_by_id(id).one(db).await {
-        Ok(Some(route)) => route,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Route not found").into_response(),
-        Err(err) => {
-            warn!("failed to load route {} for edit: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load routing rule: {}", err),
-            )
-                .into_response();
-        }
-    };
+    let model = crate::console::config_helpers::find_or_404!(RoutingEntity, id, db, "Route");
 
     let trunks = match load_trunks(db).await {
         Ok(list) => list,
@@ -1118,24 +1098,7 @@ pub async fn route_detail_data(
     AuthRequired(_): AuthRequired,
 ) -> Response {
     let db = state.db();
-    let model = match RoutingEntity::find_by_id(id).one(db).await {
-        Ok(Some(route)) => route,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "Routing rule not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load route {} detail data: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = crate::console::config_helpers::find_or_404!(RoutingEntity, id, db, "Route");
 
     let trunks = match load_trunks(db).await {
         Ok(list) => list,
@@ -1180,24 +1143,7 @@ pub async fn clone_routing(
     AuthRequired(_): AuthRequired,
 ) -> Response {
     let db = state.db();
-    let model = match RoutingEntity::find_by_id(id).one(db).await {
-        Ok(Some(route)) => route,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "Route not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load route {} for clone: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = crate::console::config_helpers::find_or_404!(RoutingEntity, id, db, "Route");
 
     let mut doc = RouteDocument::from_model(&model);
     doc.id = None;
@@ -1295,24 +1241,7 @@ pub async fn toggle_routing(
     AuthRequired(_): AuthRequired,
 ) -> Response {
     let db = state.db();
-    let model = match RoutingEntity::find_by_id(id).one(db).await {
-        Ok(Some(route)) => route,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "Route not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load route {} for toggle: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to toggle routing rule: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = crate::console::config_helpers::find_or_404!(RoutingEntity, id, db, "Route");
 
     let mut doc = RouteDocument::from_model(&model);
     doc.disabled = !doc.disabled;
@@ -1356,12 +1285,8 @@ pub(crate) async fn create_routing(
     AuthRequired(user): AuthRequired,
     Json(mut doc): Json<RouteDocument>,
 ) -> Response {
-    if !state.has_permission(&user, "routes", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "routes", "write").await {
+        return resp;
     }
     let db = state.db();
     doc.id = None;
@@ -1453,7 +1378,7 @@ pub(crate) async fn create_routing(
             .into_response();
     }
 
-    state.mark_pending_reload();
+    state.mark_pending_reload(ReloadTarget::Routes);
     Json(json!({"status": "ok", "id": model.id})).into_response()
 }
 
@@ -1463,43 +1388,18 @@ pub(crate) async fn update_routing(
     AuthRequired(user): AuthRequired,
     Json(mut doc): Json<RouteDocument>,
 ) -> Response {
-    if !state.has_permission(&user, "routes", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "routes", "write").await {
+        return resp;
     }
     let db = state.db();
 
-    let model = match RoutingEntity::find_by_id(id).one(db).await {
-        Ok(Some(route)) => route,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "Route not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load route {} for update: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
-            )
-                .into_response();
-        }
-    };
+    let model = find_or_404!(RoutingEntity, id, db, "Route");
 
     let trunks = match load_trunks(db).await {
         Ok(list) => list,
         Err(err) => {
             warn!("failed to load trunks for route update: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
-            )
-                .into_response();
+            return internal_error(format!("Failed to update routing rule: {}", err));
         }
     };
 
@@ -1526,11 +1426,7 @@ pub(crate) async fn update_routing(
                 "failed to start transaction for route update {}: {}",
                 id, err
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
-            )
-                .into_response();
+            return internal_error(format!("Failed to update routing rule: {}", err));
         }
     };
 
@@ -1565,24 +1461,16 @@ pub(crate) async fn update_routing(
     if let Err(err) = active.update(&tx).await {
         warn!("failed to update routing rule {}: {}", id, err);
         let _ = tx.rollback().await;
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
-        )
-            .into_response();
+        return internal_error(format!("Failed to update routing rule: {}", err));
     }
 
     if let Err(err) = tx.commit().await {
         warn!("failed to commit routing rule update {}: {}", id, err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
-        )
-            .into_response();
+        return internal_error(format!("Failed to update routing rule: {}", err));
     }
 
     // Issue #175: mark routes as pending reload.
-    state.mark_pending_reload();
+    state.mark_pending_reload(ReloadTarget::Routes);
     Json(json!({"status": "ok", "id": id})).into_response()
 }
 
@@ -1591,12 +1479,8 @@ pub async fn delete_routing(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    if !state.has_permission(&user, "routes", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "routes", "write").await {
+        return resp;
     }
     let db = state.db();
     match RoutingEntity::delete_by_id(id).exec(db).await {
@@ -1608,88 +1492,24 @@ pub async fn delete_routing(
                 )
                     .into_response()
             } else {
-                state.mark_pending_reload();
+                state.mark_pending_reload(ReloadTarget::Routes);
                 Json(json!({"status": "ok", "rows_affected": result.rows_affected})).into_response()
             }
         }
         Err(err) => {
             warn!("failed to delete routing rule {}: {}", id, err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to delete routing rule: {}", err)})),
-            )
-                .into_response()
+            internal_error(format!("Failed to delete routing rule: {}", err))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::console::handlers::test_helpers::{setup_state, superuser, unprivileged_user};
+
     use super::*;
-    use crate::{
-        config::ConsoleConfig, console::middleware::AuthRequired, models::migration::Migrator,
-    };
+    use crate::console::middleware::AuthRequired;
     use axum::{Json, extract::State, http::StatusCode};
-    use chrono::Utc;
-    use sea_orm::Database;
-    use sea_orm_migration::MigratorTrait;
-    use std::sync::Arc;
-
-    fn superuser() -> crate::models::user::Model {
-        let now = Utc::now();
-        crate::models::user::Model {
-            id: 1,
-            email: "admin@rustpbx.com".into(),
-            username: "admin".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: true,
-            is_superuser: true,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
-
-    fn unprivileged_user() -> crate::models::user::Model {
-        let now = Utc::now();
-        crate::models::user::Model {
-            id: 99,
-            email: "limited@rustpbx.com".into(),
-            username: "limited".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: false,
-            is_superuser: false,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
-
-    async fn setup_state() -> Arc<ConsoleState> {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(db,
-            ConsoleConfig::default(),
-        )
-        .await
-        .expect("initialize console state")
-    }
 
     #[tokio::test]
     async fn create_routing_denied_without_permission() {
@@ -1773,8 +1593,14 @@ mod tests {
                 select: RoutingSelectionStrategy::RoundRobin,
                 hash_key: None,
                 trunks: vec![
-                    RouteTrunkDocument { name: "trunk-b".into(), weight: 100 },
-                    RouteTrunkDocument { name: "trunk-c".into(), weight: 50 },
+                    RouteTrunkDocument {
+                        name: "trunk-b".into(),
+                        weight: 100,
+                    },
+                    RouteTrunkDocument {
+                        name: "trunk-c".into(),
+                        weight: 50,
+                    },
                 ],
                 target_type: RouteTargetKind::SipTrunk,
                 queue_file: None,
@@ -1788,17 +1614,30 @@ mod tests {
         let value = serde_json::to_value(&doc).unwrap();
         let obj = value.as_object().expect("value should be object");
 
-        let source_trunk_val = obj.get("source_trunk").expect("source_trunk key should exist");
+        let source_trunk_val = obj
+            .get("source_trunk")
+            .expect("source_trunk key should exist");
         assert_eq!(source_trunk_val, &Value::String("trunk-a".into()));
 
-        let action = obj.get("action").expect("action key should exist").as_object().expect("action should be object");
-        let trunks = action.get("trunks").expect("action.trunks key should exist").as_array().expect("trunks should be array");
+        let action = obj
+            .get("action")
+            .expect("action key should exist")
+            .as_object()
+            .expect("action should be object");
+        let trunks = action
+            .get("trunks")
+            .expect("action.trunks key should exist")
+            .as_array()
+            .expect("trunks should be array");
         assert_eq!(trunks.len(), 2);
         assert_eq!(trunks[0].get("name").unwrap().as_str().unwrap(), "trunk-b");
         assert_eq!(trunks[0].get("weight").unwrap().as_i64().unwrap(), 100);
         assert_eq!(trunks[1].get("name").unwrap().as_str().unwrap(), "trunk-c");
         assert_eq!(trunks[1].get("weight").unwrap().as_i64().unwrap(), 50);
-        assert_eq!(action.get("target_type").unwrap().as_str().unwrap(), "sip_trunk");
+        assert_eq!(
+            action.get("target_type").unwrap().as_str().unwrap(),
+            "sip_trunk"
+        );
     }
 
     #[test]
@@ -1816,9 +1655,10 @@ mod tests {
             action: RouteActionDocument {
                 select: RoutingSelectionStrategy::RoundRobin,
                 hash_key: None,
-                trunks: vec![
-                    RouteTrunkDocument { name: "trunk-b".into(), weight: 100 },
-                ],
+                trunks: vec![RouteTrunkDocument {
+                    name: "trunk-b".into(),
+                    weight: 100,
+                }],
                 target_type: RouteTargetKind::SipTrunk,
                 queue_file: None,
                 voicemail_extension: None,

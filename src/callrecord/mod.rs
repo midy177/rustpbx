@@ -325,8 +325,17 @@ pub trait CallRecordHook: Send + Sync {
     async fn on_record_completed(&self, record: &mut CallRecord) -> anyhow::Result<()>;
 }
 
-pub type CallRecordSender = tokio::sync::mpsc::UnboundedSender<CallRecord>;
-pub type CallRecordReceiver = tokio::sync::mpsc::UnboundedReceiver<CallRecord>;
+/// Channel type used to forward call records to the background saver.
+///
+/// This used to be an `mpsc::unbounded_channel`, which under saver stalls
+/// (e.g. S3 latency) accumulated `CallRecord` objects without limit and
+/// could exhaust process memory. It is now a bounded channel: when the
+/// saver falls behind, the producer drops new records (logged at warn)
+/// instead of buffering indefinitely. Real deployments should never hit
+/// the cap under normal load — the bound is a safety net, not a target.
+pub const CALL_RECORD_CHANNEL_CAPACITY: usize = 1024;
+pub type CallRecordSender = tokio::sync::mpsc::Sender<CallRecord>;
+pub type CallRecordReceiver = tokio::sync::mpsc::Receiver<CallRecord>;
 
 #[async_trait::async_trait]
 pub trait CallRecordSaver: Send + Sync {
@@ -500,7 +509,7 @@ impl CallRecordManagerBuilder {
             hooks,
         } = self;
         let cancel_token = cancel_token.unwrap_or_default();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(CALL_RECORD_CHANNEL_CAPACITY);
         let saver: Box<dyn CallRecordSaver> = match config.map(|config| config.storage) {
             None => Box::new(NoopCallRecordSaver),
             Some(CallRecordStorageConfig::Local { root }) => {
@@ -538,8 +547,7 @@ impl CallRecordManagerBuilder {
                 .map_err(|e| {
                     warn!(
                         bucket,
-                        endpoint,
-                        "CallRecordManager failed to initialize S3 storage: {}", e
+                        endpoint, "CallRecordManager failed to initialize S3 storage: {}", e
                     );
                     e
                 })?;
@@ -781,16 +789,14 @@ impl CallRecordManager {
         let mut futures = FuturesUnordered::new();
         let mut receiver_closed = false;
         let mut shutting_down = false;
-        let mut shutdown_timeout: Pin<Box<dyn Future<Output = ()> + Send>> =
-            Box::pin(pending());
+        let mut shutdown_timeout: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(pending());
 
         loop {
             if (receiver_closed || shutting_down) && futures.is_empty() {
                 break;
             }
 
-            let can_receive =
-                !receiver_closed && !shutting_down && futures.len() < max_concurrent;
+            let can_receive = !receiver_closed && !shutting_down && futures.len() < max_concurrent;
 
             tokio::select! {
                 record = receiver.recv(), if can_receive => {

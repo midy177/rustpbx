@@ -1,28 +1,52 @@
+use crate::app::AppStateInner;
 use crate::config::ConsoleConfig;
-use crate::console::i18n::{I18n, LocaleConfig, LocaleInfo, detect_locale};
+use crate::console::i18n::{I18n, LocaleConfig, detect_locale};
 use crate::console::middleware::RenderTemplate;
 use crate::models::rbac::{role_permission, user_role};
 use crate::proxy::server::SipServerRef;
-use crate::app::AppStateInner;
 use anyhow::Result;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use lru::LruCache;
 use minijinja::Environment;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 pub mod auth;
 pub mod catalog;
+pub mod config_helpers;
 pub mod handlers;
 pub mod i18n;
 pub mod middleware;
 pub use handlers::router;
 
-pub type PermCache = HashMap<i64, (Instant, HashSet<String>)>;
+/// Permission cache: `user_id -> (cached_at, permission set)`.
+///
+/// Implemented as an `LruCache` so inactive users are evicted automatically
+/// instead of accumulating for the lifetime of the process. The TTL check
+/// happens on read in [`ConsoleState::user_permissions`]; the LRU cap only
+/// bounds memory and does not change the effective TTL.
+pub type PermCache = LruCache<i64, (Instant, HashSet<String>)>;
+
+/// Maximum number of cached permission entries. Each entry is small (a few
+/// permissions strings), so 1024 covers realistic admin-console usage while
+/// keeping memory bounded if many distinct users log in briefly.
+pub const PERM_CACHE_CAP: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReloadTarget {
+    Routes,
+    Trunks,
+    SbcRoutes,
+    SbcTrunks,
+    Queues,
+    App,
+    Acl,
+}
 
 #[derive(Clone)]
 pub struct ConsoleState {
@@ -33,7 +57,7 @@ pub struct ConsoleState {
     app_state: Arc<RwLock<Option<Weak<AppStateInner>>>>,
     i18n: Arc<I18n>,
     perm_cache: Arc<Mutex<PermCache>>,
-    pub pending_reload: Arc<AtomicBool>,
+    pub pending_reload: Arc<RwLock<BTreeSet<ReloadTarget>>>,
     /// Addon-specific state storage using http::Extensions for type-safe access
     addon_extensions: Arc<std::sync::RwLock<http::Extensions>>,
 }
@@ -51,19 +75,7 @@ impl ConsoleState {
         config.base_path = normalize_base_path(&config.base_path);
         config.api_prefix = normalize_api_prefix(&config.api_prefix);
 
-        // Build LocaleConfig from ConsoleConfig
-        let locale_config = LocaleConfig {
-            default: config.locale_default.clone(),
-            available: config
-                .locales
-                .iter()
-                .map(|(code, info)| LocaleInfo {
-                    code: code.clone(),
-                    name: info.name.clone(),
-                    native_name: info.native_name.clone(),
-                })
-                .collect(),
-        };
+        let locale_config = LocaleConfig::from(&config);
         let i18n = Arc::new(I18n::new(locale_config));
 
         Ok(Arc::new(Self {
@@ -73,8 +85,10 @@ impl ConsoleState {
             sip_server: Arc::new(RwLock::new(None)),
             app_state: Arc::new(RwLock::new(None)),
             i18n,
-            perm_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_reload: Arc::new(AtomicBool::new(false)),
+            perm_cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(PERM_CACHE_CAP).expect("non-zero cap"),
+            ))),
+            pending_reload: Arc::new(RwLock::new(BTreeSet::new())),
             addon_extensions: Arc::new(std::sync::RwLock::new(http::Extensions::new())),
         }))
     }
@@ -169,6 +183,8 @@ impl ConsoleState {
                 serde_json::Value::String("© 2025 RustPBX. All rights reserved.".to_string())
             });
             let static_path = self.config().static_path();
+            map.entry("static_path")
+                .or_insert_with(|| serde_json::Value::String(static_path.clone()));
             map.entry("site_logo").or_insert_with(|| {
                 serde_json::Value::String(format!("{}/images/logo.png", static_path))
             });
@@ -202,10 +218,8 @@ impl ConsoleState {
                 .or_insert_with(|| serde_json::Value::String(locale.to_string()));
             map.entry("t")
                 .or_insert_with(|| self.i18n.get_translations_json(locale));
-            map.entry("available_locales").or_insert_with(|| {
-                serde_json::to_value(self.i18n.available_locales())
-                    .unwrap_or(serde_json::Value::Array(vec![]))
-            });
+            map.entry("available_locales")
+                .or_insert_with(|| self.i18n.available_locales_json());
         }
 
         let mut tmpl_env = Environment::new();
@@ -332,7 +346,7 @@ impl ConsoleState {
         }
 
         const TTL_SECS: u64 = 300;
-        if let Ok(cache) = self.perm_cache.lock()
+        if let Ok(mut cache) = self.perm_cache.lock()
             && let Some((ts, perms)) = cache.get(&user.id)
             && ts.elapsed().as_secs() < TTL_SECS
         {
@@ -342,7 +356,7 @@ impl ConsoleState {
         let perms = self.load_permissions_from_db(user.id).await;
 
         if let Ok(mut cache) = self.perm_cache.lock() {
-            cache.insert(user.id, (Instant::now(), perms.clone()));
+            cache.put(user.id, (Instant::now(), perms.clone()));
         }
 
         perms
@@ -388,6 +402,19 @@ impl ConsoleState {
         perms.contains(&format!("{}:{}", resource, action))
     }
 
+    pub async fn require_permission(
+        &self,
+        user: &crate::models::user::Model,
+        resource: &str,
+        action: &str,
+    ) -> Result<(), Response> {
+        if self.has_permission(user, resource, action).await {
+            Ok(())
+        } else {
+            Err(crate::console::config_helpers::permission_denied())
+        }
+    }
+
     pub async fn build_current_user_ctx(
         &self,
         user: &crate::models::user::Model,
@@ -423,12 +450,20 @@ impl ConsoleState {
         &self.db
     }
 
-    pub fn mark_pending_reload(&self) {
-        self.pending_reload.store(true, Ordering::Relaxed);
+    pub fn mark_pending_reload(&self, target: ReloadTarget) {
+        self.pending_reload.write().unwrap().insert(target);
     }
 
-    pub fn clear_pending_reload(&self) {
-        self.pending_reload.store(false, Ordering::Relaxed);
+    pub fn clear_pending_reload(&self, target: ReloadTarget) {
+        self.pending_reload.write().unwrap().remove(&target);
+    }
+
+    pub fn clear_all_pending_reload(&self) {
+        self.pending_reload.write().unwrap().clear();
+    }
+
+    pub fn pending_reload_targets(&self) -> BTreeSet<ReloadTarget> {
+        self.pending_reload.read().unwrap().clone()
     }
 
     pub fn set_sip_server(&self, server: Option<SipServerRef>) {
@@ -623,6 +658,8 @@ fn normalize_api_prefix(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::console::handlers::test_helpers::setup_state;
+
     use super::*;
     use crate::config::ConsoleConfig;
     use crate::models::migration::Migrator;
@@ -651,18 +688,6 @@ mod tests {
             mfa_secret: None,
             auth_source: "local".into(),
         }
-    }
-
-    async fn setup_state() -> Arc<ConsoleState> {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(db,
-            ConsoleConfig::default(),
-        )
-        .await
-        .expect("initialize console state")
     }
 
     #[tokio::test]
@@ -729,19 +754,66 @@ mod tests {
         let user = make_user(300, false);
         state.user_permissions(&user).await;
         let cache = state.perm_cache.lock().expect("lock cache");
-        assert!(cache.contains_key(&300));
+        assert!(cache.contains(&300));
+    }
+
+    /// Regression: `PermCache` used to be an unbounded `HashMap` that kept
+    /// inactive users forever. The LRU cap must evict least-recently-used
+    /// entries so memory stays bounded regardless of how many distinct users
+    /// briefly query their permissions.
+    #[tokio::test]
+    async fn permission_cache_evicts_lru_entries_beyond_cap() {
+        let state = setup_state().await;
+        // PERM_CACHE_CAP+1 distinct users must fit into a PERM_CACHE_CAP cache.
+        for id in 0..(PERM_CACHE_CAP as i64 + 1) {
+            let user = make_user(id, false);
+            state.user_permissions(&user).await;
+        }
+        let cache = state.perm_cache.lock().expect("lock cache");
+        assert_eq!(cache.len(), PERM_CACHE_CAP, "cache should be at capacity");
+        // The very first user we inserted (id=0) must have been evicted.
+        assert!(
+            !cache.contains(&0),
+            "least-recently-used user should have been evicted"
+        );
+        // The most recent user must still be present.
+        assert!(cache.contains(&(PERM_CACHE_CAP as i64)));
     }
 
     #[tokio::test]
     async fn pending_reload_mark_and_clear() {
         let state = setup_state().await;
-        use std::sync::atomic::Ordering;
 
-        assert!(!state.pending_reload.load(Ordering::Relaxed));
-        state.mark_pending_reload();
-        assert!(state.pending_reload.load(Ordering::Relaxed));
-        state.clear_pending_reload();
-        assert!(!state.pending_reload.load(Ordering::Relaxed));
+        assert!(state.pending_reload_targets().is_empty());
+        state.mark_pending_reload(ReloadTarget::Routes);
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Routes)
+        );
+        state.clear_pending_reload(ReloadTarget::Routes);
+        assert!(state.pending_reload_targets().is_empty());
+
+        // Multiple targets can be pending independently
+        state.mark_pending_reload(ReloadTarget::Trunks);
+        state.mark_pending_reload(ReloadTarget::Queues);
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Trunks)
+        );
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Queues)
+        );
+        assert!(
+            !state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Routes)
+        );
+        state.clear_all_pending_reload();
+        assert!(state.pending_reload_targets().is_empty());
     }
 
     #[tokio::test]
@@ -756,11 +828,9 @@ mod tests {
         config.base_path = "/admin".to_string();
         config.api_prefix = "/v1/api".to_string();
 
-        let state = ConsoleState::initialize(db,
-            config,
-        )
-        .await
-        .expect("initialize console state");
+        let state = ConsoleState::initialize(db, config)
+            .await
+            .expect("initialize console state");
 
         // Test base_path
         assert_eq!(state.base_path(), "/admin");

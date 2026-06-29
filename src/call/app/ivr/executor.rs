@@ -7,6 +7,7 @@ use crate::call::app::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use tracing::warn;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,17 @@ pub struct StepIvrApp {
     pending_menu: Option<PendingMenu>,
     current_track_id: Option<String>,
     interrupt_on_dtmf: bool,
+    /// Whether the IVR is currently expecting DTMF input.
+    ///
+    /// Set to `true` once a `DtmfMenu` greeting finishes playing (or when the
+    /// menu has no greeting audio), indicating that the caller may press a key.
+    /// Cleared when a DTMF digit is processed, the menu times out, or a new
+    /// non-DtmfMenu step begins.
+    ///
+    /// DTMF events that arrive while this is `false` (e.g. a key pressed during
+    /// a plain `Prompt` playback) are silently ignored instead of being
+    /// forwarded to the provider, which could derail the flow.
+    awaiting_dtmf: bool,
     tts_service: Option<Arc<crate::tts::TtsService>>,
     trace: Option<Arc<IvrTraceCollector>>,
     step_index: u32,
@@ -40,6 +52,13 @@ pub struct StepIvrApp {
     last_transfer_target: Option<String>,
     /// Current step start time (ISO UTC) — set when a step begins, used for step_start_time.
     current_step_start_time: Option<String>,
+    /// Monotonic instant when the current step really started (edge-cli response received).
+    /// Used to compute the complete step duration including async waits (playback, user input).
+    step_start_instant: Option<std::time::Instant>,
+    /// Monotonic instant when the pending WaitFor step started (for duration calculation).
+    pending_start_instant: Option<std::time::Instant>,
+    /// Pending trace entry for a WaitFor step — finalized and recorded when the next event arrives.
+    pending_trace: Option<IvrTraceEntry>,
     /// Current step provider response metadata.
     current_step_id: Option<String>,
     current_step_name: Option<String>,
@@ -68,6 +87,7 @@ impl StepIvrApp {
             pending_menu: None,
             current_track_id: None,
             interrupt_on_dtmf: false,
+            awaiting_dtmf: false,
             tts_service: None,
             trace: None,
             step_index: 0,
@@ -82,6 +102,9 @@ impl StepIvrApp {
             transferred_from: None,
             last_transfer_target: None,
             current_step_start_time: None,
+            step_start_instant: None,
+            pending_start_instant: None,
+            pending_trace: None,
             current_step_id: None,
             current_step_name: None,
             current_trigger_event_type: None,
@@ -97,6 +120,7 @@ impl StepIvrApp {
             pending_menu: None,
             current_track_id: None,
             interrupt_on_dtmf: false,
+            awaiting_dtmf: false,
             tts_service: None,
             trace: None,
             step_index: 0,
@@ -111,6 +135,9 @@ impl StepIvrApp {
             transferred_from: None,
             last_transfer_target: None,
             current_step_start_time: None,
+            step_start_instant: None,
+            pending_start_instant: None,
+            pending_trace: None,
             current_step_id: None,
             current_step_name: None,
             current_trigger_event_type: None,
@@ -135,10 +162,7 @@ impl StepIvrApp {
     }
 
     /// Attach the RWI gateway for real-time event emission.
-    pub fn with_rwi_gateway(
-        mut self,
-        gw: Option<crate::rwi::RwiGatewayRef>,
-    ) -> Self {
+    pub fn with_rwi_gateway(mut self, gw: Option<crate::rwi::RwiGatewayRef>) -> Self {
         self.rwi_gateway = gw;
         self
     }
@@ -165,6 +189,10 @@ impl StepIvrApp {
     pub fn with_transferred_from(mut self, from: Option<String>) -> Self {
         self.transferred_from = from;
         self
+    }
+
+    fn pending_take(&mut self) -> Option<IvrTraceEntry> {
+        self.pending_trace.take()
     }
 
     fn record_trace(&self, entry: IvrTraceEntry) {
@@ -265,6 +293,13 @@ impl StepIvrApp {
         ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         let node = self.current_node.as_ref().unwrap().clone();
+
+        // Reset the awaiting_dtmf flag unless this node is a DtmfMenu (which
+        // will re-arm it via execute_node once the greeting finishes).
+        if !node.action.is_dtmf_menu() {
+            self.awaiting_dtmf = false;
+        }
+
         let node_type_str = match &node.action {
             EntryAction::Transfer { .. } => "Transfer",
             EntryAction::Queue { .. } => "Queue",
@@ -296,8 +331,14 @@ impl StepIvrApp {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let step_end = chrono::Utc::now().to_rfc3339();
 
-        let step_id = node.step_id.clone().or_else(|| self.current_step_id.clone());
-        let step_name = node.step_name.clone().or_else(|| self.current_step_name.clone());
+        let step_id = node
+            .step_id
+            .clone()
+            .or_else(|| self.current_step_id.clone());
+        let step_name = node
+            .step_name
+            .clone()
+            .or_else(|| self.current_step_name.clone());
 
         let trigger_event_type = self
             .current_trigger_event_type
@@ -329,6 +370,21 @@ impl StepIvrApp {
 
         match result {
             Ok(action_result) => {
+                // Finalize any pending trace (from a previous WaitFor step) before
+                // recording the current step's trace.
+                if let Some(pending) = self.pending_take() {
+                    let end = std::time::Instant::now();
+                    let duration = self
+                        .pending_start_instant
+                        .map(|s| end.duration_since(s).as_millis() as u64)
+                        .unwrap_or(0);
+                    let step_end = chrono::Utc::now().to_rfc3339();
+                    self.record_trace(IvrTraceEntry {
+                        step_end_time: Some(step_end),
+                        duration_ms: duration,
+                        ..pending
+                    });
+                }
                 let (app_action, _result_kind) = match action_result {
                     ActionResult::Terminal(terminal) => {
                         self.step_index += 1;
@@ -353,10 +409,10 @@ impl StepIvrApp {
                             extra: self.extra.clone(),
                         });
                         match terminal {
-                    TerminalAction::Transfer(target) => {
-                            self.last_transfer_target = Some(target.clone());
-                            (AppAction::Transfer(target), "terminal")
-                        }
+                            TerminalAction::Transfer(target) => {
+                                self.last_transfer_target = Some(target.clone());
+                                (AppAction::Transfer(target), "terminal")
+                            }
                             TerminalAction::Hangup { reason, code } => {
                                 (AppAction::Hangup { reason, code }, "terminal")
                             }
@@ -370,7 +426,10 @@ impl StepIvrApp {
                         return Box::pin(self.__exec_node(ctrl, ctx)).await;
                     }
                     ActionResult::WaitFor(_) => {
-                        self.record_trace(IvrTraceEntry {
+                        // Step isn't done yet (e.g. waiting for audio to complete / DTMF).
+                        // Save as pending — will be finalized in request_next when next event arrives.
+                        self.pending_start_instant = self.step_start_instant;
+                        self.pending_trace = Some(IvrTraceEntry {
                             session_id: session_id.clone(),
                             caller: caller.clone(),
                             callee: callee.clone(),
@@ -386,7 +445,7 @@ impl StepIvrApp {
                             step_name: step_name.clone(),
                             step_start_time: self.current_step_start_time.clone(),
                             step_end_time: None,
-                            duration_ms: elapsed_ms,
+                            duration_ms: 0,
                             extra: self.extra.clone(),
                         });
                         (AppAction::Continue, "continue")
@@ -463,12 +522,35 @@ impl StepIvrApp {
             route_name: self.route_name.clone(),
             route_headers: self.route_headers.clone(),
             custom_data: self.custom_data.clone(),
-            step_start_time: Some(self.step_prev_start_time.clone().unwrap_or_else(|| now_rfc3339.clone())),
+            step_start_time: Some(
+                self.step_prev_start_time
+                    .clone()
+                    .unwrap_or_else(|| now_rfc3339.clone()),
+            ),
             step_end_time: Some(now_rfc3339.clone()),
-            step_duration_ms: if prev_step_duration_ms > 0 { Some(prev_step_duration_ms) } else { None },
+            step_duration_ms: if prev_step_duration_ms > 0 {
+                Some(prev_step_duration_ms)
+            } else {
+                None
+            },
             step_index: Some(self.step_index),
             transferred_from: self.transferred_from.clone(),
         };
+
+        // Finalize and record pending trace (WaitFor step just completed).
+        if let Some(pending) = self.pending_take() {
+            let end = std::time::Instant::now();
+            let duration = self
+                .pending_start_instant
+                .map(|s| end.duration_since(s).as_millis() as u64)
+                .unwrap_or(0);
+            let step_end = chrono::Utc::now().to_rfc3339();
+            self.record_trace(IvrTraceEntry {
+                step_end_time: Some(step_end),
+                duration_ms: duration,
+                ..pending
+            });
+        }
 
         let start = std::time::Instant::now();
         let result = self.provider.next_action(ctx.clone()).await;
@@ -494,26 +576,28 @@ impl StepIvrApp {
 
         // Mark when this step started executing.
         self.current_step_start_time = Some(chrono::Utc::now().to_rfc3339());
+        self.step_start_instant = Some(std::time::Instant::now());
 
         // Store trigger event info for __exec_node to use when recording trace after node execution
-        self.current_trigger_event_type = Some(ctx
-            .event
-            .as_ref()
-            .map(|e| match e {
-                ProviderEvent::SessionStart => "session_start",
-                ProviderEvent::AudioComplete { .. } => "audio_complete",
-                ProviderEvent::Dtmf { .. } => "dtmf",
-                ProviderEvent::DtmfTimeout => "dtmf_timeout",
-                ProviderEvent::ApiResponse { .. } => "api_response",
-                ProviderEvent::PhoneCollected { .. } => "phone_collected",
-                ProviderEvent::RecordingComplete { .. } => "recording_complete",
-                ProviderEvent::InputVoice { .. } => "input_voice",
-                ProviderEvent::Error { .. } => "error",
-                ProviderEvent::DtmfMenuInvalid { .. } => "dtmf_menu_invalid",
-                ProviderEvent::DtmfMenuTimeout => "dtmf_menu_timeout",
-            })
-            .unwrap_or("unknown")
-            .to_string());
+        self.current_trigger_event_type = Some(
+            ctx.event
+                .as_ref()
+                .map(|e| match e {
+                    ProviderEvent::SessionStart => "session_start",
+                    ProviderEvent::AudioComplete { .. } => "audio_complete",
+                    ProviderEvent::Dtmf { .. } => "dtmf",
+                    ProviderEvent::DtmfTimeout => "dtmf_timeout",
+                    ProviderEvent::ApiResponse { .. } => "api_response",
+                    ProviderEvent::PhoneCollected { .. } => "phone_collected",
+                    ProviderEvent::RecordingComplete { .. } => "recording_complete",
+                    ProviderEvent::InputVoice { .. } => "input_voice",
+                    ProviderEvent::Error { .. } => "error",
+                    ProviderEvent::DtmfMenuInvalid { .. } => "dtmf_menu_invalid",
+                    ProviderEvent::DtmfMenuTimeout => "dtmf_menu_timeout",
+                })
+                .unwrap_or("unknown")
+                .to_string(),
+        );
         self.current_trigger_event_detail = match &ctx.event {
             Some(ProviderEvent::Dtmf { digit }) => Some(format!("digit={}", digit)),
             Some(ProviderEvent::ApiResponse { status, .. }) => Some(format!("status={}", status)),
@@ -562,11 +646,14 @@ impl StepIvrApp {
         if let ActionResult::WaitFor(WaitEvent::AudioComplete { .. }) = &result {
             if node.action.is_dtmf_menu() {
                 self.pending_menu = Some(self.build_pending_menu(&node.action));
+            } else if node.action.is_interruptible() {
+                self.interrupt_on_dtmf = true;
             }
         }
         if matches!(&result, ActionResult::WaitFor(WaitEvent::NoAudio)) {
             if node.action.is_dtmf_menu() {
                 self.pending_menu = Some(self.build_pending_menu(&node.action));
+                self.awaiting_dtmf = true;
                 if let Some(ref menu) = self.pending_menu {
                     ctrl.set_timeout(
                         "ivr_dtmf_timeout",
@@ -602,7 +689,16 @@ impl StepIvrApp {
                 max_retries: *max_retries,
                 retry_count: 0,
             },
-            _ => unreachable!(),
+            _ => {
+                warn!("build_pending_menu called with unexpected action type, returning empty menu");
+                PendingMenu {
+                    entries: HashMap::new(),
+                    timeout_action: None,
+                    invalid_action: None,
+                    max_retries: 0,
+                    retry_count: 0,
+                }
+            }
         }
     }
 
@@ -747,6 +843,20 @@ impl CallApp for StepIvrApp {
         ctrl: &mut CallController,
         context: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
+        // Ignore DTMF that arrives before the IVR is ready to accept input
+        // (e.g. a key pressed during a plain Prompt/Play step).  Forwarding
+        // such early digits to the provider would derail the flow.
+        if self.pending_menu.is_none() && !self.awaiting_dtmf && !self.interrupt_on_dtmf {
+            tracing::info!(
+                digit = %digit,
+                "StepIvrApp: ignoring early DTMF (not awaiting input)"
+            );
+            return Ok(AppAction::Continue);
+        }
+
+        // From here on we are consuming the DTMF, so clear the flag.
+        self.awaiting_dtmf = false;
+
         if self.pending_menu.is_some() {
             ctrl.stop_audio().await.ok();
             self.current_track_id = None;
@@ -786,6 +896,7 @@ impl CallApp for StepIvrApp {
 
         if was_menu && track_id == "ivr_menu_greeting" {
             if let Some(ref menu) = self.pending_menu {
+                self.awaiting_dtmf = true;
                 ctrl.set_timeout(
                     "ivr_dtmf_timeout",
                     Duration::from_millis(menu.max_retries as u64 * 5000),
@@ -845,6 +956,8 @@ impl CallApp for StepIvrApp {
             return Ok(AppAction::Continue);
         }
 
+        self.awaiting_dtmf = false;
+
         if self.pending_menu.is_some() {
             if let Some(next) = self.handle_menu_timeout() {
                 self.current_trigger_event_type = Some("dtmf_menu_timeout".to_string());
@@ -859,6 +972,25 @@ impl CallApp for StepIvrApp {
     }
 
     async fn on_exit(&mut self, reason: crate::call::app::ExitReason) -> anyhow::Result<()> {
+        // Finalize any pending trace (from a WaitFor step) before recording
+        // the session end, so the last step's trace is not lost when the call
+        // ends while waiting for DTMF, audio playback, or other async input.
+        if let Some(pending) = self.pending_take() {
+            let end = std::time::Instant::now();
+            let duration = self
+                .pending_start_instant
+                .map(|s| end.duration_since(s).as_millis() as u64)
+                .unwrap_or(0);
+            self.pending_start_instant = None;
+            let step_end = chrono::Utc::now().to_rfc3339();
+            self.record_trace(IvrTraceEntry {
+                result_kind: "interrupted".to_string(),
+                step_end_time: Some(step_end),
+                duration_ms: duration,
+                ..pending
+            });
+        }
+
         let end_reason = match reason {
             crate::call::app::ExitReason::Normal => EndReason::Normal,
             crate::call::app::ExitReason::Hangup => EndReason::Hangup,
@@ -875,6 +1007,7 @@ impl CallApp for StepIvrApp {
                 }
             }
             crate::call::app::ExitReason::Error(e) => EndReason::Error(e),
+            crate::call::app::ExitReason::Cancelled => EndReason::Hangup,
             _ => EndReason::Normal,
         };
         let session_id = self
@@ -883,17 +1016,16 @@ impl CallApp for StepIvrApp {
             .get("session_id")
             .cloned()
             .unwrap_or_default();
-        self.provider.on_session_end(&end_reason, &session_id).await.ok();
-        let status = match &end_reason {
-            EndReason::Normal => "completed",
-            EndReason::Transfer(_) => "completed",
-            EndReason::TransferToQueue(_) => "completed",
-            EndReason::TransferToIvr(_) => "completed",
-            EndReason::Hangup => "completed",
-            EndReason::UserHangup => "completed",
-            EndReason::Error(_) => "error",
-        };
-        self.record_session_end(status).await;
+        self.provider
+            .on_session_end(&end_reason, &session_id)
+            .await
+            .ok();
+        let end_tag = end_reason.to_session_end_reason();
+        let status = serde_json::to_string(&end_tag.reason)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        self.record_session_end(&status).await;
         // Clean up local state
         if self.current_track_id.is_some() {
             // Audio track will be cleaned up by media layer
@@ -949,7 +1081,11 @@ mod tests {
             Ok(())
         }
 
-        async fn on_session_end(&self, _reason: &EndReason, _session_id: &str) -> anyhow::Result<()> {
+        async fn on_session_end(
+            &self,
+            _reason: &EndReason,
+            _session_id: &str,
+        ) -> anyhow::Result<()> {
             *self.end_called.lock().unwrap() = true;
             Ok(())
         }
@@ -1223,7 +1359,7 @@ mod tests {
         assert_eq!(sess.caller, "1001");
         assert_eq!(sess.callee, "2000");
         assert_eq!(sess.ivr_name.as_deref(), Some("test-ivr"));
-        assert_eq!(sess.status, "completed");
+        assert_eq!(sess.status, "transfer");
 
         // Verify trace entries exist
         let entries = trace.query_by_session(&sess.session_id).await;
@@ -1499,6 +1635,240 @@ mod tests {
             .await;
     }
 
+    // ── Early DTMF (awaiting_dtmf flag) tests ───────────────────────────────
+
+    /// DTMF pressed during a non-interruptible Prompt should be silently
+    /// ignored — the provider must NOT be called with the digit, and the flow
+    /// must continue normally after audio completes.
+    #[tokio::test]
+    async fn test_early_dtmf_during_prompt_is_ignored() {
+        let prompt = ActionNode::new(EntryAction::Prompt {
+            file: Some("hello.wav".into()),
+            tts_text: None,
+            tts_voice: None,
+            record_name_list: None,
+            interruptible: false,
+            tts_api_url: None,
+        });
+        let transfer = ActionNode::new(EntryAction::Transfer {
+            target: "2001".into(),
+        });
+
+        let mut stack =
+            MockCallStack::run(Box::new(mock_app(vec![prompt, transfer])), "1001", "2000");
+        stack
+            .assert_cmd(200, "accept", |c| matches!(c, CallCommand::Answer { .. }))
+            .await;
+        stack
+            .assert_cmd(200, "play", |c| {
+                matches!(
+                    c,
+                    CallCommand::Play {
+                        source: crate::call::domain::MediaSource::File { path },
+                        ..
+                    } if path == "hello.wav"
+                )
+            })
+            .await;
+
+        // User presses a key WHILE the prompt is still playing.
+        // This must be ignored — no extra commands should be generated.
+        let _ = stack.drain_cmds();
+        stack.dtmf("5");
+        // Give the event loop a moment to process the DTMF event.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // No stop/transfer/provider command should have been emitted.
+        let cmds = stack.drain_cmds();
+        assert!(
+            cmds.is_empty(),
+            "early DTMF should be ignored, but got commands: {cmds:?}"
+        );
+
+        // Now audio completes normally — flow should proceed to Transfer.
+        stack.audio_complete("ivr_prompt");
+        stack
+            .assert_cmd(
+                200,
+                "transfer",
+                |c| matches!(c, CallCommand::Transfer { target, .. } if target == "2001"),
+            )
+            .await;
+    }
+
+    /// Same as above but the Prompt has `next` chained — verifying that the
+    /// chained node fires correctly after audio complete even if a stray DTMF
+    /// was received during playback.
+    #[tokio::test]
+    async fn test_early_dtmf_with_chained_next() {
+        let node = ActionNode::with_next(
+            EntryAction::Prompt {
+                file: Some("intro.wav".into()),
+                tts_text: None,
+                tts_voice: None,
+                record_name_list: None,
+                interruptible: false,
+                tts_api_url: None,
+            },
+            ActionNode::new(EntryAction::Transfer {
+                target: "3003".into(),
+            }),
+        );
+
+        let mut stack = MockCallStack::run(Box::new(mock_app(vec![node])), "1001", "2000");
+        stack
+            .assert_cmd(200, "accept", |c| matches!(c, CallCommand::Answer { .. }))
+            .await;
+        stack
+            .assert_cmd(200, "play", |c| {
+                matches!(
+                    c,
+                    CallCommand::Play {
+                        source: crate::call::domain::MediaSource::File { path },
+                        ..
+                    } if path == "intro.wav"
+                )
+            })
+            .await;
+
+        // Stray DTMF during playback — should be ignored.
+        let _ = stack.drain_cmds();
+        stack.dtmf("9");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(stack.drain_cmds().is_empty());
+
+        // Audio completes → chained Transfer fires.
+        stack.audio_complete("ivr_prompt");
+        stack
+            .assert_cmd(
+                200,
+                "transfer",
+                |c| matches!(c, CallCommand::Transfer { target, .. } if target == "3003"),
+            )
+            .await;
+    }
+
+    /// Verify that DTMF still works correctly when the IVR IS expecting input
+    /// (i.e. after a DtmfMenu greeting finishes).  This is a regression guard
+    /// ensuring the `awaiting_dtmf` flag doesn't block legitimate input.
+    #[tokio::test]
+    async fn test_dtmf_accepted_after_menu_greeting() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "1".into(),
+            ActionNode::new(EntryAction::Transfer {
+                target: "2001".into(),
+            }),
+        );
+
+        let menu = ActionNode::new(EntryAction::DtmfMenu {
+            greeting: Some("menu.wav".into()),
+            greeting_text: None,
+            greeting_record_list: None,
+            greeting_voice: None,
+            timeout_ms: 5000,
+            max_retries: 3,
+            entries,
+            timeout_action: Some(Box::new(ActionNode::new(EntryAction::Repeat))),
+            invalid_action: Some(Box::new(ActionNode::new(EntryAction::Repeat))),
+            greeting_api_url: None,
+        });
+
+        let mut stack = MockCallStack::run(Box::new(mock_app(vec![menu])), "1001", "2000");
+        stack
+            .assert_cmd(200, "accept", |c| matches!(c, CallCommand::Answer { .. }))
+            .await;
+        stack
+            .assert_cmd(200, "play", |c| {
+                matches!(
+                    c,
+                    CallCommand::Play {
+                        source: crate::call::domain::MediaSource::File { path },
+                        ..
+                    } if path == "menu.wav"
+                )
+            })
+            .await;
+
+        // Greeting finishes → awaiting_dtmf becomes true.
+        stack.audio_complete("ivr_menu_greeting");
+
+        // Now DTMF should be accepted (pending_menu is set, so it goes through
+        // the local menu lookup path).
+        let _ = stack.drain_cmds();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stack.dtmf("1");
+
+        stack
+            .assert_cmd(200, "stop", |c| {
+                matches!(c, CallCommand::StopPlayback { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(
+                200,
+                "transfer",
+                |c| matches!(c, CallCommand::Transfer { target, .. } if target == "2001"),
+            )
+            .await;
+    }
+
+    /// Regression: DTMF during an *interruptible* Prompt must be forwarded to
+    /// the provider.  The `awaiting_dtmf` / `interrupt_on_dtmf` flags should
+    /// NOT block legitimate input when the node explicitly allows interruption.
+    #[tokio::test]
+    async fn test_interruptible_prompt_forwards_dtmf_to_provider() {
+        let prompt = ActionNode::new(EntryAction::Prompt {
+            file: Some("hello.wav".into()),
+            tts_text: None,
+            tts_voice: None,
+            record_name_list: None,
+            interruptible: true,
+            tts_api_url: None,
+        });
+        let transfer = ActionNode::new(EntryAction::Transfer {
+            target: "2001".into(),
+        });
+
+        let mut stack =
+            MockCallStack::run(Box::new(mock_app(vec![prompt, transfer])), "1001", "2000");
+        stack
+            .assert_cmd(200, "accept", |c| matches!(c, CallCommand::Answer { .. }))
+            .await;
+        stack
+            .assert_cmd(200, "play", |c| {
+                matches!(
+                    c,
+                    CallCommand::Play {
+                        source: crate::call::domain::MediaSource::File { path },
+                        ..
+                    } if path == "hello.wav"
+                )
+            })
+            .await;
+
+        // While the interruptible prompt is still playing, inject a DTMF digit.
+        // It MUST be forwarded to the provider (not silently ignored).
+        let _ = stack.drain_cmds();
+        stack.dtmf("5");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The app should stop the audio first, then ask the provider for
+        // the next action (MockProvider returns Transfer("2001")).
+        stack
+            .assert_cmd(200, "stop", |c| {
+                matches!(c, CallCommand::StopPlayback { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(
+                200,
+                "transfer",
+                |c| matches!(c, CallCommand::Transfer { target, .. } if target == "2001"),
+            )
+            .await;
+    }
+
     // ── True E2E: HTTP → Python provider ─────────────────────────────────
     //
     // Validates the FULL IVR protocol chain:
@@ -1569,10 +1939,7 @@ mod tests {
             custom_data: None,
             transferred_from: None,
         };
-        step_provider
-            .on_session_start(&session)
-            .await
-            .unwrap();
+        step_provider.on_session_start(&session).await.unwrap();
 
         let ctx = ProviderContext {
             session_id: session.session_id.clone(),
@@ -1623,9 +1990,11 @@ mod tests {
                 transferred_from: None,
             }
         };
-        let transfer = step_provider.next_action(ctx).await.unwrap();
+        let action = step_provider.next_action(ctx).await.unwrap();
+        // Latest step_ivr_provider.py maps DTMF "2" to a queue action targeting
+        // "sales" (see examples/step_ivr_provider.py::IvrSession.next_action).
         assert!(
-            matches!(transfer.action, EntryAction::Transfer { ref target } if target == "agent")
+            matches!(action.action, EntryAction::Queue { ref target, .. } if target == "sales")
         );
 
         step_provider

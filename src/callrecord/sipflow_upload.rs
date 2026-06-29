@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use sea_orm::DatabaseConnection;
 use tracing::{info, warn};
 
@@ -188,16 +188,50 @@ async fn do_upload(
     }
 
     // Emit RecordEnd after successful sipflow upload.
-    if let Some(url) = first_uploaded_url {
+    if let Some(url) = first_uploaded_url.as_ref() {
         if let Some(gw) = rwi_gateway {
             let gw_ref = gw.read();
             gw_ref.send_to_owner(&crate::rwi::RecordEnd {
                 call_id: call_id.to_string(),
-                url: Some(url),
+                url: Some(url.clone()),
                 duration_secs: duration_secs as u64,
                 file_size: uploaded_file_size,
             });
             info!(call_id, "SipFlowUploadHook: RecordEnd event emitted");
+        }
+    }
+
+    // Emit RecordingMetadataAvailable after successful sipflow upload.
+    if let Some(url) = first_uploaded_url.as_ref() {
+        if let Some(gw) = rwi_gateway {
+            use crate::rwi::proto::RecordingMetadata;
+            let metadata = RecordingMetadata {
+                filename: media_key.to_string(),
+                unique_id: call_id.to_string(),
+                file_size: uploaded_file_size,
+                download_url: Some(url.clone()),
+                caller_name: None,
+                callee_name: None,
+                called_phone: None,
+                call_type: "".to_string(),
+                agent_id: None,
+                agent_name: None,
+                call_start_time: Some(start.to_rfc3339()),
+                call_end_time: Some(end.to_rfc3339()),
+                upload_time: Some(Utc::now().to_rfc3339()),
+                switch_flag: None,
+                process_flag: None,
+                root_call_id: None,
+            };
+            let gw_ref = gw.read();
+            gw_ref.send_to_owner(&crate::rwi::RecordingMetadataAvailable {
+                call_id: call_id.to_string(),
+                metadata,
+            });
+            info!(
+                call_id,
+                "SipFlowUploadHook: RecordingMetadataAvailable event emitted"
+            );
         }
     }
 }
@@ -329,10 +363,7 @@ async fn upload_signaling_flow(
     let data = jsonl.into_bytes();
 
     let result = match upload_config {
-        SipFlowUploadConfig::S3 {
-            root,
-            ..
-        } => {
+        SipFlowUploadConfig::S3 { root, .. } => {
             let full_key = if root.is_empty() {
                 signaling_key.to_string()
             } else {
@@ -370,11 +401,7 @@ pub(crate) fn sipflow_s3_url(endpoint: &str, bucket: &str, key: &str) -> String 
     )
 }
 
-async fn upload_s3(
-    storage: &Storage,
-    key: &str,
-    data: Vec<u8>,
-) -> Result<()> {
+async fn upload_s3(storage: &Storage, key: &str, data: Vec<u8>) -> Result<()> {
     storage.write(key, Bytes::from(data)).await?;
     Ok(())
 }

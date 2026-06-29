@@ -90,15 +90,14 @@ async fn wait_for_event(
             if json.get(event_type).is_some() {
                 return json;
             }
+            if json["event_type"].as_str() == Some(event_type) {
+                return serde_json::json!({ event_type: json });
+            }
         }
     }
 }
 
-async fn originate_call(
-    ws: &mut WsStream,
-    call_id: &str,
-    dest: &str,
-) {
+async fn originate_call(ws: &mut WsStream, call_id: &str, dest: &str) {
     let resp = ws_send_recv(
         ws,
         "call.originate",
@@ -182,7 +181,10 @@ async fn test_host_end_all() {
         }),
     )
     .await;
-    assert_eq!(resp["status"], "success", "conference.create failed: {resp}");
+    assert_eq!(
+        resp["status"], "success",
+        "conference.create failed: {resp}"
+    );
 
     // Add all participants
     for call_id in [&call_alice, &call_bob, &call_charlie] {
@@ -196,8 +198,7 @@ async fn test_host_end_all() {
         )
         .await;
         assert_eq!(
-            resp["status"],
-            "success",
+            resp["status"], "success",
             "conference.add {} failed: {resp}",
             call_id
         );
@@ -216,8 +217,7 @@ async fn test_host_end_all() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "success",
+        resp["status"], "success",
         "conference.end by host failed: {resp}"
     );
 
@@ -244,7 +244,10 @@ async fn test_host_end_all() {
         }),
     )
     .await;
-    assert_eq!(resp["status"], "error", "conference should be destroyed after host-end");
+    assert_eq!(
+        resp["status"], "error",
+        "conference should be destroyed after host-end"
+    );
 
     alice.stop();
     bob.stop();
@@ -331,8 +334,7 @@ async fn test_non_host_cannot_end_conference() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "error",
+        resp["status"], "error",
         "Non-host should not be able to end conference: {resp}"
     );
 
@@ -347,8 +349,7 @@ async fn test_non_host_cannot_end_conference() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "success",
+        resp["status"], "success",
         "Host should be able to end conference: {resp}"
     );
 
@@ -462,8 +463,7 @@ async fn test_auto_destroy_on_last_participant() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "success",
+        resp["status"], "success",
         "Conference should still exist with 2 participants"
     );
 
@@ -623,7 +623,10 @@ async fn test_conference_timeout_auto_destroy() {
         }),
     )
     .await;
-    assert_eq!(resp["status"], "success", "Conference should exist before timeout");
+    assert_eq!(
+        resp["status"], "success",
+        "Conference should exist before timeout"
+    );
 
     // Wait for timeout + auto-destroy (3s timeout + 2s margin)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -728,8 +731,7 @@ async fn test_conference_end_without_host_fails() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "error",
+        resp["status"], "error",
         "conference.end should fail when no host was designated: {resp}"
     );
 
@@ -743,8 +745,7 @@ async fn test_conference_end_without_host_fails() {
     )
     .await;
     assert_eq!(
-        resp["status"],
-        "success",
+        resp["status"], "success",
         "conference.destroy should work without a host: {resp}"
     );
 

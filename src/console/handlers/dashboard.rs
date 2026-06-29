@@ -1,5 +1,6 @@
 use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::models::call_record::{Column as CallRecordColumn, Entity as CallRecordEntity};
+use crate::utils::count_when;
 use anyhow::Result;
 use axum::{
     Json, Router,
@@ -18,13 +19,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::warn;
-
-fn count_when<C>(condition: C) -> sea_query::SimpleExpr
-where
-    C: sea_query::IntoCondition,
-{
-    sea_query::Func::count(sea_query::Expr::case(condition, sea_query::Expr::val(1))).into()
-}
 
 fn sum_i64<E>(db: &impl ConnectionTrait, expr: E) -> sea_query::SimpleExpr
 where
@@ -376,7 +370,11 @@ async fn build_dashboard_payload(
 
     let transaction_running = state
         .sip_server()
-        .map(|server| server.runnings_tx.load(std::sync::atomic::Ordering::Relaxed) as u32)
+        .map(|server| {
+            server
+                .runnings_tx
+                .load(std::sync::atomic::Ordering::Relaxed) as u32
+        })
         .unwrap_or(0);
     let transaction_capacity = capacity;
 

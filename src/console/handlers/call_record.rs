@@ -1,6 +1,7 @@
 use crate::callrecord::CallRecord;
 use crate::callrecord::storage;
 use crate::callrecord::storage::CdrStorage;
+use crate::console::config_helpers::{bad_request, find_or_404, internal_error};
 use crate::console::{ConsoleState, handlers::forms, middleware::AuthRequired};
 use crate::models::{
     call_record::{
@@ -116,7 +117,10 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
 
 pub fn api_urls() -> Router<Arc<ConsoleState>> {
     Router::new()
-        .route("/call-records", get(query_call_records).post(query_call_records))
+        .route(
+            "/call-records",
+            get(query_call_records).post(query_call_records),
+        )
         .route(
             "/call-records/{id}",
             patch(update_call_record).delete(delete_call_record),
@@ -222,10 +226,28 @@ async fn download_call_record_sip_flow(
     // Default main call_id to "primary" if not overridden
     call_id_roles.insert(record.call_id.clone(), "primary".to_string());
 
-    let cdr_data = load_cdr_data(&state, &record).await;
-    if let Some(cdr) = &cdr_data {
-        for (cid, role) in &cdr.record.sip_leg_roles {
-            call_id_roles.insert(cid.clone(), role.clone());
+    // Load sip_leg_roles from DB metadata first (faster, no file I/O),
+    // then fall back to the CDR JSON file.
+    let mut sip_leg_roles_loaded = false;
+    if let Some(ref meta) = record.metadata {
+        if let Some(meta_map) = meta.as_object() {
+            if let Some(json_str) = meta_map.get("sip_leg_roles").and_then(|v| v.as_str()) {
+                if let Ok(roles) = serde_json::from_str::<HashMap<String, String>>(json_str) {
+                    for (cid, role) in roles {
+                        call_id_roles.insert(cid, role);
+                    }
+                    sip_leg_roles_loaded = true;
+                }
+            }
+        }
+    }
+
+    if !sip_leg_roles_loaded {
+        let cdr_data = load_cdr_data(&state, &record).await;
+        if let Some(cdr) = &cdr_data {
+            for (cid, role) in &cdr.record.sip_leg_roles {
+                call_id_roles.insert(cid.clone(), role.clone());
+            }
         }
     }
 
@@ -329,36 +351,18 @@ async fn stream_call_recording(
     let stream_leg = match parse_recording_stream_selector(query.stream.as_deref()) {
         Ok(selection) => selection,
         Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
+            return bad_request(
+                json!({
                     "message": message,
                     "allowed": ["A", "B", "mixed", "caller", "callee"],
-                })),
-            )
-                .into_response();
+                })
+                .to_string(),
+            );
         }
     };
 
     let db = state.db();
-    let record = match CallRecordEntity::find_by_id(pk).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Call record not found" })),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!(id = pk, "failed to load call record for playback: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": format!("Failed to load call record: {}", err) })),
-            )
-                .into_response();
-        }
-    };
+    let record = find_or_404!(CallRecordEntity, pk, db, "Call record");
 
     let cdr_data = load_cdr_data(&state, &record).await;
     let recording_path = select_recording_path(&record, cdr_data.as_ref());
@@ -411,8 +415,7 @@ async fn stream_call_recording(
             .generate_wav_file(&record.call_id, start_time, end_time, stream_leg)
             .await;
 
-        if let Ok(temp_file) = wav_result
-        {
+        if let Ok(temp_file) = wav_result {
             let temp_path = temp_file.path().to_owned();
             let file_len = match std::fs::metadata(&temp_path) {
                 Ok(m) => m.len(),
@@ -448,10 +451,11 @@ async fn stream_call_recording(
                     .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response());
             }
 
-            let path_str = temp_path.to_string_lossy().to_string();
-            std::mem::forget(temp_file);
+            let tmp_path = temp_file.into_temp_path();
+            let path_str = tmp_path.to_string_lossy().to_string();
             let response = stream_file_with_range(&path_str, file_len, &headers).await;
             let _ = std::fs::remove_file(&path_str);
+            drop(tmp_path);
             return response;
         }
     }
@@ -492,11 +496,7 @@ async fn stream_file_with_range(
         Ok(file) => file,
         Err(err) => {
             warn!(path = %recording_path, "failed to open recording file: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": format!("Failed to open recording file: {}", err) })),
-            )
-                .into_response();
+            return internal_error(format!("Failed to open recording file: {}", err));
         }
     };
 
@@ -504,11 +504,7 @@ async fn stream_file_with_range(
         && let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await
     {
         warn!(path = %recording_path, "failed to seek recording file: {}", err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "message": format!("Failed to read recording file: {}", err) })),
-        )
-            .into_response();
+        return internal_error(format!("Failed to read recording file: {}", err));
     }
 
     let bytes_to_send = end.saturating_sub(start) + 1;
@@ -626,24 +622,8 @@ async fn download_call_record_metadata(
     AuthRequired(_): AuthRequired,
 ) -> Response {
     let db = state.db();
-    let model = match CallRecordEntity::find_by_id(pk).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Call record not found" })),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!(id = pk, "failed to load call record metadata: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": format!("Failed to load call record: {}", err) })),
-            )
-                .into_response();
-        }
-    };
+    let model =
+        crate::console::config_helpers::find_or_404!(CallRecordEntity, pk, db, "Call record");
 
     let cdr_data = match load_cdr_data(&state, &model).await {
         Some(data) => data,
@@ -923,27 +903,8 @@ async fn update_call_record(
     }
 
     let db = state.db();
-    let mut record = match CallRecordEntity::find_by_id(pk).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Call record not found" })),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!(
-                call_record_id = pk,
-                "failed to load call record for update: {}", err
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": format!("Failed to load call record: {}", err) })),
-            )
-                .into_response();
-        }
-    };
+    let mut record =
+        crate::console::config_helpers::find_or_404!(CallRecordEntity, pk, db, "Call record");
 
     let mut active: CallRecordActiveModel = record.clone().into();
     let mut changed = false;
@@ -1012,12 +973,8 @@ async fn delete_call_record(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    if !state.has_permission(&user, "cdr", "delete").await {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "cdr", "delete").await {
+        return resp;
     }
     match CallRecordEntity::delete_by_id(pk).exec(state.db()).await {
         Ok(result) => {
@@ -1327,7 +1284,7 @@ fn build_record_payload(
         "status": record.status,
         "from": record.from_number,
         "to": record.to_number,
-        "cnam": record.caller_name,
+        "caller_name": record.caller_name,
         "agent": record.agent_name,
         "agent_extension": extension_number,
         "department": department_name,
@@ -1474,7 +1431,12 @@ fn strip_storage_root(state: &ConsoleState, path: &str) -> String {
 
 pub async fn load_cdr_data(state: &ConsoleState, record: &CallRecordModel) -> Option<CdrData> {
     let app = state.app_state()?;
-    let root = match app.config().callrecord.as_ref().map(|config| &config.storage) {
+    let root = match app
+        .config()
+        .callrecord
+        .as_ref()
+        .map(|config| &config.storage)
+    {
         Some(crate::config::CallRecordStorageConfig::Local { root })
         | Some(crate::config::CallRecordStorageConfig::S3 { root, .. }) => root.as_str(),
         _ => "",
@@ -1814,61 +1776,18 @@ fn parse_recording_stream_selector(stream: Option<&str>) -> Result<Option<i32>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console::handlers::test_helpers::{superuser, unprivileged_user};
     use crate::media::wav_reader::SampleFormat;
     use crate::{
         config::ConsoleConfig,
         console::{ConsoleState, middleware::AuthRequired},
-        models::{call_record, migration::Migrator, user},
+        models::{call_record, migration::Migrator},
     };
     use axum::{extract::State, http::StatusCode};
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
     use sea_orm_migration::MigratorTrait;
     use std::sync::Arc;
-
-    fn superuser() -> user::Model {
-        let now = Utc::now();
-        user::Model {
-            id: 1,
-            email: "admin@rustpbx.com".into(),
-            username: "admin".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: true,
-            is_superuser: true,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
-
-    fn unprivileged_user() -> user::Model {
-        let now = Utc::now();
-        user::Model {
-            id: 99,
-            email: "limited@rustpbx.com".into(),
-            username: "limited".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: false,
-            is_superuser: false,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
-    }
 
     async fn setup_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:")
@@ -1879,7 +1798,8 @@ mod tests {
     }
 
     async fn create_console_state(db: DatabaseConnection) -> Arc<ConsoleState> {
-        ConsoleState::initialize(db,
+        ConsoleState::initialize(
+            db,
             ConsoleConfig {
                 session_secret: "secret".into(),
                 base_path: "/console".into(),

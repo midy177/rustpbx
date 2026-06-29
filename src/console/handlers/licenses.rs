@@ -1,38 +1,33 @@
 use crate::console::ConsoleState;
 use axum::{
     Router,
-    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
 };
 use serde::Serialize;
 use std::sync::Arc;
 
-/// Register license routes — commerce builds add a `/licenses/verify` POST endpoint.
+// Only the commerce route module pulls in the `State` extractor; gate the
+// import so the default build does not warn about it being unused.
+#[cfg(feature = "commerce")]
+use axum::extract::State;
+
+/// Register license routes — only the commerce build exposes the
+/// `/licenses/verify` POST endpoint. The legacy `GET /licenses` redirect has
+/// been removed in favour of the unified `/addons#licenses` tab.
 pub fn urls() -> Router<Arc<ConsoleState>> {
     #[cfg(feature = "commerce")]
     return commerce::urls();
 
     #[cfg(not(feature = "commerce"))]
-    Router::new().route("/licenses", get(index))
-}
-
-pub async fn index(State(state): State<Arc<ConsoleState>>) -> impl IntoResponse {
-    let bp = state.base_path().to_string();
-    // Community build: redirect straight to addons (no license tab).
-    #[cfg(not(feature = "commerce"))]
-    return axum::response::Redirect::to(&format!("{bp}/addons"));
-    #[cfg(feature = "commerce")]
-    axum::response::Redirect::to(&format!("{bp}/addons#licenses"))
+    Router::new()
 }
 
 /// Core license-key verification logic — commerce builds only.
 #[cfg(feature = "commerce")]
 pub async fn verify_license_key(_state: Arc<ConsoleState>, license_key: String) -> Response {
-    use super::addons::{
-        get_config_path, json_error, load_document, parse_config_from_str, persist_document,
-    };
+    use super::addons::{get_config_path, load_document, parse_config_from_str, persist_document};
+    use crate::console::config_helpers::json_error;
     use toml_edit::{Item, Table};
 
     let license_key = license_key.trim().to_string();
@@ -193,7 +188,7 @@ pub async fn verify_license_key(_state: Arc<ConsoleState>, license_key: String) 
 /// Non-commerce stub so `addons.rs` can still reference the symbol without errors.
 #[cfg(not(feature = "commerce"))]
 pub async fn verify_license_key(_state: Arc<ConsoleState>, _license_key: String) -> Response {
-    use super::addons::json_error;
+    use crate::console::config_helpers::json_error;
     json_error(
         StatusCode::NOT_FOUND,
         "License management is not available in this build.",
@@ -314,8 +309,6 @@ mod commerce {
 
     pub fn urls() -> Router<Arc<ConsoleState>> {
         let _ = Json::<()>;
-        Router::new()
-            .route("/licenses", get(super::index))
-            .route("/licenses/verify", post(verify_license))
+        Router::new().route("/licenses/verify", post(verify_license))
     }
 }

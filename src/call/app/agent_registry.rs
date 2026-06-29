@@ -35,7 +35,7 @@ pub enum PresenceState {
     /// Agent is online but not ready (e.g., logged in but on break)
     Away,
     /// Agent is online and ready to receive calls
-    Available,
+    Idle,
     /// Agent is being rang for a call
     Ringing {
         /// ID of the call being routed to this agent
@@ -60,7 +60,7 @@ pub enum PresenceState {
 impl PresenceState {
     /// Check if agent can receive calls
     pub fn can_receive_calls(&self) -> bool {
-        matches!(self, PresenceState::Available)
+        matches!(self, PresenceState::Idle)
     }
 
     /// Check if agent is in a call-related state
@@ -89,7 +89,7 @@ impl PresenceState {
         match self {
             PresenceState::Offline => "offline".to_string(),
             PresenceState::Away => "away".to_string(),
-            PresenceState::Available => "available".to_string(),
+            PresenceState::Idle => "idle".to_string(),
             PresenceState::Ringing { .. } => "ringing".to_string(),
             PresenceState::Busy { .. } => "busy".to_string(),
             PresenceState::Wrapup { .. } => "wrapup".to_string(),
@@ -104,7 +104,7 @@ impl PresenceState {
         match s {
             "offline" => Some(PresenceState::Offline),
             "away" => Some(PresenceState::Away),
-            "available" => Some(PresenceState::Available),
+            "idle" | "available" => Some(PresenceState::Idle),
             "ringing" => Some(PresenceState::Ringing { call_id: None }),
             "busy" => Some(PresenceState::Busy { call_id: None }),
             "wrapup" => Some(PresenceState::Wrapup { call_id: None }),
@@ -129,7 +129,7 @@ impl PresenceState {
         match self {
             PresenceState::Offline => "Offline".to_string(),
             PresenceState::Away => "Away".to_string(),
-            PresenceState::Available => "Available".to_string(),
+            PresenceState::Idle => "Idle".to_string(),
             PresenceState::Ringing { .. } => "Ringing".to_string(),
             PresenceState::Busy { .. } => "Busy".to_string(),
             PresenceState::Wrapup { .. } => "Wrap-up".to_string(),
@@ -268,12 +268,15 @@ pub trait AgentRegistry: Send + Sync {
 
     /// Select best agent with an optional ACD policy hint.
     ///
-    /// Default implementation ignores policy and calls `select_agent`.
+    /// `call_id` identifies the call being routed; addon implementations use it
+    /// to emit scheduling webhook events. Default implementation ignores policy
+    /// and calls `select_agent`.
     async fn select_agent_with_policy(
         &self,
         required_skills: &[String],
         strategy: RoutingStrategy,
         _policy: Option<&str>,
+        _call_id: &str,
     ) -> Option<AgentRecord> {
         self.select_agent(required_skills, strategy).await
     }
@@ -288,11 +291,14 @@ pub trait AgentRegistry: Send + Sync {
 
     /// Resolve target URI with an optional ACD policy hint.
     ///
-    /// Default implementation ignores policy and calls `resolve_target`.
+    /// `call_id` identifies the call being routed; addon implementations use it
+    /// to emit scheduling webhook events. Default implementation ignores policy
+    /// and calls `resolve_target`.
     async fn resolve_target_with_policy(
         &self,
         target_uri: &str,
         _policy: Option<&str>,
+        _call_id: &str,
     ) -> Vec<String> {
         self.resolve_target(target_uri).await
     }
@@ -312,17 +318,17 @@ pub trait AgentRegistry: Send + Sync {
             // Any state can go to Offline
             (_, PresenceState::Offline) => true,
 
-            // Can go to Available from any non-active state
+            // Can go to Idle from any non-active state
             (
                 PresenceState::Away
                 | PresenceState::Wrapup { .. }
                 | PresenceState::Dnd
                 | PresenceState::Custom(_),
-                PresenceState::Available,
+                PresenceState::Idle,
             ) => true,
 
-            // Can go to Ringing only from Available
-            (PresenceState::Available, PresenceState::Ringing { .. }) => true,
+            // Can go to Ringing only from Idle
+            (PresenceState::Idle, PresenceState::Ringing { .. }) => true,
 
             // Can go to Busy only from Ringing
             (PresenceState::Ringing { .. }, PresenceState::Busy { .. }) => true,
@@ -330,15 +336,15 @@ pub trait AgentRegistry: Send + Sync {
             // Can go to Wrapup only from Busy
             (PresenceState::Busy { .. }, PresenceState::Wrapup { .. }) => true,
 
-            // Can go to Away/Dnd from Available or Custom
+            // Can go to Away/Dnd from Idle or Custom
             (
-                PresenceState::Available | PresenceState::Custom(_),
+                PresenceState::Idle | PresenceState::Custom(_),
                 PresenceState::Away | PresenceState::Dnd,
             ) => true,
 
-            // Can go to any Custom state from Available, Away, Dnd, or Wrapup
+            // Can go to any Custom state from Idle, Away, Dnd, or Wrapup
             (
-                PresenceState::Available
+                PresenceState::Idle
                 | PresenceState::Away
                 | PresenceState::Dnd
                 | PresenceState::Wrapup { .. },

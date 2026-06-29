@@ -7,8 +7,8 @@
             filter_options: {{ filter_options | default({}) | tojson }},
             list_url: {{ list_url | default("/console/call-records") | tojson }},
             page_size_options: {{ page_size_options | default([10, 25, 50]) | tojson }},
-            translations: {{ t | tojson }}
-        })' x-init="init()">
+            translations: window.__i18n_t || {}
+        })'>
         <header class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
             <div class="space-y-1">
                 <p class="text-xs font-semibold uppercase tracking-wide text-sky-600">{{ "call_record.voice_analytics" | t }}</p>
@@ -354,7 +354,7 @@
                                     </div>
                                 </td>
                                 <td class="px-4 py-2">
-                                    <div class="text-sm font-semibold text-slate-800" x-text="record.cnam || '—'"></div>
+                                    <div class="text-sm font-semibold text-slate-800" x-text="record.caller_name || '—'"></div>
                                     <div class="text-xs text-slate-500">
                                         <span class="font-mono" x-text="record.from || '—'"></span>
                                     </div>
@@ -454,10 +454,10 @@
                                             class="inline-flex h-8 w-8 items-center justify-center rounded-full border border-rose-200 text-rose-500 transition hover:border-rose-300 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-60"
                                             :disabled="deletingId === record.id" @click.stop="deleteRecord(record)"
                                             :title="t.action_delete_record || 'Delete record'">
-                                            <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                                 stroke-width="1.6">
                                                 <path stroke-linecap="round" stroke-linejoin="round"
-                                                    d="M6 6h8m-7 3v6m6-6v6M4 6h12" />
+                                                    d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" />
                                             </svg>
                                         </button>
                                     </div>
@@ -744,8 +744,12 @@
                     this.currentPage = currentPageRaw;
                 }
 
+                this.syncActiveFilters();
+
                 if (!this.dateFrom) {
                     this.applyDatePreset('last_7_days');
+                } else if (!Array.isArray(data.records) || !data.records.length) {
+                    this.fetchRecords({ page: this.currentPage });
                 }
 
                 const scheduleWatcher = () => {
@@ -787,10 +791,6 @@
                     this.applyPageSize(value);
                 });
 
-                this.syncActiveFilters();
-                if (!Array.isArray(data.records) || !data.records.length) {
-                    this.fetchRecords({ page: this.currentPage });
-                }
             },
             normalizeBasePath(value) {
                 if (!value || value === '/') {

@@ -210,22 +210,26 @@ impl AuthModule {
         Some((call_id, from_tag))
     }
 
-    pub fn create_proxy_auth_challenge(&self, realm: &str) -> Result<ProxyAuthenticate> {
+    /// Build the shared `Digest realm="...", nonce="...", algorithm=MD5`
+    /// challenge string used by both `create_proxy_auth_challenge` and
+    /// `create_www_auth_challenge`. Centralising the format prevents the two
+    /// variants from drifting out of sync.
+    fn build_digest_challenge(&self, realm: &str) -> String {
+        // NOTE: a fresh nonce is generated on every call so callers must not
+        // share the returned string between two distinct challenges.
         let nonce = rsipstack::transaction::random_text(16);
-        let proxy_auth = ProxyAuthenticate::new(format!(
+        format!(
             r#"Digest realm="{}", nonce="{}", algorithm=MD5"#,
             realm, nonce
-        ));
-        Ok(proxy_auth)
+        )
+    }
+
+    pub fn create_proxy_auth_challenge(&self, realm: &str) -> Result<ProxyAuthenticate> {
+        Ok(ProxyAuthenticate::new(self.build_digest_challenge(realm)))
     }
 
     pub fn create_www_auth_challenge(&self, realm: &str) -> Result<WwwAuthenticate> {
-        let nonce = rsipstack::transaction::random_text(16);
-        let www_auth = WwwAuthenticate::new(format!(
-            r#"Digest realm="{}", nonce="{}", algorithm=MD5"#,
-            realm, nonce
-        ));
-        Ok(www_auth)
+        Ok(WwwAuthenticate::new(self.build_digest_challenge(realm)))
     }
 
     fn is_cluster_peer_source(&self, tx: &Transaction) -> bool {
@@ -375,6 +379,44 @@ impl ProxyModule for AuthModule {
             }
         }
 
+        // Path B: Check WebSocket pre-authentication via JWT
+        if let Some(ref registry) = self.server.pre_auth_registry {
+            if let Some(source_addr) = self.get_source_addr(tx) {
+                if let Some(agent_id) = registry.lookup(&source_addr).await {
+                    if tx.original.method == rsipstack::sip::Method::Register {
+                        let realm = tx.original.uri().host().to_string();
+                        match self
+                            .server
+                            .user_backend
+                            .get_user(&agent_id, Some(&realm), Some(&tx.original))
+                            .await
+                        {
+                            Ok(Some(mut user)) => {
+                                if !user.enabled {
+                                    info!(username = %agent_id, "Pre-authed user is disabled");
+                                } else {
+                                    user.username = agent_id;
+                                    cookie.set_user(user);
+                                    return Ok(ProxyAction::Continue);
+                                }
+                            }
+                            _ => {
+                                // User not found in backend — create minimal SipUser from JWT identity
+                                let user = SipUser {
+                                    username: agent_id,
+                                    enabled: true,
+                                    realm: Some(realm),
+                                    ..Default::default()
+                                };
+                                cookie.set_user(user);
+                                return Ok(ProxyAction::Continue);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         match self.authenticate_request(tx).await {
             Ok(authenticated) => {
                 if let Some(user) = authenticated {
@@ -464,14 +506,10 @@ impl ProxyModule for AuthModule {
                             vec![Header::WwwAuthenticate(www_auth)],
                         )
                     } else {
-                        let www_auth = self.create_www_auth_challenge(&realm)?;
                         let proxy_auth = self.create_proxy_auth_challenge(&realm)?;
                         (
                             rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
-                            vec![
-                                Header::WwwAuthenticate(www_auth),
-                                Header::ProxyAuthenticate(proxy_auth),
-                            ],
+                            vec![Header::ProxyAuthenticate(proxy_auth)],
                         )
                     };
 

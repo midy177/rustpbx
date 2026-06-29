@@ -559,6 +559,8 @@
                         <button class="tab active" data-tab="debug-ws">WebSocket</button>
                         <button class="tab" data-tab="debug-state">Call State</button>
                         <button class="tab" data-tab="debug-sip">SIP Messages</button>
+                        <button class="tab" data-tab="debug-sip-commands">SIP Commands</button>
+                        <button class="tab" data-tab="debug-http-commands">HTTP Commands</button>
                     </div>
                     <div class="tab-content active" id="debug-ws">
                         <div class="form-group">
@@ -584,6 +586,46 @@
                     <div class="tab-content" id="debug-sip">
                         <div class="debug-panel" id="sipMessagesLog" style="height:200px;"></div>
                         <button type="button" id="clearSipLogBtn" class="secondary" style="width:auto;margin-top:8px;">Clear SIP Log</button>
+                    </div>
+                    <div class="tab-content" id="debug-sip-commands">
+                        <div class="form-group">
+                            <label>Preset:</label>
+                            <select id="sipCmdPreset" style="width:100%;" onchange="onSipCmdPresetChange()">
+                                <option value="">-- Custom --</option>
+                                <option value='{"action":"media.play","params":{"source":{"source_type":"silence"}}}'>media.play (silence)</option>
+                                <option value='{"action":"media.stop","params":{}}'>media.stop</option>
+                                <option value='{"action":"media.inject_start","params":{"source":{"source_type":"silence"}}}'>media.inject_start</option>
+                                <option value='{"action":"media.inject_stop","params":{}}'>media.inject_stop</option>
+                                <option value='{"action":"record.start","params":{"path":"/tmp/recording.wav","beep":true}}'>record.start</option>
+                                <option value='{"action":"record.stop","params":{}}'>record.stop</option>
+                                <option value='{"action":"hold","params":{"leg_id":"caller"}}'>hold</option>
+                                <option value='{"action":"unhold","params":{"leg_id":"caller"}}'>unhold</option>
+                                <option value='{"action":"media.play","params":{"source":{"source_type":"files","uris":["/tmp/announce.wav","/tmp/music.wav"]}}}'>media.play (multi-url)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>JSON Body (SIP INFO):</label>
+                            <textarea id="sipCmdBody" rows="4">{"action":"media.play","params":{"source":{"source_type":"silence"}}}</textarea>
+                        </div>
+                        <button type="button" id="sendSipInfoCmdBtn" style="width:auto;" onclick="sendSipInfoCommand()">Send INFO Command</button>
+                        <div class="debug-panel" id="sipCmdLog" style="margin-top:10px;height:150px;"></div>
+                    </div>
+                    <div class="tab-content" id="debug-http-commands">
+                        <div class="form-group">
+                            <label>API Server URL:</label>
+                            <input type="text" id="httpApiUrl" placeholder="http://localhost:8082">
+                        </div>
+                        <div class="form-group">
+                            <label>Bearer Token:</label>
+                            <input type="text" id="httpApiToken" value="dev" placeholder="Bearer token">
+                        </div>
+
+                        <div class="form-group">
+                            <label>JSON Body:</label>
+                             <textarea id="httpCmdBody" rows="6">{"action":"play","leg_id":"both","source":{"type":"url","url":"http://192.168.3.181:8000/H000026548852213211.wav"},"loop_playback":false}</textarea>
+                        </div>
+                        <button type="button" id="sendHttpCmdBtn" onclick="sendHttpCommand()">Send HTTP Command</button>
+                        <div class="debug-panel" id="httpCmdLog" style="margin-top:10px;height:150px;"></div>
                     </div>
                 </div>
             </div>
@@ -2357,16 +2399,14 @@
 
         function getSessionCallId(session) {
             if (!session) return null;
-            if (session.id) return session.id;
-            if (session._id) return session._id;
-            if (session.request && session.request.call_id) return session.request.call_id;
-            if (session.request && session.request.headers && session.request.headers['Call-ID']) {
-                const hdr = session.request.headers['Call-ID'];
-                if (Array.isArray(hdr) && hdr[0] && hdr[0].raw) return hdr[0].raw;
+            let callId = session._request && session._request.call_id;
+            if (!callId) callId = session._id || session.id || null;
+
+            if (callId && typeof callId === 'string') {
+                callId = callId.split(';')[0].split('\r')[0].split('\n')[0].trim();
             }
-            if (session.dialog && session.dialog.id && session.dialog.id.call_id) return session.dialog.id.call_id;
-            if (session.dialog && session.dialog.call_id) return session.dialog.call_id;
-            return null;
+
+            return callId;
         }
 
         function notifyCcCallAction(action, session) {
@@ -2409,6 +2449,153 @@
             callStateDebug.innerHTML = html.join('');
         }
 
+        // ========== SIP Commands (INFO) ==========
+        const sipCmdPresets = [
+            { action: 'media.play', params: { source: { source_type: 'silence' } } },
+            { action: 'media.stop', params: {} },
+            { action: 'media.inject_start', params: { source: { source_type: 'silence' } } },
+            { action: 'media.inject_stop', params: {} },
+            { action: 'record.start', params: { path: '/tmp/recording.wav', beep: true } },
+            { action: 'record.stop', params: {} },
+            { action: 'hold', params: { leg_id: 'caller' } },
+            { action: 'unhold', params: { leg_id: 'caller' } },
+            { action: 'media.play', params: { source: { source_type: 'files', uris: ['/tmp/announce.wav', '/tmp/music.wav'] } } },
+        ];
+
+        function onSipCmdPresetChange() {
+            const select = document.getElementById('sipCmdPreset');
+            const bodyArea = document.getElementById('sipCmdBody');
+            if (select && bodyArea && select.value) {
+                bodyArea.value = select.value;
+            }
+        }
+
+        function logSipCmd(message, type) {
+            const logPanel = document.getElementById('sipCmdLog');
+            if (!logPanel) return;
+            const entry = document.createElement('div');
+            entry.className = 'debug-entry';
+            const ts = new Date().toLocaleTimeString();
+            entry.innerHTML = `<span class="debug-time">[${ts}]</span> <span class="${type === 'error' ? 'debug-error' : 'debug-info'}">${message}</span>`;
+            logPanel.appendChild(entry);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+
+        function sendSipInfoCommand() {
+            const bodyArea = document.getElementById('sipCmdBody');
+            if (!bodyArea) return;
+            const raw = bodyArea.value.trim();
+            if (!raw) { logSipCmd('Empty command body', 'error'); return; }
+
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (e) {
+                logSipCmd('Invalid JSON: ' + e.message, 'error');
+                return;
+            }
+
+            const session = currentSession;
+            if (!session) { logSipCmd('No active call session', 'error'); return; }
+
+            const contentType = 'application/vnd.rustpbx+json';
+            const bodyStr = JSON.stringify(parsed);
+
+            try {
+                // JsSIP 3.x: RTCSession.sendRequest() drops the `contentType`
+                // option — it only forwards `extraHeaders` and `body` to the
+                // dialog.  So the Content-Type header MUST be supplied via
+                // extraHeaders, otherwise the server receives ct=None.
+                const extraHeaders = ['Content-Type: ' + contentType];
+                if (typeof session.sendRequest === 'function') {
+                    session.sendRequest('INFO', {
+                        extraHeaders: extraHeaders,
+                        body: bodyStr,
+                    });
+                } else {
+                    // Older JsSIP API: use session.request.sendRequest directly
+                    session.request.sendRequest('INFO', {
+                        extraHeaders: extraHeaders,
+                        body: bodyStr,
+                    });
+                }
+                logSipCmd(`Sent INFO (${contentType}): ${bodyStr.substring(0, 80)}${bodyStr.length > 80 ? '...' : ''}`, 'info');
+                logSipMessage('SENT', 'INFO', contentType);
+            } catch (e) {
+                logSipCmd('Failed to send INFO: ' + e.message, 'error');
+                logSipMessage('SENT', 'INFO', `(failed) ${e.message}`);
+            }
+        }
+
+        // ========== HTTP Commands ==========
+        function sendHttpCommand() {
+            const apiUrl = document.getElementById('httpApiUrl').value.trim();
+            const token = document.getElementById('httpApiToken').value.trim();
+            const bodyRaw = document.getElementById('httpCmdBody').value.trim();
+            const logPanel = document.getElementById('httpCmdLog');
+
+            function logHttpMsg(message, type) {
+                if (!logPanel) return;
+                const entry = document.createElement('div');
+                entry.className = 'debug-entry';
+                const ts = new Date().toLocaleTimeString();
+                entry.innerHTML = `<span class="debug-time">[${ts}]</span> <span class="${type === 'error' ? 'debug-error' : 'debug-info'}">${message}</span>`;
+                logPanel.appendChild(entry);
+                logPanel.scrollTop = logPanel.scrollHeight;
+            }
+
+            if (!apiUrl) { logHttpMsg('Please enter API Server URL', 'error'); return; }
+            if (!token) { logHttpMsg('Please enter Bearer Token', 'error'); return; }
+            if (!bodyRaw) { logHttpMsg('Empty command body', 'error'); return; }
+
+            let parsedBody;
+            try { parsedBody = JSON.parse(bodyRaw); } catch (e) {
+                logHttpMsg('Invalid JSON: ' + e.message, 'error');
+                return;
+            }
+
+            const session = currentSession;
+            if (!session) { logHttpMsg('No active call session', 'error'); return; }
+
+            const callId = getSessionCallId(session);
+            logHttpMsg('Call ID: ' + (callId || 'null'), 'info');
+            if (!callId) { logHttpMsg('Could not get call ID from session', 'error'); return; }
+
+            const url = apiUrl.replace(/\/+$/, '') + '/api/calls/active/' + encodeURIComponent(callId) + '/commands';
+
+            logHttpMsg('POST ' + url, 'info');
+            logHttpMsg('Request: ' + JSON.stringify(parsedBody, null, 2), 'info');
+
+            fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': 'Bearer ' + token,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(parsedBody)
+            })
+            .then(async response => {
+                const text = await response.text();
+                logHttpMsg('Status: ' + response.status + ' ' + response.statusText, 'info');
+                let contentType = response.headers.get('Content-Type') || '';
+                logHttpMsg('Content-Type: ' + contentType, 'info');
+                if (text) {
+                    try {
+                        const pretty = JSON.stringify(JSON.parse(text), null, 2);
+                        logHttpMsg('Response: ' + pretty, 'info');
+                    } catch (e) {
+                        logHttpMsg('Response: ' + text, 'info');
+                    }
+                } else {
+                    logHttpMsg('Response: (empty)', 'info');
+                }
+                if (!response.ok) {
+                    logHttpMsg('Request failed with status ' + response.status, 'error');
+                }
+            })
+            .catch(error => {
+                logHttpMsg('Request error: ' + error.message, 'error');
+            });
+        }
+
         // ========== SIP Message Logging ==========
         function logSipMessage(direction, method, body) {
             const entry = document.createElement('div');
@@ -2426,6 +2613,11 @@
         window.addEventListener('beforeunload', () => { if (ua) ua.stop(); if (ccWs) ccWs.close(); });
         loadDefaultIceServers();
         enumerateCameras();
+        // Set default HTTP API URL to current origin
+        const httpApiUrlInput = document.getElementById('httpApiUrl');
+        if (httpApiUrlInput && !httpApiUrlInput.value) {
+            httpApiUrlInput.value = window.location.origin;
+        }
         log('CC SIP Phone initialized');
     </script>
 </body>

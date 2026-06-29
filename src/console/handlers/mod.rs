@@ -1,4 +1,4 @@
-use crate::console::ConsoleState;
+use crate::console::{ConsoleState, ReloadTarget};
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
 use http::StatusCode;
 use serde_json::json;
@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod extension;
 pub mod forms;
 pub mod licenses;
+pub mod locales;
 pub mod metrics;
 pub mod notifications;
 pub mod presence;
@@ -23,8 +24,7 @@ pub mod user;
 pub mod utils;
 
 pub fn bad_request(message: impl Into<String>) -> axum::response::Response {
-    let text = message.into();
-    (StatusCode::BAD_REQUEST, Json(json!({ "message": text }))).into_response()
+    crate::console::config_helpers::json_error(StatusCode::BAD_REQUEST, message)
 }
 
 #[allow(clippy::result_large_err)]
@@ -43,12 +43,16 @@ pub fn normalize_optional_string(value: &Option<String>) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+pub fn sanitize_optional_string(value: Option<String>) -> Option<String> {
+    normalize_optional_string(&value)
+}
+
 pub fn router(state: Arc<ConsoleState>) -> Router {
     let base_path = state.base_path().to_string();
     let api_prefix = state.api_prefix().to_string();
 
     // Page routes (nested under base_path)
-    let page_routes = Router::new()
+    let mut page_routes = Router::new()
         .merge(user::urls())
         .merge(extension::urls())
         .merge(sip_trunk::urls())
@@ -62,37 +66,21 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         .merge(sipflow::urls())
         .merge(notifications::urls())
         .merge(metrics::urls());
-    #[cfg(feature = "addon-cc")]
-    let page_routes = page_routes.merge(crate::addons::cc::console_handlers::page_urls());
 
-    // API routes (nested under api_prefix)
-    let api_routes = Router::new()
-        .route("/pending-reloads", get(pending_reloads_handler))
-        .merge(presence::api_urls())
-        .merge(notifications::api_urls())
-        .merge(metrics::api_urls())
-        .merge(addons::api_urls());
-    #[cfg(feature = "addon-cc")]
-    let api_routes = {
-        let cc_api_routes = crate::addons::cc::console_handlers::api_urls();
-        let cc_api_routes = if let Some(app_state) = state.app_state() {
-            if let Some(cc_state) = app_state.get_addon_state::<crate::addons::cc::CcAddonState>() {
-                let auth_state = crate::addons::cc::phone_auth::PhoneAuthState {
-                    phone_auth: cc_state.phone_auth.clone(),
-                    console_state: Some(state.clone()),
-                };
-                cc_api_routes.layer(axum::middleware::from_fn_with_state(
-                    auth_state,
-                    crate::addons::cc::phone_auth::phone_auth_middleware,
-                ))
-            } else {
-                cc_api_routes
-            }
-        } else {
-            cc_api_routes
-        };
-        api_routes.merge(cc_api_routes)
-    };
+    // Addon page routes (collected at runtime via Addon trait hooks).
+    if let Some(app_state) = state.app_state() {
+        let config = app_state.config();
+        for r in app_state
+            .addon_registry
+            .get_console_page_routes(&state, &config)
+        {
+            page_routes = page_routes.merge(r);
+        }
+    }
+
+    // API routes were unified into src/api/mod.rs (single /api tree with
+    // api_auth_middleware). See `api::router`.
+    let api_routes = Router::new();
 
     Router::new()
         .route(&format!("{base_path}/"), get(self::dashboard::dashboard))
@@ -102,34 +90,97 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         )
         .nest(&base_path, page_routes)
         .nest(&api_prefix, api_routes)
+        // CSRF protection on all console mutations (POST/PUT/PATCH/DELETE).
+        // Auth endpoints (login/register/reset/forgot/logout) are exempt
+        // inside csrf_guard itself; they rely on SameSite=Lax.
+        .layer(axum::middleware::from_fn(
+            crate::console::middleware::csrf_guard,
+        ))
         .with_state(state)
 }
 
-async fn pending_reloads_handler(State(state): State<Arc<ConsoleState>>) -> impl IntoResponse {
-    use std::sync::atomic::Ordering;
-    let pending = state.pending_reload.load(Ordering::Relaxed);
-    Json(json!({ "pending": pending }))
+pub async fn pending_reloads_handler(State(state): State<Arc<ConsoleState>>) -> impl IntoResponse {
+    let targets = state.pending_reload_targets();
+    Json(json!({
+        "pending": {
+            "routes": targets.contains(&ReloadTarget::Routes),
+            "trunks": targets.contains(&ReloadTarget::Trunks),
+            "sbc_routes": targets.contains(&ReloadTarget::SbcRoutes),
+            "sbc_trunks": targets.contains(&ReloadTarget::SbcTrunks),
+            "queues": targets.contains(&ReloadTarget::Queues),
+            "app": targets.contains(&ReloadTarget::App),
+            "acl": targets.contains(&ReloadTarget::Acl),
+        }
+    }))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod test_helpers {
     use crate::{config::ConsoleConfig, console::ConsoleState, models::migration::Migrator};
-    use axum::{body::to_bytes, extract::State, http::StatusCode};
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
+    use std::sync::Arc;
 
-    async fn setup_state() -> Arc<ConsoleState> {
+    pub async fn setup_state() -> Arc<ConsoleState> {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("connect sqlite memory");
         Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(db,
-            ConsoleConfig::default(),
-        )
-        .await
-        .expect("initialize console state")
+        ConsoleState::initialize(db, ConsoleConfig::default())
+            .await
+            .expect("initialize console state")
     }
+
+    pub fn superuser() -> crate::models::user::Model {
+        let now = chrono::Utc::now();
+        crate::models::user::Model {
+            id: 1,
+            email: "admin@rustpbx.com".into(),
+            username: "admin".into(),
+            password_hash: "hashed".into(),
+            reset_token: None,
+            reset_token_expires: None,
+            last_login_at: None,
+            last_login_ip: None,
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+            is_staff: true,
+            is_superuser: true,
+            mfa_enabled: false,
+            mfa_secret: None,
+            auth_source: "local".into(),
+        }
+    }
+
+    pub fn unprivileged_user() -> crate::models::user::Model {
+        let now = chrono::Utc::now();
+        crate::models::user::Model {
+            id: 2,
+            email: "user@rustpbx.com".into(),
+            username: "user".into(),
+            password_hash: "hashed".into(),
+            reset_token: None,
+            reset_token_expires: None,
+            last_login_at: None,
+            last_login_ip: None,
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+            is_staff: false,
+            is_superuser: false,
+            mfa_enabled: false,
+            mfa_secret: None,
+            auth_source: "local".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::setup_state;
+    use super::*;
+    use axum::{body::to_bytes, extract::State, http::StatusCode};
 
     #[tokio::test]
     async fn pending_reloads_handler_false_initially() {
@@ -138,17 +189,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["pending"], false);
+        assert_eq!(v["pending"]["routes"], false);
+        assert_eq!(v["pending"]["trunks"], false);
     }
 
     #[tokio::test]
     async fn pending_reloads_handler_true_after_mark() {
         let state = setup_state().await;
-        state.mark_pending_reload();
+        state.mark_pending_reload(ReloadTarget::Routes);
 
         let response = pending_reloads_handler(State(state)).await.into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["pending"], true);
+        assert_eq!(v["pending"]["routes"], true);
+        assert_eq!(v["pending"]["trunks"], false);
     }
 }

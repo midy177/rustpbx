@@ -5,6 +5,7 @@ use crate::config::Config;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -131,6 +132,18 @@ pub struct ApplicationContext {
 
     /// Post-call hook (registered by callcenter addon).
     pub post_call_hook: Option<Arc<dyn PostCallHook>>,
+
+    /// Pending queue plan + resolved agent URIs, set by SipSession before
+    /// starting the queue app. The queue app factory reads (and clears) this.
+    pub pending_queue: Arc<Mutex<Option<PendingQueuePlan>>>,
+}
+
+/// A resolved queue plan ready to be handed to QueueApp.
+#[derive(Clone)]
+pub struct PendingQueuePlan {
+    pub plan: crate::call::QueuePlan,
+    pub agent_uris: Vec<String>,
+    pub parallel: bool,
 }
 
 impl ApplicationContext {
@@ -147,6 +160,7 @@ impl ApplicationContext {
             ivr_trace: None,
             app_factories: Arc::new(Vec::new()),
             post_call_hook: None,
+            pending_queue: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -261,7 +275,7 @@ mod tests {
     fn test_routed_headers_override_originals_in_call_info() {
         // Simulate the merge logic used in SipSession::new():
         // routed headers should override original SIP request headers
-        use rsipstack::sip::{Header, Request, Method, Uri};
+        use rsipstack::sip::{Header, Method, Request, Uri};
 
         let mut req = Request {
             method: Method::Invite,
@@ -270,7 +284,8 @@ mod tests {
             headers: vec![
                 Header::Other("X-Custom".to_string(), "original-value".to_string()),
                 Header::Other("X-Forwarded-For".to_string(), "192.168.1.1".to_string()),
-            ].into(),
+            ]
+            .into(),
             body: vec![],
         };
         // Add a typed header to ensure it's still skipped by extract
@@ -279,18 +294,25 @@ mod tests {
                 display_name: None,
                 uri: Uri::try_from("sip:alice@example.com").unwrap(),
                 params: vec![],
-            }.into(),
+            }
+            .into(),
         );
 
         let original = extract_sip_headers(&req);
         assert_eq!(original.get("X-Custom").unwrap(), "original-value");
         assert_eq!(original.get("X-Forwarded-For").unwrap(), "192.168.1.1");
-        assert!(original.get("From").is_none(), "From header should be skipped");
+        assert!(
+            original.get("From").is_none(),
+            "From header should be skipped"
+        );
 
         // Simulate routing-modified headers (overriding X-Custom, adding P-Asserted-Identity)
         let routed_headers: Option<Vec<Header>> = Some(vec![
             Header::Other("X-Custom".to_string(), "routing-value".to_string()),
-            Header::Other("P-Asserted-Identity".to_string(), "<sip:routing@pbx.com>".to_string()),
+            Header::Other(
+                "P-Asserted-Identity".to_string(),
+                "<sip:routing@pbx.com>".to_string(),
+            ),
         ]);
 
         // Apply the same merge logic as in sip_session.rs

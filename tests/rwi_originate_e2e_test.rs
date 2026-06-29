@@ -59,20 +59,6 @@ async fn ws_send_recv(ws: &mut WsStream, json: &str) -> serde_json::Value {
     .await
 }
 
-/// Wait for the next text frame (up to 5 s).
-#[allow(dead_code)]
-async fn recv_next(ws: &mut WsStream) -> serde_json::Value {
-    let msg = timeout(Duration::from_secs(5), ws.next())
-        .await
-        .expect("recv timeout")
-        .expect("stream ended")
-        .expect("ws error");
-    match msg {
-        Message::Text(t) => serde_json::from_str(&t).expect("not JSON"),
-        other => panic!("unexpected frame: {other:?}"),
-    }
-}
-
 /// Read frames until `predicate(frame)` returns `true` or timeout expires.
 async fn recv_until(
     ws: &mut WsStream,
@@ -172,14 +158,18 @@ async fn test_originate_single_bob_answers() {
     // Expect CallRinging within 5 s
     // Events are serialized as {"call_ringing": {"call_id": "..."}} (snake_case enum variant)
     let ringing = recv_until(&mut ws, 5, |v| {
-        v.get("call_ringing").is_some() || v.to_string().contains("ringing")
+        v.get("call_ringing").is_some()
+            || v["event_type"].as_str() == Some("call_ringing")
+            || v.to_string().contains("ringing")
     })
     .await;
     tracing::info!("Got ringing event: {:?}", ringing);
 
     // Expect CallAnswered within 10 s (bob rings for 1 s, then answers)
     let answered = recv_until(&mut ws, 10, |v| {
-        v.get("call_answered").is_some() || v.to_string().contains("answered")
+        v.get("call_answered").is_some()
+            || v["event_type"].as_str() == Some("call_answered")
+            || v.to_string().contains("answered")
     })
     .await;
     tracing::info!("Got answered event: {:?}", answered);
@@ -233,11 +223,17 @@ async fn test_originate_sends_proper_sdp() {
     );
 
     // Wait for ringing - this proves the INVITE was sent and processed
-    let ringing = recv_until(&mut ws, 5, |v| v.get("call_ringing").is_some()).await;
+    let ringing = recv_until(&mut ws, 5, |v| {
+        v.get("call_ringing").is_some() || v["event_type"].as_str() == Some("call_ringing")
+    })
+    .await;
     tracing::info!("Got ringing event: {:?}", ringing);
 
     // Wait for answer - this proves the callee received SDP and accepted the call
-    let answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
     tracing::info!("Bob answered: {:?}", answered);
 
     // The fact that we got CallAnswered proves SDP was sent correctly.
@@ -337,7 +333,10 @@ async fn test_originate_then_hangup() {
     assert_eq!(v["status"], "success");
 
     // Wait for ringing
-    let _ringing = recv_until(&mut ws, 5, |v| v.get("call_ringing").is_some()).await;
+    let _ringing = recv_until(&mut ws, 5, |v| {
+        v.get("call_ringing").is_some() || v["event_type"].as_str() == Some("call_ringing")
+    })
+    .await;
     tracing::info!("Got ringing event - test passed");
 
     // Clean up
@@ -383,7 +382,10 @@ async fn test_originate_and_bridge() {
     assert_eq!(v["status"], "success");
 
     // Wait for Alice to answer
-    let answered_a = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let answered_a = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
     tracing::info!("Alice answered: {:?}", answered_a);
 
     // Originate to Bob
@@ -406,7 +408,11 @@ async fn test_originate_and_bridge() {
     // Wait for Bob's ringing event first
     let ringing_b = recv_until(&mut ws, 10, |v| {
         v.get("call_ringing")
-            .is_some_and(|r| r.get("call_id").and_then(|id| id.as_str()) == Some(&call_b))
+            .and_then(|r| r.get("call_id"))
+            .and_then(|id| id.as_str())
+            == Some(&call_b)
+            || (v["event_type"].as_str() == Some("call_ringing")
+                && v["call_id"].as_str() == Some(&call_b))
     })
     .await;
     tracing::info!("Bob ringing: {:?}", ringing_b);
@@ -414,7 +420,11 @@ async fn test_originate_and_bridge() {
     // Wait for Bob to answer
     let answered_b = recv_until(&mut ws, 10, |v| {
         v.get("call_answered")
-            .is_some_and(|a| a.get("call_id").and_then(|id| id.as_str()) == Some(&call_b))
+            .and_then(|a| a.get("call_id"))
+            .and_then(|id| id.as_str())
+            == Some(&call_b)
+            || (v["event_type"].as_str() == Some("call_answered")
+                && v["call_id"].as_str() == Some(&call_b))
     })
     .await;
     tracing::info!("Bob answered: {:?}", answered_b);
@@ -500,7 +510,10 @@ async fn test_media_play() {
     assert_eq!(v["status"], "success");
 
     // Wait for answer
-    let _answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let _answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
 
     // Play a sound (use a non-existent file to test error handling)
     let (_, play_json) = rwi_req(
@@ -559,7 +572,10 @@ async fn test_call_hold_unhold() {
     assert_eq!(v["status"], "success");
 
     // Wait for answer
-    let _answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let _answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
     tracing::info!("Bob answered");
 
     // Note: call.hold requires an RWI app running on the call session.
@@ -615,7 +631,10 @@ async fn test_call_transfer() {
     assert_eq!(v["status"], "success");
 
     // Wait for answer
-    let _answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let _answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
     tracing::info!("Bob answered");
 
     // Transfer to Charlie
@@ -675,7 +694,10 @@ async fn test_call_ring() {
     assert_eq!(v["status"], "success");
 
     // Wait for ringing (should come automatically from sipbot)
-    let _ringing = recv_until(&mut ws, 5, |v| v.get("call_ringing").is_some()).await;
+    let _ringing = recv_until(&mut ws, 5, |v| {
+        v.get("call_ringing").is_some() || v["event_type"].as_str() == Some("call_ringing")
+    })
+    .await;
     tracing::info!("Got ringing event");
 
     // Now send explicit call.ring (redundant but tests the command)
@@ -754,7 +776,10 @@ async fn test_parallel_originate_first_answer() {
     assert_eq!(v["status"], "success", "second originate failed: {:?}", v);
 
     // Wait for first answer (either Alice or Bob)
-    let answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
     tracing::info!("First answered: {:?}", answered);
 
     // Get the call_id of the answered call
@@ -815,7 +840,10 @@ async fn test_list_calls() {
     assert_eq!(v["status"], "success");
 
     // Wait for answer
-    let _answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let _answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
 
     // List calls after originate
     let (_, list_json) = rwi_req("session.list_calls", serde_json::json!({}));
@@ -881,7 +909,10 @@ async fn test_originate_task_cleanup() {
     assert_eq!(v["status"], "success");
 
     // Wait for answer
-    let _answered = recv_until(&mut ws, 10, |v| v.get("call_answered").is_some()).await;
+    let _answered = recv_until(&mut ws, 10, |v| {
+        v.get("call_answered").is_some() || v["event_type"].as_str() == Some("call_answered")
+    })
+    .await;
 
     // Check task count during call (should have increased)
     let during_count = active_task_count();

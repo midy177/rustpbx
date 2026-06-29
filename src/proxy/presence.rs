@@ -64,12 +64,15 @@ struct RpidActivities {
 struct RpidEmpty {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(untagged)]
 #[derive(Default)]
 pub enum PresenceStatus {
-    Available,
+    Idle,
     Busy,
-    Away,
+    Ringing,
+    Wrapup,
+    Dnd,
+    Away(String),
     #[default]
     Offline,
 }
@@ -77,9 +80,18 @@ pub enum PresenceStatus {
 impl std::fmt::Display for PresenceStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PresenceStatus::Available => write!(f, "available"),
+            PresenceStatus::Idle => write!(f, "idle"),
             PresenceStatus::Busy => write!(f, "busy"),
-            PresenceStatus::Away => write!(f, "away"),
+            PresenceStatus::Ringing => write!(f, "ringing"),
+            PresenceStatus::Wrapup => write!(f, "wrapup"),
+            PresenceStatus::Dnd => write!(f, "dnd"),
+            PresenceStatus::Away(detail) => {
+                if detail.is_empty() {
+                    write!(f, "away")
+                } else {
+                    write!(f, "{}", detail)
+                }
+            }
             PresenceStatus::Offline => write!(f, "offline"),
         }
     }
@@ -164,16 +176,27 @@ impl PresenceManager {
         *lock = Some(tx);
     }
 
+    /// Drop the notify sender so the dispatcher task observes channel-closed.
+    /// Called from `PresenceModule::on_stop` to ensure deterministic shutdown.
+    pub fn clear_notify_tx(&self) {
+        let mut lock = self.notify_tx.write().unwrap();
+        *lock = None;
+    }
+
     pub async fn load_from_db(&self) -> Result<()> {
         if let Some(db) = &self.database {
             let states = presence::Entity::find().all(db).await?;
             let mut map = self.states.write().unwrap();
             for s in states {
                 let status = match s.status.as_str() {
-                    "available" => PresenceStatus::Available,
+                    "idle" | "available" => PresenceStatus::Idle,
                     "busy" => PresenceStatus::Busy,
-                    "away" => PresenceStatus::Away,
-                    _ => PresenceStatus::Offline,
+                    "ringing" => PresenceStatus::Ringing,
+                    "wrapup" => PresenceStatus::Wrapup,
+                    "away" => PresenceStatus::Away(String::new()),
+                    "dnd" => PresenceStatus::Dnd,
+                    "offline" => PresenceStatus::Offline,
+                    other => PresenceStatus::Away(other.to_string()),
                 };
                 map.insert(
                     s.identity,
@@ -269,6 +292,13 @@ impl PresenceManager {
         *lock = Some(tx);
     }
 
+    /// Drop the MWI sender so the dispatch task observes channel-closed.
+    /// Called from `PresenceModule::on_stop` to ensure deterministic shutdown.
+    pub fn clear_mwi_tx(&self) {
+        let mut lock = self.mwi_tx.write().unwrap();
+        *lock = None;
+    }
+
     /// Add (or refresh) an MWI subscription for `extension`.
     pub fn add_mwi_subscriber(&self, extension: &str, sub: MwiSubscriber) {
         let mut map = self.mwi_subscribers.write().unwrap();
@@ -332,18 +362,43 @@ impl PresenceManager {
                         status = %current.status,
                         "Presence: Registered"
                     );
-                    if current.status == PresenceStatus::Offline {
-                        self.update_state(
-                            &user,
-                            PresenceState {
-                                status: PresenceStatus::Available,
-                                last_updated: chrono::Utc::now().timestamp(),
-                                ..current
-                            },
-                            source,
-                        )
-                        .await;
-                    }
+
+                    // Extract X-CC-Presence from custom REGISTER headers,
+                    // sent by cc-phone's JsSIP UA to set presence via SIP.
+                    let header_status = loc.headers.as_ref().and_then(|headers| {
+                        for h in headers {
+                            if let rsipstack::sip::Header::Other(name, val) = h {
+                                if name.eq_ignore_ascii_case("X-CC-Presence") {
+                                    return Some(val.as_str());
+                                }
+                            }
+                        }
+                        None
+                    });
+
+                    let new_status = match header_status {
+                        Some("online" | "available" | "idle") => PresenceStatus::Idle,
+                        Some(s @ ("away" | "break" | "lunch" | "training" | "meeting" | "personal")) => PresenceStatus::Away(s.to_string()),
+                        Some("dnd") => PresenceStatus::Dnd,
+                        Some("busy") => PresenceStatus::Busy,
+                        Some("ringing") => PresenceStatus::Ringing,
+                        Some("wrapup") => PresenceStatus::Wrapup,
+                        Some("offline" | "closed") => PresenceStatus::Offline,
+                        Some(s) => PresenceStatus::Away(s.to_string()),
+                        None if current.status == PresenceStatus::Offline => PresenceStatus::Idle,
+                        None => return,
+                    };
+
+                    self.update_state(
+                        &user,
+                        PresenceState {
+                            status: new_status,
+                            last_updated: chrono::Utc::now().timestamp(),
+                            ..current
+                        },
+                        source,
+                    )
+                    .await;
                 }
             }
             LocatorEvent::Unregistered(loc) => {
@@ -409,14 +464,25 @@ impl ProxyModule for PresenceModule {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
         self.manager.set_notify_tx(tx);
 
+        // All background tasks below are tied to a child of the server's
+        // cancel token so they shut down deterministically on `on_stop`.
+        let cancel = self.server.cancel_token.child_token();
+
         // Spawn listener for notification requests (e.g. from UI or PUBLISH)
         let module_clone = self.clone();
+        let cancel_notify = cancel.clone();
         crate::utils::spawn(async move {
-            while let Some(identity) = rx.recv().await {
-                let state = module_clone.manager.get_state(&identity);
-                let subscribers = module_clone.manager.get_subscribers(&identity);
-                for sub in subscribers {
-                    let _ = module_clone.send_notify(&identity, &sub, &state).await;
+            loop {
+                tokio::select! {
+                    _ = cancel_notify.cancelled() => break,
+                    identity = rx.recv() => {
+                        let Some(identity) = identity else { break };
+                        let state = module_clone.manager.get_state(&identity);
+                        let subscribers = module_clone.manager.get_subscribers(&identity);
+                        for sub in subscribers {
+                            let _ = module_clone.send_notify(&identity, &sub, &state).await;
+                        }
+                    }
                 }
             }
         });
@@ -425,40 +491,70 @@ impl ProxyModule for PresenceModule {
         let (mwi_tx, mut mwi_rx) = tokio::sync::mpsc::channel::<MwiTrigger>(100);
         self.manager.set_mwi_tx(mwi_tx);
         let mwi_module = self.clone();
+        let cancel_mwi = cancel.clone();
         crate::utils::spawn(async move {
-            while let Some(trigger) = mwi_rx.recv().await {
-                let subscribers = mwi_module.manager.get_mwi_subscribers(&trigger.extension);
-                for sub in subscribers {
-                    let _ = mwi_module.send_mwi_notify(&trigger, &sub).await;
+            loop {
+                tokio::select! {
+                    _ = cancel_mwi.cancelled() => break,
+                    trigger = mwi_rx.recv() => {
+                        let Some(trigger) = trigger else { break };
+                        let subscribers = mwi_module.manager.get_mwi_subscribers(&trigger.extension);
+                        for sub in subscribers {
+                            let _ = mwi_module.send_mwi_notify(&trigger, &sub).await;
+                        }
+                    }
                 }
             }
         });
 
         // Spawn listener for locator events
         let manager = self.manager.clone();
+        let cancel_locator = cancel.clone();
         if let Some(mut rx) = self.server.locator_events.as_ref().map(|tx| tx.subscribe()) {
             crate::utils::spawn(async move {
                 let source = EventSource::Local;
-                while let Ok(event) = rx.recv().await {
-                    manager.handle_locator_event(event, &source).await;
+                loop {
+                    tokio::select! {
+                        _ = cancel_locator.cancelled() => break,
+                        res = rx.recv() => {
+                            if let Ok(event) = res {
+                                manager.handle_locator_event(event, &source).await;
+                            } else {
+                                // channel closed; exit gracefully
+                                break;
+                            }
+                        }
+                    }
                 }
             });
         }
 
         // Spawn background cleanup for expired subscriptions (presence + MWI)
         let manager_cleanup = self.manager.clone();
+        let cancel_cleanup = cancel.clone();
         crate::utils::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                manager_cleanup.cleanup_expired();
-                manager_cleanup.cleanup_expired_mwi();
+                tokio::select! {
+                    _ = cancel_cleanup.cancelled() => break,
+                    _ = interval.tick() => {
+                        manager_cleanup.cleanup_expired();
+                        manager_cleanup.cleanup_expired_mwi();
+                    }
+                }
             }
         });
 
         Ok(())
     }
     async fn on_stop(&self) -> Result<()> {
+        // Cancelling the server token's children signals every spawned task
+        // above to exit promptly. We also clear the channel senders held by
+        // the manager so receivers observe channel-closed even without the
+        // select! arms firing.
+        self.manager.clear_notify_tx();
+        self.manager.clear_mwi_tx();
         Ok(())
     }
 
@@ -582,17 +678,24 @@ impl PresenceModule {
 
             for tuple in &pidf.tuples {
                 if tuple.status.basic == "open" {
-                    status = PresenceStatus::Available;
+                    status = PresenceStatus::Idle;
 
                     // Try to refine status from RPID activities
                     if let Some(activities) = &tuple.activities {
                         if activities.busy.is_some() || activities.on_the_phone.is_some() {
                             status = PresenceStatus::Busy;
                         } else if activities.away.is_some() {
-                            status = PresenceStatus::Away;
+                            status = PresenceStatus::Away(tuple.note.clone().unwrap_or_default());
                         }
                     }
+                    // Allow clients to signal call-related states via the
+                    // PIDF <note> element (e.g. "ringing", "wrapup").
                     if let Some(note) = &tuple.note {
+                        match note.to_ascii_lowercase().as_str() {
+                            "ringing" => status = PresenceStatus::Ringing,
+                            "wrapup" | "wrap-up" | "wrap_up" => status = PresenceStatus::Wrapup,
+                            _ => {}
+                        }
                         activity_note = Some(note.clone());
                     }
                     break;
@@ -601,12 +704,17 @@ impl PresenceModule {
 
             if status == PresenceStatus::Offline && pidf.tuples.is_empty() {
                 // Fallback to simple string check if XML parsed but no tuples found
-                if body.contains("busy") {
+                let lower = body.to_ascii_lowercase();
+                if lower.contains("ringing") {
+                    status = PresenceStatus::Ringing;
+                } else if lower.contains("wrapup") || lower.contains("wrap-up") {
+                    status = PresenceStatus::Wrapup;
+                } else if lower.contains("busy") {
                     status = PresenceStatus::Busy;
-                } else if body.contains("away") {
-                    status = PresenceStatus::Away;
-                } else if body.contains("available") || body.contains("open") {
-                    status = PresenceStatus::Available;
+                } else if lower.contains("away") {
+                    status = PresenceStatus::Away(String::new());
+                } else if lower.contains("idle") || lower.contains("available") || lower.contains("open") {
+                    status = PresenceStatus::Idle;
                 }
             }
 
@@ -618,14 +726,19 @@ impl PresenceModule {
             }
         } else {
             // Fallback for non-compliant or simplified clients
-            if body.contains("busy") {
+            let lower = body.to_ascii_lowercase();
+            if lower.contains("ringing") {
+                current.status = PresenceStatus::Ringing;
+            } else if lower.contains("wrapup") || lower.contains("wrap-up") {
+                current.status = PresenceStatus::Wrapup;
+            } else if lower.contains("busy") {
                 current.status = PresenceStatus::Busy;
-            } else if body.contains("away") {
-                current.status = PresenceStatus::Away;
-            } else if body.contains("offline") {
+            } else if lower.contains("away") {
+                current.status = PresenceStatus::Away(String::new());
+            } else if lower.contains("offline") {
                 current.status = PresenceStatus::Offline;
             } else {
-                current.status = PresenceStatus::Available;
+                current.status = PresenceStatus::Idle;
             }
         }
 
@@ -655,9 +768,16 @@ impl PresenceModule {
         );
 
         // Build PIDF-XML (RFC 3863)
+        // Ringing/Wrapup/Busy are active (on-a-call) states — represented as
+        // <basic>open</basic> per RFC 3863, with RPID activities for detail.
         let basic_status = if matches!(
             state.status,
-            PresenceStatus::Available | PresenceStatus::Busy | PresenceStatus::Away
+            PresenceStatus::Idle
+                | PresenceStatus::Busy
+                | PresenceStatus::Ringing
+                | PresenceStatus::Wrapup
+                | PresenceStatus::Away(_)
+                | PresenceStatus::Dnd
         ) {
             "open"
         } else {
@@ -682,11 +802,15 @@ impl PresenceModule {
                     .or_else(|| Some(state.status.to_string())),
                 contact: Some(format!("sip:{}@{}", identity, domain)),
                 activities: match state.status {
-                    PresenceStatus::Busy => Some(RpidActivities {
+                    PresenceStatus::Busy | PresenceStatus::Dnd => Some(RpidActivities {
                         busy: Some(RpidEmpty {}),
                         ..Default::default()
                     }),
-                    PresenceStatus::Away => Some(RpidActivities {
+                    PresenceStatus::Ringing | PresenceStatus::Wrapup => Some(RpidActivities {
+                        on_the_phone: Some(RpidEmpty {}),
+                        ..Default::default()
+                    }),
+                    PresenceStatus::Away(_) => Some(RpidActivities {
                         away: Some(RpidEmpty {}),
                         ..Default::default()
                     }),
@@ -873,12 +997,12 @@ mod tests {
 
         // Update state manually
         let mut state = manager.get_state(ext);
-        state.status = PresenceStatus::Available;
+        state.status = PresenceStatus::Idle;
         state.note = Some("On line".to_string());
         manager.update_state(ext, state, &EventSource::Local).await;
 
         let updated = manager.get_state(ext);
-        assert_eq!(updated.status, PresenceStatus::Available);
+        assert_eq!(updated.status, PresenceStatus::Idle);
         assert_eq!(updated.note, Some("On line".to_string()));
     }
 
@@ -897,7 +1021,7 @@ mod tests {
         manager
             .handle_locator_event(LocatorEvent::Registered(loc.clone()), &EventSource::Local)
             .await;
-        assert_eq!(manager.get_state(ext).status, PresenceStatus::Available);
+        assert_eq!(manager.get_state(ext).status, PresenceStatus::Idle);
 
         // Test unregistration
         manager

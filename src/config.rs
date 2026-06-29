@@ -125,71 +125,48 @@ pub enum RecordingType {
     S3,
 }
 
-fn is_default_recording_type(recording_type: &RecordingType) -> bool {
-    *recording_type == RecordingType::Local
-}
-
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case")]
 pub struct RecordingPolicy {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(
-        default,
-        rename = "type",
-        skip_serializing_if = "is_default_recording_type"
-    )]
-    pub recording_type: RecordingType,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled: Option<bool>,
+    #[serde(rename = "type")]
+    pub recording_type: Option<RecordingType>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub directions: Vec<RecordingDirection>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub caller_allow: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub caller_deny: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub callee_allow: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub callee_deny: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename_pattern: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samplerate: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptime: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<crate::storage::S3Vendor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// When true, always use the legacy WAV file recorder for media capture
     /// even if SipFlow backend is available. SipFlow will capture SIP
     /// signalling only (no RTP). Media upload is handled by the
     /// `[recording]` upload path, not `[sipflow.upload]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_file: Option<bool>,
 }
 
 impl RecordingPolicy {
     pub fn new_recording_config(&self) -> CallRecordingConfig {
         crate::call::CallRecordingConfig {
-            enabled: self.enabled,
+            enabled: self.enabled.unwrap_or(false),
             auto_start: self.auto_start.unwrap_or(true),
             force_file: self.force_file.unwrap_or(false),
             option: None,
@@ -205,7 +182,7 @@ impl RecordingPolicy {
     }
 
     pub fn uploads_recording(&self) -> bool {
-        self.enabled && matches!(self.recording_type, RecordingType::Http | RecordingType::S3)
+        self.enabled.unwrap_or(false)
     }
 
     pub fn ensure_defaults(&mut self) -> bool {
@@ -223,7 +200,7 @@ impl RecordingPolicy {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_config_http_addr")]
     pub http_addr: String,
@@ -425,6 +402,21 @@ pub enum UserBackendConfig {
         request_uri_field: Option<String>,
         headers: Option<HashMap<String, String>>,
         sip_headers: Option<Vec<String>>,
+        /// If set, enables one-shot token auth: when the SIP request carries
+        /// this header, the token is forwarded to the HTTP service for
+        /// immediate validation (skipping the 401/407 Digest challenge).
+        token_header: Option<String>,
+        /// HTTP request timeout in milliseconds (applies to both token auth
+        /// and Digest password lookup). Default: 5000.
+        http_timeout_ms: Option<u64>,
+        /// Number of retries on HTTP failure. Default: 1.
+        http_retry_count: Option<u32>,
+        /// Delay between retries in milliseconds. Default: 500.
+        http_retry_delay_ms: Option<u64>,
+        /// Token cache TTL in seconds. 0 = disabled. Default: 0.
+        token_cache_ttl_secs: Option<u64>,
+        /// Maximum token cache entries (LRU eviction). Default: 10000.
+        token_cache_size: Option<usize>,
     },
     Plain {
         path: String,
@@ -540,11 +532,11 @@ pub enum SipFlowSubdirs {
 /// Storage engine selection for the Local sipflow backend.
 #[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 pub enum SipFlowEngine {
-    /// Use FlowDB LSM-tree engine (default).
-    #[default]
+    /// Use FlowDB LSM-tree engine.
     #[serde(rename = "flowdb")]
     FlowDb,
-    /// Use the legacy SQLite + raw-file engine.
+    /// Use SQLite + raw-file engine (default).
+    #[default]
     #[serde(rename = "sqlite")]
     Sqlite,
 }
@@ -601,7 +593,7 @@ pub enum SipFlowConfig {
         flush_interval_secs: u64,
         #[serde(default = "default_sipflow_id_cache_size")]
         id_cache_size: usize,
-        /// Storage engine: "flowdb" (default) or "sqlite".
+        /// Storage engine: "flowdb" or "sqlite" (default).
         #[serde(default)]
         engine: SipFlowEngine,
         /// TTL in seconds for FlowDB records (optional). When set,
@@ -632,11 +624,11 @@ pub enum SipFlowConfig {
 }
 
 fn default_sipflow_flush_count() -> usize {
-    1000
+    0
 }
 
 fn default_sipflow_flush_interval() -> u64 {
-    5
+    0
 }
 
 fn default_sipflow_timeout() -> u64 {
@@ -717,6 +709,35 @@ pub struct LocatorWebhookConfig {
     pub events: Vec<String>,
     pub headers: Option<HashMap<String, String>>,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JwtAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub secret: String,
+    #[serde(default = "default_jwt_user_id_claim")]
+    pub user_id_claim: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_jwt_sip_header")]
+    pub sip_header_name: String,
+    #[serde(default)]
+    pub check_local_user: bool,
+    #[serde(default = "default_jwt_ws_token_param")]
+    pub ws_token_param: String,
+}
+
+fn default_jwt_user_id_claim() -> String {
+    "userId".to_string()
+}
+fn default_jwt_sip_header() -> String {
+    "X-Auth-Token".to_string()
+}
+fn default_jwt_ws_token_param() -> String {
+    "token".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -840,6 +861,8 @@ pub struct ProxyConfig {
     pub contact_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc_cname: Option<String>,
+    #[serde(default)]
+    pub jwt_auth: Option<JwtAuthConfig>,
 }
 
 /// Emergency number routing configuration.
@@ -985,7 +1008,7 @@ pub enum RouteResult {
     Abort(StatusCode, Option<String>),
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AmiConfig {
     pub allows: Option<Vec<String>>,
 }
@@ -1147,6 +1170,7 @@ impl Default for ProxyConfig {
                 "auth".to_string(),
                 "registrar".to_string(),
                 "call".to_string(),
+                "presence".to_string(),
             ]),
             useragent: default_useragent(),
             callid_suffix: default_callid_suffix(),
@@ -1214,6 +1238,7 @@ impl Default for ProxyConfig {
             emergency: None,
             contact_username: None,
             rtc_cname: None,
+            jwt_auth: None,
         }
     }
 }
@@ -1276,15 +1301,6 @@ impl Default for Config {
     }
 }
 
-impl Clone for Config {
-    fn clone(&self) -> Self {
-        // This is a bit expensive but Config is not cloned often in hot paths
-        // and implementing Clone manually for all nested structs is tedious
-        let s = toml::to_string(self).unwrap();
-        toml::from_str(&s).unwrap()
-    }
-}
-
 impl Config {
     pub fn load(path: &str) -> Result<Self, Error> {
         let mut config: Self = toml::from_str(
@@ -1338,11 +1354,19 @@ impl Config {
 
     /// Returns the configured static files HTTP path prefix.
     /// Defaults to "/static" when not configured.
+    #[cfg(feature = "console")]
     pub fn static_path(&self) -> String {
         self.console
             .as_ref()
             .and_then(|c| c.static_path.clone())
             .unwrap_or_else(|| "/static".to_string())
+    }
+
+    /// Returns the configured static files HTTP path prefix.
+    /// Defaults to "/static" when the console feature is not compiled.
+    #[cfg(not(feature = "console"))]
+    pub fn static_path(&self) -> String {
+        "/static".to_string()
     }
 
     /// Returns the wholesale bills directory.
@@ -1505,5 +1529,42 @@ mod tests {
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: ClusterConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.peers.is_empty());
+    }
+
+    /// Regression: `Config::clone` used to round-trip through TOML which is
+    /// expensive (called on every server bootstrap and config reload). The
+    /// derive(d Clone implementation must produce a deeply-equal copy while
+    /// avoiding the serialization hop. We assert equality on a representative
+    /// field set covering primitives, Vec, nested config and Option types.
+    #[test]
+    fn test_config_clone_preserves_all_fields() {
+        let mut original = Config::default();
+        original.http_addr = "127.0.0.1:8080".to_string();
+        original.http_gzip = true;
+        original.http_access_skip_paths = vec!["/health".to_string(), "/metrics".to_string()];
+        original.proxy.addr = "127.0.0.1:5060".to_string();
+        original.proxy.useragent = Some("TestPBX/1.0".to_string());
+        original.database_url = "sqlite://test.db".to_string();
+        original.demo_mode = true;
+        original.ami = Some(AmiConfig {
+            allows: Some(vec!["10.0.0.0/8".to_string()]),
+        });
+        original.recording = Some(RecordingPolicy::default());
+
+        let cloned = original.clone();
+
+        // Equality is intentionally checked via TOML round-trip serialization
+        // (not PartialEq, which is not derived) so we exercise the same
+        // surface the previous implementation relied on, but at clone time we
+        // no longer pay that cost.
+        let original_toml = toml::to_string(&original).unwrap();
+        let cloned_toml = toml::to_string(&cloned).unwrap();
+        assert_eq!(original_toml, cloned_toml, "Config::clone lost data");
+
+        // Mutating the clone must not bleed into the original (deep copy).
+        let mut cloned2 = original.clone();
+        cloned2.http_addr = "0.0.0.0:9999".to_string();
+        assert_ne!(original.http_addr, cloned2.http_addr);
+        assert_eq!(original.http_addr, "127.0.0.1:8080");
     }
 }

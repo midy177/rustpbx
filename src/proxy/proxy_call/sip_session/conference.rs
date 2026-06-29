@@ -9,8 +9,14 @@ use tracing::{debug, info, warn};
 
 impl SipSession {
     pub(super) async fn setup_conference_mixer(&mut self) {
-        let conf_id_str = format!("conf-{}", self.id.0);
-        let conf_id = crate::call::runtime::ConferenceId::from(conf_id_str.as_str());
+        self.join_conference_mixer(&format!("conf-{}", self.id.0))
+            .await;
+    }
+
+    /// Join all active legs into the given conference room.
+    /// Creates the room if it does not already exist.
+    pub(super) async fn join_conference_mixer(&mut self, conf_id_str: &str) {
+        let conf_id = crate::call::runtime::ConferenceId::from(conf_id_str);
 
         if self
             .server
@@ -42,7 +48,7 @@ impl SipSession {
             .collect();
 
         for (leg_id, peer) in active_legs {
-            let participant_leg = LegId::new(format!("{}-{}", self.id.0, leg_id));
+            let participant_leg = self.participant_leg(&leg_id);
 
             if let Err(e) = self
                 .server
@@ -57,8 +63,44 @@ impl SipSession {
             info!(%leg_id, "Added participant to conference");
 
             if let Some(peer) = peer {
+                let fallback_pc = if leg_id.0 == "caller" {
+                    self.media
+                        .media_bridge
+                        .as_ref()
+                        .map(|b| b.caller_pc().clone())
+                } else if leg_id.0 == "callee" {
+                    self.media
+                        .media_bridge
+                        .as_ref()
+                        .map(|b| b.callee_pc().clone())
+                } else {
+                    None
+                };
+
+                let fallback_sender = if leg_id.0 == "caller" {
+                    if let Some(b) = self.media.media_bridge.as_ref() {
+                        b.get_caller_sender().await
+                    } else {
+                        None
+                    }
+                } else if leg_id.0 == "callee" {
+                    if let Some(b) = self.media.media_bridge.as_ref() {
+                        b.get_callee_sender().await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 if let Err(e) = self
-                    .start_conference_media_bridge_for_peer(&conf_id_str, &leg_id, &peer)
+                    .start_conference_media_bridge_for_peer(
+                        &conf_id_str,
+                        &leg_id,
+                        &peer,
+                        fallback_pc,
+                        fallback_sender,
+                    )
                     .await
                 {
                     warn!(%leg_id, "Failed to start conference media bridge for dynamic leg: {}", e);
@@ -72,15 +114,6 @@ impl SipSession {
                 }
             }
         }
-
-        self.emit_dn_event(
-            "PARTYCHANGED",
-            Some(self.context.session_id.clone()),
-            Some(&self.context.original_callee),
-            Some(&self.context.original_caller),
-            Some(&self.context.original_callee),
-            None,
-        );
     }
 
     pub(super) async fn start_conference_media_bridge_for_peer(
@@ -88,6 +121,8 @@ impl SipSession {
         conf_id: &str,
         leg_id: &LegId,
         peer: &Arc<dyn MediaPeer>,
+        fallback_pc: Option<rustrtc::PeerConnection>,
+        fallback_sender: Option<rustrtc::media::SampleStreamSource>,
     ) -> Result<crate::call::runtime::ConferenceBridgeHandle> {
         use rustrtc::media::MediaSample;
 
@@ -101,7 +136,11 @@ impl SipSession {
             }
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
+        if audio_sender.is_none() {
+            audio_sender = fallback_sender;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
 
         if let Some(sender) = audio_sender {
             info!(
@@ -111,32 +150,8 @@ impl SipSession {
                 "Using existing track sender for conference media bridge"
             );
 
-            let cancel_token = self.cancel_token.child_token();
-            let forwarder_handle = crate::utils::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel_token.cancelled() => {
-                            break;
-                        }
-                        sample = rx.recv() => {
-                            match sample {
-                                Some(s) => {
-                                    if sender.send(s).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-            });
-            self.legs
-                .tasks
-                .entry(leg_id.clone())
-                .or_default()
-                .push(forwarder_handle);
+            let cancel = self.cancel_token.child_token();
+            self.spawn_forwarder(leg_id, cancel, sender, rx);
         } else {
             warn!(
                 session_id = %self.id,
@@ -147,7 +162,7 @@ impl SipSession {
         }
 
         let audio_receiver = self
-            .create_audio_receiver_from_peer(peer)
+            .create_audio_receiver_from_peer(peer, fallback_pc)
             .await
             .map_err(|e| anyhow!("Failed to create audio receiver for dynamic leg: {}", e))?;
 
@@ -176,9 +191,9 @@ impl SipSession {
             self.stop_caller_ingress_monitor().await;
         }
         let (peer, track_id) = if is_callee {
-            (self.callee_peer().clone(), Self::CALLEE_TRACK_ID)
+            (self.callee_peer().cloned().ok_or_else(|| anyhow!("Missing callee peer"))?, Self::CALLEE_TRACK_ID)
         } else {
-            (self.caller_peer().clone(), Self::CALLER_TRACK_ID)
+            (self.caller_peer().cloned().ok_or_else(|| anyhow!("Missing caller peer"))?, Self::CALLER_TRACK_ID)
         };
 
         let (audio_sender, track, _feedback_rx) = sample_track(MediaKind::Audio, 100);
@@ -253,37 +268,12 @@ impl SipSession {
             "Conference sample track added to existing peer connection"
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
-
-        let cancel_token = self.cancel_token.child_token();
-        let forwarder_handle = crate::utils::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_token.cancelled() => {
-                        break;
-                    }
-                    sample = rx.recv() => {
-                        match sample {
-                            Some(s) => {
-                                if audio_sender.send(s).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-        });
-        self.legs
-            .tasks
-            .entry(leg_id.clone())
-            .or_default()
-            .push(forwarder_handle);
+        let (tx, rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
+        let cancel = self.cancel_token.child_token();
+        self.spawn_forwarder(leg_id, cancel, audio_sender, rx);
 
         let audio_receiver = if is_callee {
-            self.create_audio_receiver_from_peer(&peer).await
+            self.create_audio_receiver_from_peer(&peer, None).await
         } else {
             self.create_audio_receiver().await
         }
@@ -302,66 +292,25 @@ impl SipSession {
     pub(super) async fn create_audio_receiver(
         &self,
     ) -> Result<Box<dyn crate::call::runtime::conference_media_bridge::AudioReceiver>> {
-        let mut pc = None;
-        for _ in 0..100 {
-            if let Some(found_pc) = self.get_caller_peer_connection().await {
-                pc = Some(found_pc);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let pc = pc.ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
-
-        let decoder = self
-            .create_audio_decoder()
-            .ok_or_else(|| anyhow!("Failed to create audio decoder"))?;
-
-        Ok(Box::new(
-            crate::proxy::proxy_call::sip_session::PeerConnectionAudioReceiver::new(pc, decoder),
-        ))
+        let Some(peer) = self.caller_peer() else {
+            return Err(anyhow!("No caller peer for conference input"));
+        };
+        let pc = Self::wait_for_peer_connection(peer, 100)
+            .await
+            .ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
+        self.build_audio_receiver(pc)
     }
 
     pub(super) async fn create_audio_receiver_from_peer(
         &self,
         peer: &Arc<dyn MediaPeer>,
+        fallback_pc: Option<rustrtc::PeerConnection>,
     ) -> Result<Box<dyn crate::call::runtime::conference_media_bridge::AudioReceiver>> {
-        let mut pc = None;
-        for _ in 0..150 {
-            let tracks = peer.get_tracks().await;
-            for t in &tracks {
-                let guard = t.lock().await;
-                if let Some(found_pc) = guard.get_peer_connection().await {
-                    pc = Some(found_pc);
-                    break;
-                }
-            }
-            if pc.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let pc = pc.ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
-
-        let decoder = self
-            .create_audio_decoder()
-            .ok_or_else(|| anyhow!("Failed to create audio decoder"))?;
-
-        Ok(Box::new(
-            crate::proxy::proxy_call::sip_session::PeerConnectionAudioReceiver::new(pc, decoder),
-        ))
-    }
-
-    pub(super) async fn get_caller_peer_connection(&self) -> Option<rustrtc::PeerConnection> {
-        let tracks = self.caller_peer().get_tracks().await;
-        for t in tracks.iter() {
-            let guard = t.lock().await;
-            if let Some(pc) = guard.get_peer_connection().await {
-                return Some(pc);
-            }
-        }
-        None
+        let pc = Self::wait_for_peer_connection(peer, 150)
+            .await
+            .or(fallback_pc)
+            .ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
+        self.build_audio_receiver(pc)
     }
 
     pub(super) fn leg_negotiated_codec(&self, leg_id: &LegId) -> audio_codec::CodecType {
@@ -445,17 +394,14 @@ impl SipSession {
     ) -> Result<()> {
         info!(%conf_id, %leg_id, "Adding leg to conference");
 
-        if !self.legs.contains_key(&leg_id) {
-            return Err(anyhow!("Leg not found: {}", leg_id));
-        }
+        self.require_leg(&leg_id)?;
 
         let peer = self.legs.peers.get(&leg_id).cloned();
         let bridge_result = if let Some(peer) = peer {
-            self.start_conference_media_bridge_for_peer(&conf_id, &leg_id, &peer)
+            self.start_conference_media_bridge_for_peer(&conf_id, &leg_id, &peer, None, None)
                 .await
         } else {
-            self.start_conference_media_bridge(&conf_id, &leg_id)
-                .await
+            self.start_conference_media_bridge(&conf_id, &leg_id).await
         };
 
         match bridge_result {
@@ -463,14 +409,6 @@ impl SipSession {
                 info!(%conf_id, %leg_id, "Conference media bridge started for added leg");
                 self.legs
                     .set_conference_bridge_handle(leg_id.clone(), handle);
-                self.emit_dn_event(
-                    "PARTYADDED",
-                    Some(self.context.session_id.clone()),
-                    Some(&leg_id.to_string()),
-                    Some(&self.context.original_caller),
-                    Some(&self.context.original_callee),
-                    None,
-                );
                 Ok(())
             }
             Err(e) => {
@@ -503,15 +441,6 @@ impl SipSession {
             .remove_participant(&conf_id.into(), &leg_id)
             .await?;
 
-        self.emit_dn_event(
-            "PARTYDELETED",
-            Some(self.context.session_id.clone()),
-            Some(&leg_id.to_string()),
-            Some(&self.context.original_caller),
-            Some(&self.context.original_callee),
-            None,
-        );
-
         Ok(())
     }
 
@@ -520,14 +449,7 @@ impl SipSession {
         conf_id: String,
         leg_id: LegId,
     ) -> Result<()> {
-        info!(%conf_id, %leg_id, "Muting leg in conference");
-
-        self.server
-            .conference_manager
-            .mute_participant(&conf_id.into(), &leg_id)
-            .await?;
-
-        Ok(())
+        self.set_conference_mute_state(conf_id, leg_id, true).await
     }
 
     pub(super) async fn handle_conference_unmute(
@@ -535,13 +457,29 @@ impl SipSession {
         conf_id: String,
         leg_id: LegId,
     ) -> Result<()> {
-        info!(%conf_id, %leg_id, "Unmuting leg in conference");
+        self.set_conference_mute_state(conf_id, leg_id, false).await
+    }
 
-        self.server
-            .conference_manager
-            .unmute_participant(&conf_id.into(), &leg_id)
-            .await?;
-
+    async fn set_conference_mute_state(
+        &mut self,
+        conf_id: String,
+        leg_id: LegId,
+        mute: bool,
+    ) -> Result<()> {
+        let action = if mute { "Muting" } else { "Unmuting" };
+        info!(%conf_id, %leg_id, "{} leg in conference", action);
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+        if mute {
+            self.server
+                .conference_manager
+                .mute_participant(&conf_id_obj, &leg_id)
+                .await?;
+        } else {
+            self.server
+                .conference_manager
+                .unmute_participant(&conf_id_obj, &leg_id)
+                .await?;
+        }
         Ok(())
     }
 
@@ -628,10 +566,11 @@ impl SipSession {
             .ok_or_else(|| anyhow!("Conference {} not found", conf_id))
     }
 
-    pub(super) async fn handle_conference_list(
-        &self,
-    ) -> Vec<crate::call::runtime::ConferenceRoom> {
-        self.server.conference_manager.list_conferences_detail().await
+    pub(super) async fn handle_conference_list(&self) -> Vec<crate::call::runtime::ConferenceRoom> {
+        self.server
+            .conference_manager
+            .list_conferences_detail()
+            .await
     }
 
     pub(super) async fn handle_join_mixer(&mut self, mixer_id: String) -> Result<()> {
@@ -650,28 +589,12 @@ impl SipSession {
         }
 
         let participant_leg = LegId::new(format!("{}-callee", self.id.0));
-        match self
-            .start_conference_media_bridge(&mixer_id, &participant_leg)
-            .await
-        {
-            Ok(handle) => {
-                info!(
-                    session_id = %self.id,
-                    conf_id = %mixer_id,
-                    "Supervisor conference media bridge started"
-                );
-                self.conference_bridge.bridge_handle = Some(handle);
-                self.conference_bridge.conf_id = Some(mixer_id.clone());
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %self.id,
-                    conf_id = %mixer_id,
-                    error = %e,
-                    "Failed to start supervisor conference media bridge"
-                );
-            }
-        }
+        self.try_start_and_store_bridge(
+            &mixer_id,
+            &participant_leg,
+            "supervisor conference media bridge",
+        )
+        .await;
 
         Ok(())
     }

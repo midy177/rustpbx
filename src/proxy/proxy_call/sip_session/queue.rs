@@ -33,9 +33,7 @@ impl SipSession {
             return Ok(());
         }
 
-        let resolved_agents = self
-            .resolve_custom_targets(agents, plan.acd_policy.as_deref())
-            .await;
+        let resolved_agents = self.resolve_custom_targets(agents).await;
 
         let resolved_agents = if let Some(enricher) = &self.server.queue_location_enricher {
             let caller_headers: Vec<rsipstack::sip::Header> = self
@@ -252,6 +250,24 @@ impl SipSession {
     ) -> Result<(), CalleeError> {
         use crate::call::{FailureAction, QueueFallbackAction, TransferEndpoint};
 
+        // 1. Play final_destination_prompt before executing fallback action
+        if let Some(final_prompt) = plan
+            .voice_prompts
+            .as_ref()
+            .and_then(|p| p.final_destination_prompt.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            info!(file = %final_prompt, "Queue fallback: playing final destination prompt");
+            self.prepare_queue_playback_media().await;
+            if let Err(e) = self
+                .play_audio_file(final_prompt, true, "queue-final-prompt", false)
+                .await
+            {
+                warn!(error = %e, "Failed to play final destination prompt");
+            }
+        }
+
         let pre_action_audio: Option<String> =
             plan.failure_audio.clone().or_else(|| match &plan.fallback {
                 Some(QueueFallbackAction::Failure(FailureAction::PlayThenHangup {
@@ -287,24 +303,27 @@ impl SipSession {
                 ..
             })) => {
                 info!("Queue fallback - play then hangup");
-                Err((status_code.code(), status_code.text().to_string(), reason.clone()))
+                Err((
+                    status_code.code(),
+                    status_code.text().to_string(),
+                    reason.clone(),
+                ))
             }
             Some(QueueFallbackAction::Failure(FailureAction::Transfer(target))) => {
                 info!(target = ?target, "Queue fallback - transfer");
 
                 match target {
-                    TransferEndpoint::Uri(uri) => Box::pin(self.handle_blind_transfer(
-                        LegId::from("caller"),
-                        uri.clone(),
-                        callee_state_rx,
-                    ))
-                    .await
-                    .map_err(|e| {
-                        into_callee_err(
-                            &StatusCode::TemporarilyUnavailable,
-                            Some(format!("Transfer failed: {}", e)),
-                        )
-                    }),
+                    TransferEndpoint::Uri(uri) => {
+                        let realm = self.server.proxy_config.select_realm("");
+                        let normalized = crate::call::build_sip_uri(uri, &realm);
+                        Box::pin(self.handle_blind_transfer(
+                            LegId::from("caller"),
+                            normalized,
+                            callee_state_rx,
+                        ))
+                        .await
+                        .map_err(super::map_queue_xfer_err)
+                    }
                     TransferEndpoint::Queue(queue_name) => Box::pin(self.handle_queue_transfer(
                         LegId::from("caller"),
                         queue_name,
@@ -313,18 +332,33 @@ impl SipSession {
                         callee_state_rx,
                     ))
                     .await
-                    .map_err(|e| {
-                        into_callee_err(
-                            &StatusCode::TemporarilyUnavailable,
-                            Some(format!("Transfer failed: {}", e)),
-                        )
-                    }),
+                    .map_err(super::map_queue_xfer_err),
                     TransferEndpoint::Ivr(ivr_name) => {
                         info!(ivr = %ivr_name, "Queue fallback - transferring to IVR");
                         self.start_ivr_app(ivr_name).await.map_err(|e| {
                             into_callee_err(
                                 &StatusCode::ServerInternalError,
                                 Some(format!("Failed to start IVR: {}", e)),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                    TransferEndpoint::Voicemail(ext) => {
+                        info!(ext = %ext, "Queue fallback - transferring to voicemail");
+                        self.start_voicemail_app(ext).await.map_err(|e| {
+                            into_callee_err(
+                                &StatusCode::ServerInternalError,
+                                Some(format!("Failed to start voicemail: {}", e)),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                    TransferEndpoint::Conference(id) => {
+                        info!(conf_id = %id, "Queue fallback - transferring to conference");
+                        self.start_conference_app(id).await.map_err(|e| {
+                            into_callee_err(
+                                &StatusCode::ServerInternalError,
+                                Some(format!("Failed to start conference: {}", e)),
                             )
                         })?;
                         Ok(())
@@ -354,7 +388,11 @@ impl SipSession {
 
                     if let Some(registry) = self.server.agent_registry.clone() {
                         let skill_group_uri = format!("skill-group:{}", skill_group_id);
-                        let agents = registry.resolve_target(&skill_group_uri).await;
+                        // Use the _with_policy variant so skill-group scheduling
+                        // webhook events are emitted for this resolution.
+                        let agents = registry
+                            .resolve_target_with_policy(&skill_group_uri, None, &self.id.0)
+                            .await;
                         if !agents.is_empty() {
                             info!(agents = ?agents, "Resolved skill group to agents");
                             let target = agents[0].clone();
@@ -364,12 +402,7 @@ impl SipSession {
                                 callee_state_rx,
                             ))
                             .await
-                            .map_err(|e| {
-                                into_callee_err(
-                                    &StatusCode::TemporarilyUnavailable,
-                                    Some(format!("Transfer failed: {}", e)),
-                                )
-                            })
+                            .map_err(super::map_queue_xfer_err)
                         } else {
                             warn!(skill_group = %skill_group_id, "No agents found for this skill group");
                             Err(into_callee_err(

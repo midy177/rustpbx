@@ -111,10 +111,14 @@ pub async fn persist_call_record(
         transcript_language: Set(transcript_language.clone()),
         tags: Set(tags.clone()),
         leg_timeline: Set(leg_timeline_json),
-        metadata: Set(details
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_value(m).ok())),
+        metadata: Set({
+            let mut m = details.metadata.clone().unwrap_or_default();
+            if !record.sip_leg_roles.is_empty() {
+                let json = serde_json::to_string(&record.sip_leg_roles).unwrap_or_default();
+                m.insert("sip_leg_roles".to_string(), json);
+            }
+            serde_json::to_value(&m).ok()
+        }),
         created_at: Set(record.start_time),
         updated_at: Set(record.end_time),
         archived_at: Set(None),
@@ -227,6 +231,52 @@ pub fn extract_sip_username(input: &str) -> Option<String> {
         None
     } else {
         Some(candidate.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sip_username_full_uri() {
+        assert_eq!(
+            extract_sip_username("sip:alice@192.168.1.1:5060"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            extract_sip_username("sips:bob@example.com"),
+            Some("bob".to_string())
+        );
+        assert_eq!(
+            extract_sip_username("sip:+8613800138000@10.0.0.1"),
+            Some("+8613800138000".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_sip_username_plain_number() {
+        assert_eq!(extract_sip_username("1001"), Some("1001".to_string()));
+        assert_eq!(extract_sip_username("+8613800138000"), Some("+8613800138000".to_string()));
+    }
+
+    #[test]
+    fn extract_sip_username_tel_uri() {
+        assert_eq!(extract_sip_username("tel:12345"), Some("12345".to_string()));
+    }
+
+    #[test]
+    fn extract_sip_username_empty_and_whitespace() {
+        assert_eq!(extract_sip_username(""), None);
+        assert_eq!(extract_sip_username("   "), None);
+    }
+
+    #[test]
+    fn extract_sip_username_with_whitespace_trim() {
+        assert_eq!(
+            extract_sip_username("  sip:alice@example.com  "),
+            Some("alice".to_string())
+        );
     }
 }
 
@@ -453,10 +503,7 @@ impl MigrationTrait for Migration {
         }
 
         if !manager
-            .has_index(
-                "rustpbx_call_records",
-                "idx_rustpbx_call_records_extension",
-            )
+            .has_index("rustpbx_call_records", "idx_rustpbx_call_records_extension")
             .await?
         {
             manager

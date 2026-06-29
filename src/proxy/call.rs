@@ -2,7 +2,8 @@ use super::{ProxyAction, ProxyModule, server::SipServerRef};
 use crate::call::runtime::SessionId;
 use crate::call::{
     CalleeDisplayName, CalleeOfflineMarker, DialDirection, DialStrategy, Dialplan, DialplanFlow,
-    Location, MediaConfig, RouteInvite, RoutingState, SipUser, TransactionCookie, TrunkContext,
+    Location, MediaConfig, RouteInvite, RoutingState, SipUser, SourceAddress, TransactionCookie,
+    TrunkContext,
 };
 use crate::config::{ProxyConfig, RecordingPolicy, RouteResult};
 use crate::media::{Track, recorder::RecorderOption};
@@ -13,6 +14,7 @@ use crate::proxy::proxy_call::sip_session::SipSession;
 use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
     matcher::{RouteResourceLookup, match_invite},
+    source_addr_ip,
 };
 use crate::proxy::routing::{
     extract_from_user as routing_extract_from_user, extract_to_user as routing_extract_to_user,
@@ -188,10 +190,10 @@ impl RouteInvite for DefaultRouteInvite {
         option: InviteOption,
         origin: &rsipstack::sip::Request,
         direction: &DialDirection,
-        _cookie: &TransactionCookie,
+        cookie: &TransactionCookie,
     ) -> Result<RouteResult> {
         let (trunks_snapshot, routes_snapshot, source_trunk) =
-            self.build_context(origin, direction).await;
+            self.build_context(direction, cookie).await;
         if matches!(direction, DialDirection::Inbound)
             && let Some(source) = source_trunk.as_ref()
             && let Some(trunk_cfg) = trunks_snapshot.get(&source.name)
@@ -280,10 +282,10 @@ impl RouteInvite for DefaultRouteInvite {
         option: InviteOption,
         origin: &rsipstack::sip::Request,
         direction: &DialDirection,
-        _cookie: &TransactionCookie,
+        cookie: &TransactionCookie,
     ) -> Result<RouteResult> {
         let (trunks_snapshot, routes_snapshot, source_trunk) =
-            self.build_context(origin, direction).await;
+            self.build_context(direction, cookie).await;
 
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
         // Check debug routes before standard routing (preview mode)
@@ -324,8 +326,8 @@ impl RouteInvite for DefaultRouteInvite {
 impl DefaultRouteInvite {
     async fn build_context(
         &self,
-        origin: &rsipstack::sip::Request,
         direction: &DialDirection,
+        cookie: &TransactionCookie,
     ) -> (
         std::collections::HashMap<String, TrunkConfig>,
         Vec<RouteRule>,
@@ -334,7 +336,7 @@ impl DefaultRouteInvite {
         let trunks_snapshot = self.data_context.trunks_snapshot();
         let routes_snapshot = self.data_context.routes_snapshot();
         let source_trunk = self
-            .resolve_source_trunk(&trunks_snapshot, origin, direction)
+            .resolve_source_trunk(&trunks_snapshot, direction, cookie)
             .await;
         (trunks_snapshot, routes_snapshot, source_trunk)
     }
@@ -342,8 +344,8 @@ impl DefaultRouteInvite {
     async fn resolve_source_trunk(
         &self,
         trunks: &HashMap<String, TrunkConfig>,
-        origin: &rsipstack::sip::Request,
         direction: &DialDirection,
+        cookie: &TransactionCookie,
     ) -> Option<SourceTrunk> {
         if !matches!(direction, DialDirection::Inbound) {
             return None;
@@ -355,8 +357,14 @@ impl DefaultRouteInvite {
             return build_source_trunk(name.clone(), config, direction);
         }
 
-        let ip = super::routing::extract_via_ip(origin)?;
-        let name = self.data_context.find_trunk_by_ip(&ip).await?;
+        let source_addr = cookie.get_extension::<SourceAddress>()?;
+        let source_ip = source_addr_ip(&source_addr.0)?;
+        let name = self
+            .data_context
+            .find_trunks_by_ip(&source_ip)
+            .await
+            .into_iter()
+            .next()?;
         let config = trunks.get(&name)?;
         build_source_trunk(name, config, direction)
     }
@@ -608,8 +616,10 @@ impl CallModule {
         {
             match &config.endpoint {
                 crate::call::TransferEndpoint::Uri(uri) => {
+                    let realm = self.inner.config.select_realm("");
+                    let normalized = crate::call::build_sip_uri(uri, &realm);
                     let forwarded_uri =
-                        rsipstack::sip::Uri::try_from(uri.as_str()).map_err(|e| {
+                        rsipstack::sip::Uri::try_from(normalized.as_str()).map_err(|e| {
                             RouteError::from((
                                 anyhow!("invalid always-forwarding target '{}': {}", uri, e),
                                 Some(rsipstack::sip::StatusCode::ServerInternalError),
@@ -685,6 +695,50 @@ impl CallModule {
                         true,
                     ));
                 }
+                crate::call::TransferEndpoint::Voicemail(ext) => {
+                    let extension = ext.trim();
+                    if extension.is_empty() {
+                        return Err(RouteError::from((
+                            anyhow!("always-forwarding voicemail extension is empty"),
+                            Some(rsipstack::sip::StatusCode::ServerInternalError),
+                        )));
+                    }
+                    forced_pending_app = Some((
+                        "voicemail".to_string(),
+                        Some(serde_json::json!({ "extension": extension })),
+                        true,
+                    ));
+                }
+                crate::call::TransferEndpoint::Conference(id) => {
+                    let conf_id = id.trim();
+                    if conf_id.is_empty() {
+                        return Err(RouteError::from((
+                            anyhow!("always-forwarding conference id is empty"),
+                            Some(rsipstack::sip::StatusCode::ServerInternalError),
+                        )));
+                    }
+                    forced_pending_app = Some((
+                        "conference".to_string(),
+                        Some(serde_json::json!({ "id": conf_id })),
+                        true,
+                    ));
+                }
+            }
+        }
+
+        let mut source_trunk_lookup = None;
+        if matches!(direction, DialDirection::Inbound)
+            && let Some(source_addr) = cookie.get_extension::<SourceAddress>()
+            && let Some(source_ip) = source_addr_ip(&source_addr.0)
+        {
+            let source_trunks = self
+                .inner
+                .server
+                .data_context
+                .find_trunks_by_ip(&source_ip)
+                .await;
+            if !source_trunks.is_empty() {
+                source_trunk_lookup = Some((source_ip, source_trunks));
             }
         }
 
@@ -694,12 +748,23 @@ impl CallModule {
         {
             internal_lookup_empty = results.is_empty();
             if internal_lookup_empty {
-                warn!(
-                    callee_uri = %callee_uri,
-                    callee_realm = %callee_realm,
-                    caller_realm = ?caller.realm,
-                    "locator lookup returned empty results for same-realm callee"
-                );
+                if let Some((source_ip, source_trunks)) = source_trunk_lookup.as_ref() {
+                    debug!(
+                        callee_uri = %callee_uri,
+                        callee_realm = %callee_realm,
+                        caller_realm = ?caller.realm,
+                        %source_ip,
+                        source_trunks = ?source_trunks,
+                        "locator lookup returned empty results for same-realm callee; source trunk routing may handle call"
+                    );
+                } else {
+                    warn!(
+                        callee_uri = %callee_uri,
+                        callee_realm = %callee_realm,
+                        caller_realm = ?caller.realm,
+                        "locator lookup returned empty results for same-realm callee"
+                    );
+                }
             } else if !results.is_empty() {
                 // Keep locator-provided target metadata (destination/home_proxy/path/etc.)
                 // so SipSession can route cross-node calls via remote home_proxy.
@@ -830,12 +895,15 @@ impl CallModule {
             .or(self.inner.config.audio_codecs.as_deref());
 
         if let Some(mut hints) = dialplan_hints {
-            if let Some(policy) = hints.recording.take() {
+            let mut recording_policy = hints.recording.take();
+            if let Some(enabled) = hints.enable_recording {
+                recording_policy
+                    .get_or_insert_with(RecordingPolicy::default)
+                    .enabled = Some(enabled);
+            }
+            if let Some(policy) = recording_policy {
                 dialplan.recording = policy.new_recording_config();
                 dialplan.recording_policy = Some(policy);
-            }
-            if let Some(enabled) = hints.enable_recording {
-                dialplan.recording.enabled = enabled;
             }
             if let Some(bypass) = hints.bypass_media
                 && bypass
@@ -877,16 +945,94 @@ impl CallModule {
         Ok(dialplan)
     }
 
-    fn apply_recording_policy(
-        &self,
-        mut dialplan: Dialplan,
-        caller: &SipUser,
-        recording_policy_override: Option<&RecordingPolicy>,
-    ) -> Dialplan {
-        let policy = match recording_policy_override.or(self.inner.config.recording.as_ref()) {
-            Some(policy) if policy.enabled => policy,
-            _ => return dialplan,
+    fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
+        let policy = match dialplan.recording_policy.as_ref() {
+            Some(overrides) => {
+                let mut merged = self
+                    .inner
+                    .config
+                    .recording
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| overrides.clone());
+
+                if overrides.enabled.is_some() {
+                    merged.enabled = overrides.enabled;
+                }
+                if overrides.recording_type.is_some() {
+                    merged.recording_type = overrides.recording_type;
+                }
+                if !overrides.directions.is_empty() {
+                    merged.directions = overrides.directions.clone();
+                }
+                if !overrides.caller_allow.is_empty() {
+                    merged.caller_allow = overrides.caller_allow.clone();
+                }
+                if !overrides.caller_deny.is_empty() {
+                    merged.caller_deny = overrides.caller_deny.clone();
+                }
+                if !overrides.callee_allow.is_empty() {
+                    merged.callee_allow = overrides.callee_allow.clone();
+                }
+                if !overrides.callee_deny.is_empty() {
+                    merged.callee_deny = overrides.callee_deny.clone();
+                }
+                if overrides.auto_start.is_some() {
+                    merged.auto_start = overrides.auto_start;
+                }
+                if overrides.filename_pattern.is_some() {
+                    merged.filename_pattern = overrides.filename_pattern.clone();
+                }
+                if overrides.samplerate.is_some() {
+                    merged.samplerate = overrides.samplerate;
+                }
+                if overrides.ptime.is_some() {
+                    merged.ptime = overrides.ptime;
+                }
+                if overrides.path.is_some() {
+                    merged.path = overrides.path.clone();
+                }
+                if overrides.url.is_some() {
+                    merged.url = overrides.url.clone();
+                }
+                if overrides.headers.is_some() {
+                    merged.headers = overrides.headers.clone();
+                }
+                if overrides.vendor.is_some() {
+                    merged.vendor = overrides.vendor.clone();
+                }
+                if overrides.bucket.is_some() {
+                    merged.bucket = overrides.bucket.clone();
+                }
+                if overrides.region.is_some() {
+                    merged.region = overrides.region.clone();
+                }
+                if overrides.access_key.is_some() {
+                    merged.access_key = overrides.access_key.clone();
+                }
+                if overrides.secret_key.is_some() {
+                    merged.secret_key = overrides.secret_key.clone();
+                }
+                if overrides.endpoint.is_some() {
+                    merged.endpoint = overrides.endpoint.clone();
+                }
+                if overrides.root.is_some() {
+                    merged.root = overrides.root.clone();
+                }
+                if overrides.force_file.is_some() {
+                    merged.force_file = overrides.force_file;
+                }
+
+                merged
+            }
+            None => match self.inner.config.recording.as_ref() {
+                Some(policy) => policy.clone(),
+                None => return dialplan,
+            },
         };
+        if !policy.enabled.unwrap_or(false) {
+            return dialplan;
+        }
 
         if dialplan.recording.enabled && dialplan.recording.option.is_some() {
             return dialplan;
@@ -943,7 +1089,7 @@ impl CallModule {
         if !use_sipflow || force_file {
             let recorder_option = match self.build_recorder_option(
                 &dialplan,
-                policy,
+                &policy,
                 &caller_identity,
                 &callee_identity,
             ) {
@@ -1206,6 +1352,14 @@ impl CallModule {
         cookie: TransactionCookie,
         caller: &SipUser,
     ) -> Result<Dialplan, RouteError> {
+        if let Some(source_addr) = tx
+            .connection
+            .as_ref()
+            .and_then(|conn| conn.get_remote_addr().cloned())
+        {
+            cookie.insert_extension(SourceAddress(source_addr));
+        }
+
         let trunk_context = cookie.get_extension::<TrunkContext>();
         let source_trunk_hint = trunk_context.as_ref().map(|c| c.name.clone());
 
@@ -1243,6 +1397,7 @@ impl CallModule {
         }?;
 
         let mut dialplan = dialplan;
+
         if dialplan.caller_contact.is_none()
             && let Some(contact_uri) = self.inner.server.default_contact_uri()
         {
@@ -1335,9 +1490,7 @@ impl CallModule {
             }
         }
 
-        let recording_policy_override = dialplan.recording_policy.clone();
-        let dialplan =
-            self.apply_recording_policy(dialplan, caller, recording_policy_override.as_ref());
+        let dialplan = self.apply_recording_policy(dialplan, caller);
         Ok(dialplan)
     }
 
@@ -1363,8 +1516,7 @@ impl CallModule {
             dialplan = dialplan.with_extension(exts);
         }
         let proxy_call = CallSessionBuilder::new(cookie.clone(), dialplan, 70)
-            .with_call_record_sender(self.inner.server.callrecord_sender.clone())
-            .with_addon_registry(self.inner.server.addon_registry.clone());
+            .with_call_record_sender(self.inner.server.callrecord_sender.clone());
         let _ = proxy_call.report_failure(self.inner.server.clone(), code, reason);
     }
 
@@ -2082,93 +2234,6 @@ impl CallModule {
         });
 
         info!(content_type = ?content_type, body = %body, "Received SIP MESSAGE");
-
-        // Parse JSON body
-        if content_type.as_deref() == Some("application/json")
-            && let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&body)
-        {
-            let cmd_type = cmd.get("cmd").and_then(|v| v.as_str()).unwrap_or_default();
-            let call_id = cmd
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let agent_id = cmd
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let target = cmd
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let transfer_id = cmd
-                .get("transfer_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            match cmd_type {
-                "consult.initiate" => {
-                    info!(call_id = %call_id, agent_id = %agent_id, target = %target, "SIP MESSAGE: consult.initiate");
-
-                    // Hold the original call (A)
-                    let registry = self.inner.server.active_call_registry.clone();
-                    if let Some(handle) = registry.get_handle(call_id) {
-                        let _ = handle.send_command(crate::call::domain::CallCommand::Hold {
-                            leg_id: crate::call::domain::LegId::new(call_id),
-                            music: None,
-                        });
-                    }
-
-                    // Send 200 OK with transfer_id
-                    let response_body = serde_json::json!({
-                        "status": "ok",
-                        "transfer_id": transfer_id,
-                        "cmd": "consult.initiate"
-                    })
-                    .to_string();
-                    tx.reply_with(
-                        rsipstack::sip::StatusCode::OK,
-                        vec![rsipstack::sip::Header::ContentType(
-                            rsipstack::sip::headers::untyped::ContentType::new("application/json"),
-                        )],
-                        Some(response_body.into_bytes()),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                "consult.merge" => {
-                    info!(transfer_id = %transfer_id, "SIP MESSAGE: consult.merge");
-
-                    tx.reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
-                        .await?;
-                    return Ok(());
-                }
-                "consult.complete" => {
-                    info!(transfer_id = %transfer_id, "SIP MESSAGE: consult.complete");
-
-                    tx.reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
-                        .await?;
-                    return Ok(());
-                }
-                "consult.cancel" => {
-                    info!(transfer_id = %transfer_id, "SIP MESSAGE: consult.cancel");
-
-                    // Unhold the original call
-                    let registry = self.inner.server.active_call_registry.clone();
-                    if let Some(handle) = registry.get_handle(call_id) {
-                        let _ = handle.send_command(crate::call::domain::CallCommand::Unhold {
-                            leg_id: crate::call::domain::LegId::new(call_id),
-                        });
-                    }
-
-                    tx.reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
-                        .await?;
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
         // Default: accept but do nothing
         tx.reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
             .await?;
@@ -2371,6 +2436,27 @@ mod tests {
                 app_params: None,
                 auto_answer: true,
             })
+        }
+    }
+
+    struct RecordingHintsRouteInvite {
+        recording: Option<RecordingPolicy>,
+        enable_recording: Option<bool>,
+    }
+
+    #[async_trait]
+    impl RouteInvite for RecordingHintsRouteInvite {
+        async fn route_invite(
+            &self,
+            option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            let mut hints = crate::config::DialplanHints::default();
+            hints.recording = self.recording.clone();
+            hints.enable_recording = self.enable_recording;
+            Ok(RouteResult::Forward(option, Some(hints)))
         }
     }
 
@@ -2718,6 +2804,269 @@ mod tests {
             .expect("same-realm trunk-originated call should resolve");
 
         assert_eq!(dialplan.allow_codecs, vec![CodecType::PCMA]);
+    }
+
+    #[tokio::test]
+    async fn default_resolve_partial_recording_policy_inherits_global_policy_fields() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.recording = Some(RecordingPolicy {
+            enabled: Some(true),
+            recording_type: Some(crate::config::RecordingType::S3),
+            bucket: Some("recordings".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key: Some("access".to_string()),
+            secret_key: Some("secret".to_string()),
+            path: Some("/tmp/rustpbx-main-recordings".to_string()),
+            auto_start: Some(true),
+            force_file: Some(true),
+            ..Default::default()
+        });
+
+        let (server, config) = create_test_server_with_config(proxy_config).await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "alice".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+        let dialplan = module
+            .default_resolve(
+                &request,
+                Box::new(RecordingHintsRouteInvite {
+                    recording: Some(RecordingPolicy {
+                        enabled: Some(true),
+                        auto_start: Some(false),
+                        ..Default::default()
+                    }),
+                    enable_recording: None,
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("route should resolve");
+        assert_eq!(
+            dialplan
+                .recording_policy
+                .as_ref()
+                .and_then(|p| p.auto_start),
+            Some(false)
+        );
+        let dialplan = module.apply_recording_policy(dialplan, &caller);
+
+        assert!(dialplan.recording.enabled);
+        assert!(!dialplan.recording.auto_start);
+        assert!(dialplan.recording.force_file);
+        let option = dialplan
+            .recording
+            .option
+            .expect("merged policy should build recorder option");
+        assert!(
+            option
+                .recorder_file
+                .starts_with("/tmp/rustpbx-main-recordings"),
+            "partial override must inherit the global recorder path"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_resolve_recording_enable_hint_false_disables_global_policy() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.recording = Some(RecordingPolicy {
+            enabled: Some(true),
+            path: Some("/tmp/rustpbx-main-recordings".to_string()),
+            auto_start: Some(true),
+            ..Default::default()
+        });
+
+        let (server, config) = create_test_server_with_config(proxy_config).await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "alice".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+        let dialplan = module
+            .default_resolve(
+                &request,
+                Box::new(RecordingHintsRouteInvite {
+                    recording: None,
+                    enable_recording: Some(false),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("route should resolve");
+        assert_eq!(
+            dialplan.recording_policy.as_ref().and_then(|p| p.enabled),
+            Some(false)
+        );
+        let dialplan = module.apply_recording_policy(dialplan, &caller);
+
+        assert!(!dialplan.recording.enabled);
+        assert!(dialplan.recording.option.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_route_uses_real_source_ip_for_source_trunk() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.generated_dir =
+            format!("target/test-generated/source-route-{}", std::process::id());
+        proxy_config.trunks.insert(
+            "via_source".to_string(),
+            TrunkConfig {
+                dest: "sip:5.5.5.5:5060".to_string(),
+                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
+                inbound_hosts: vec!["5.5.5.0/24".to_string()],
+                ..Default::default()
+            },
+        );
+        proxy_config.trunks.insert(
+            "real_source".to_string(),
+            TrunkConfig {
+                dest: "sip:1.2.3.4:5060".to_string(),
+                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
+                inbound_hosts: vec!["1.2.3.0/24".to_string()],
+                ..Default::default()
+            },
+        );
+        proxy_config.trunks.insert(
+            "wrong_carrier".to_string(),
+            TrunkConfig {
+                dest: "sip:10.0.0.1:5060".to_string(),
+                direction: Some(crate::proxy::routing::TrunkDirection::Outbound),
+                ..Default::default()
+            },
+        );
+        proxy_config.trunks.insert(
+            "right_carrier".to_string(),
+            TrunkConfig {
+                dest: "sip:10.0.0.2:5060".to_string(),
+                direction: Some(crate::proxy::routing::TrunkDirection::Outbound),
+                ..Default::default()
+            },
+        );
+        proxy_config.routes = Some(vec![
+            RouteRule {
+                name: "wrong-via-source".to_string(),
+                priority: 0,
+                source_trunks: vec!["via_source".to_string()],
+                match_conditions: crate::proxy::routing::MatchConditions::default(),
+                action: crate::proxy::routing::RouteAction {
+                    dest: Some(crate::proxy::routing::DestConfig::Single(
+                        "wrong_carrier".to_string(),
+                    )),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            RouteRule {
+                name: "right-real-source".to_string(),
+                priority: 10,
+                source_trunks: vec!["real_source".to_string()],
+                match_conditions: crate::proxy::routing::MatchConditions::default(),
+                action: crate::proxy::routing::RouteAction {
+                    dest: Some(crate::proxy::routing::DestConfig::Single(
+                        "right_carrier".to_string(),
+                    )),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ]);
+
+        let (server, _config) = create_test_server_with_config(proxy_config).await;
+        let route_invite = DefaultRouteInvite {
+            routing_state: std::sync::Arc::new(RoutingState::default()),
+            data_context: server.data_context.clone(),
+            source_trunk_hint: None,
+        };
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "caller",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:callee@rustpbx.com").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:callee@rustpbx.com").unwrap(),
+        );
+        request
+            .headers
+            .retain(|header| !matches!(header, rsipstack::sip::Header::Via(_)));
+        request.headers.push(rsipstack::sip::Header::Via(
+            rsipstack::sip::headers::Via::new("SIP/2.0/UDP 5.5.5.5:5060;branch=z9hG4bK-wrong-via"),
+        ));
+
+        let option = InviteOption {
+            caller: rsipstack::sip::Uri::try_from("sip:caller@1.2.3.4").unwrap(),
+            callee: request.uri.clone(),
+            ..Default::default()
+        };
+        let cookie = TransactionCookie::default();
+        cookie.insert_extension(SourceAddress(
+            "1.2.3.4:5060"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        ));
+
+        let result = route_invite
+            .route_invite(option, &request, &DialDirection::Inbound, &cookie)
+            .await
+            .expect("route invite should succeed");
+
+        match result {
+            RouteResult::Forward(option, _) => {
+                assert_eq!(
+                    option.destination.unwrap().addr.to_string(),
+                    "10.0.0.2:5060"
+                );
+            }
+            RouteResult::NotHandled(_, _) => {
+                panic!("expected Forward via right carrier, got NotHandled")
+            }
+            RouteResult::Abort(code, reason) => panic!(
+                "expected Forward via right carrier, got Abort {} {:?}",
+                code, reason
+            ),
+            RouteResult::Queue { .. } => panic!("expected Forward via right carrier, got Queue"),
+            RouteResult::Application { .. } => {
+                panic!("expected Forward via right carrier, got Application")
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::proxy::routing::{
     DestConfig, MatchConditions, MediaMode, QueueDialMode, RejectConfig, RewriteRules, RouteAction,
     RouteQueueConfig, RouteQueueFallbackConfig, RouteQueueHoldConfig, RouteQueueStrategyConfig,
     RouteQueueTargetConfig, RouteRule, SourceTrunk, TrunkConfig, TrunkDirection, VideoPolicy,
+    candidate_matches_ip,
 };
 use async_trait::async_trait;
 use rsipstack::dialog::invitation::InviteOption;
@@ -91,6 +92,17 @@ async fn test_source_trunk_codecs_apply_when_no_route_handles_call() {
         }
         _ => panic!("expected not handled with source trunk codec hints"),
     }
+}
+
+#[tokio::test]
+async fn test_source_addr_candidate_matches_ip_and_cidr() {
+    let addr: IpAddr = "1.2.3.4".parse().unwrap();
+
+    assert!(candidate_matches_ip("1.2.3.4", &addr).await);
+    assert!(candidate_matches_ip("1.2.3.4:5080", &addr).await);
+    assert!(candidate_matches_ip("1.2.3.0/24", &addr).await);
+    assert!(!candidate_matches_ip("1.2.4.0/24", &addr).await);
+    assert!(!candidate_matches_ip("1.2.3.5", &addr).await);
 }
 
 #[tokio::test]
@@ -429,7 +441,7 @@ async fn test_match_invite_exact_match() {
             media_mode: Some(MediaMode::Bypass),
             video_policy: Some(VideoPolicy::Strip),
             recording: Some(RecordingPolicy {
-                enabled: true,
+                enabled: Some(true),
                 auto_start: Some(false),
                 ..Default::default()
             }),
@@ -495,7 +507,7 @@ async fn test_match_invite_exact_match() {
             let recording = hints
                 .recording
                 .expect("selected trunk recording should produce recording hint");
-            assert!(recording.enabled);
+            assert_eq!(recording.enabled, Some(true));
             assert_eq!(recording.auto_start, Some(false));
         }
         RouteResult::Abort(_, _) => panic!("Expected forward, got abort"),
@@ -953,6 +965,10 @@ fn test_queue_busy_prompt_maps_to_failure_audio() {
             no_answer_prompt: None,
             position_prompt: None,
             wait_time_prompt: None,
+            final_destination_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+            comfort_prompts: Vec::new(),
         }),
         ..RouteQueueConfig::default()
     };
@@ -2001,7 +2017,10 @@ async fn test_match_invite_application_with_rewrite_headers() {
         rewrite: Some(RewriteRules {
             headers: vec![
                 ("header.X-Custom".to_string(), "custom-value".to_string()),
-                ("header.P-Asserted-Identity".to_string(), "<sip:routing@pbx.com>".to_string()),
+                (
+                    "header.P-Asserted-Identity".to_string(),
+                    "<sip:routing@pbx.com>".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -2042,15 +2061,15 @@ async fn test_match_invite_application_with_rewrite_headers() {
 
     match result {
         RouteResult::Application {
-            option,
-            app_name,
-            ..
+            option, app_name, ..
         } => {
             assert_eq!(app_name, "ivr");
             let headers = option.headers.expect("routing should carry headers");
-            assert!(headers.iter().any(|h| {
-                h.name() == "X-Custom" && h.value() == "custom-value"
-            }));
+            assert!(
+                headers
+                    .iter()
+                    .any(|h| { h.name() == "X-Custom" && h.value() == "custom-value" })
+            );
             assert!(headers.iter().any(|h| {
                 h.name() == "P-Asserted-Identity" && h.value() == "<sip:routing@pbx.com>"
             }));

@@ -66,6 +66,207 @@ pub trait Locator: Send + Sync {
     async fn lookup(&self, uri: &rsipstack::sip::Uri) -> Result<Vec<Location>>;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Shared helpers for Locator backends (DbLocator, RedisLocator, …)
+//
+// Any custom [`Locator`] implementation (e.g. a Redis-backed one) MUST honour
+// the semantics encoded here so that cluster routing, WebRTC (.invalid)
+// contacts, and rapid-reconnect safety work uniformly across backends.
+//
+// Contract for a custom Locator backend
+// -------------------------------------
+// `lookup`:
+//   1. Try exact AoR match first (`uri.to_string()`).
+//   2. If empty **and** [`is_webrtc_invalid_host`] → use
+//      [`invalid_host_fallback`] to obtain the Contact user and host, then:
+//        a. AoR-pattern match: query by `user@host` so that bindings whose
+//           Contact AoR has the same user and `.invalid` host are found even
+//           when params differ (e.g. `;ob` in INVITE but not in REGISTER) or
+//           when the Contact user part differs from the authenticated username.
+//        b. Username match (fallback): query by the Contact user part against
+//           the username column / key.
+//   3. Filter out expired bindings via [`is_location_expired`].
+//   4. Sort surviving results with [`sort_locations_by_recency`].
+//
+// `unregister_with_address`:
+//   Only delete rows whose `last_modified` is older than the grace window
+//   ([`is_within_unregister_grace`]) so a stale transport-close event cannot
+//   wipe a freshly-registered binding (rapid reconnect / NAT port reuse).
+//
+// `register`:
+//   Store `home_proxy`, `registered_aor`, `destination`, `expires` and
+//   `last_modified` so that [`DialogTargetLocator`] can make correct
+//   cluster-routing decisions. Resolve the canonical AoR with
+//   [`choose_registered_aor`].
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Grace period (seconds) protecting freshly-registered bindings from being
+/// deleted by a stale transport-close event. See [`is_within_unregister_grace`].
+pub const UNREGISTER_GRACE_SECS: i64 = 5;
+
+/// Current UNIX epoch in seconds — the clock all `last_modified` values use.
+pub fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Returns `true` when a binding has exceeded its expiry.
+///
+/// `expires == 0` means "never expire".
+pub fn is_location_expired(expires: i64, last_modified: i64, now_epoch: i64) -> bool {
+    expires > 0 && (now_epoch - last_modified) >= expires
+}
+
+/// Returns `true` when a binding was registered so recently that a stale
+/// transport-close event must not delete it (rapid-reconnect / NAT port reuse).
+pub fn is_within_unregister_grace(last_modified: i64, now_epoch: i64) -> bool {
+    last_modified >= (now_epoch - UNREGISTER_GRACE_SECS)
+}
+
+/// Returns `true` for WebRTC (JsSIP) `.invalid` contact hosts (RFC 7118).
+pub fn is_webrtc_invalid_host(host: &str) -> bool {
+    host.ends_with(".invalid")
+}
+
+// ── WebRTC `.invalid` host fallback helpers ─────────────────────────────────
+
+/// Parameters extracted from a WebRTC `.invalid` lookup URI for fallback
+/// queries.
+///
+/// Produced by [`invalid_host_fallback`]. All Locator backends should consult
+/// these parameters when the initial exact-AoR lookup returns empty, so that
+/// in-dialog requests (BYE, re-INVITE, …) can be routed to WebRTC clients
+/// whose Contact uses a random `.invalid` hostname.
+pub struct InvalidHostFallback {
+    /// Lowercased Contact user part (e.g. `"qn27nogk"`).
+    pub user: String,
+    /// Contact host (e.g. `"2kbkhn3beiif.invalid"`).
+    pub host: String,
+}
+
+impl InvalidHostFallback {
+    /// Build a glob pattern suitable for SQL `LIKE` or Redis `SCAN MATCH`.
+    ///
+    /// Matches any stored AoR that contains `user@host`, ignoring leading
+    /// scheme and trailing parameters:
+    ///
+    /// ```text
+    /// %qn27nogk@2kbkhn3beiif.invalid%
+    /// ```
+    ///
+    /// This finds e.g. `sip:qn27nogk@2kbkhn3beiif.invalid;transport=ws` when
+    /// the lookup URI is `sip:qn27nogk@2kbkhn3beiif.invalid;transport=ws;ob`.
+    pub fn aor_like_pattern(&self) -> String {
+        format!("%{}@{}%", self.user, self.host)
+    }
+
+    /// Check whether a stored AoR matches this fallback (for in-memory
+    /// backends such as [`MemoryLocator`]).
+    ///
+    /// Returns `true` when the AoR's user part (case-insensitive) and host
+    /// match the fallback parameters, regardless of URI parameters.
+    pub fn matches_aor(&self, aor: &rsipstack::sip::Uri) -> bool {
+        let aor_user = aor
+            .user()
+            .map(|u| u.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        aor_user == self.user && aor.host().to_string().eq_ignore_ascii_case(&self.host)
+    }
+}
+
+/// Determine whether a lookup URI requires the `.invalid` host fallback, and
+/// if so, return the [`InvalidHostFallback`] parameters.
+///
+/// Returns `None` when:
+/// - the host is **not** a `.invalid` domain, or
+/// - the URI has no user part or an empty one.
+///
+/// # Example (DbLocator / SQL)
+/// ```ignore
+/// if models.is_empty() {
+///     if let Some(fb) = invalid_host_fallback(uri) {
+///         models = Entity::find()
+///             .filter(Column::Aor.like(fb.aor_like_pattern()))
+///             .all(&db).await?;
+///         if models.is_empty() {
+///             models = Entity::find()
+///                 .filter(Column::Username.eq(&fb.user))
+///                 .all(&db).await?;
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Example (RedisLocator / Redis)
+/// ```ignore
+/// if locations.is_empty() {
+///     if let Some(fb) = invalid_host_fallback(uri) {
+///         locations = redis.aor_scan(fb.aor_like_pattern()).await;
+///         if locations.is_empty() {
+///             locations = redis.username_lookup(&fb.user).await;
+///         }
+///     }
+/// }
+/// ```
+pub fn invalid_host_fallback(uri: &rsipstack::sip::Uri) -> Option<InvalidHostFallback> {
+    if !is_webrtc_invalid_host(&uri.host().to_string()) {
+        return None;
+    }
+    let user = uri.user()?.trim().to_ascii_lowercase();
+    if user.is_empty() {
+        return None;
+    }
+    Some(InvalidHostFallback {
+        user,
+        host: uri.host().to_string(),
+    })
+}
+
+/// Resolve the canonical registered AoR, repairing legacy records where
+/// `registered_aor` was incorrectly stored as the raw contact URI.
+///
+/// Custom backends should call this when materialising a [`Location`] from
+/// storage so that downstream cluster routing sees a consistent AoR.
+pub fn choose_registered_aor(
+    username: &str,
+    realm: &str,
+    contact_aor: &rsipstack::sip::Uri,
+    decoded_registered_aor: Option<rsipstack::sip::Uri>,
+) -> rsipstack::sip::Uri {
+    let fallback = fallback_registered_aor(username, realm, contact_aor);
+    let strict_equals = |a: &rsipstack::sip::Uri, b: &rsipstack::sip::Uri| {
+        a.to_string().eq_ignore_ascii_case(&b.to_string())
+    };
+
+    match decoded_registered_aor {
+        Some(registered)
+            if strict_equals(&registered, contact_aor)
+                && !strict_equals(&fallback, contact_aor) =>
+        {
+            fallback
+        }
+        Some(registered) => registered,
+        None => fallback,
+    }
+}
+
+fn fallback_registered_aor(
+    username: &str,
+    realm: &str,
+    fallback: &rsipstack::sip::Uri,
+) -> rsipstack::sip::Uri {
+    let user = username.trim();
+    let host = realm.trim();
+    if user.is_empty() || host.is_empty() {
+        return fallback.clone();
+    }
+
+    let candidate = format!("sip:{}@{}", user, host);
+    rsipstack::sip::Uri::try_from(candidate.as_str()).unwrap_or_else(|_| fallback.clone())
+}
+
 pub struct DialogTargetLocator {
     locator: Arc<Box<dyn Locator>>,
     local_addrs: Vec<SipAddr>,
@@ -101,14 +302,27 @@ impl TargetLocator for DialogTargetLocator {
             && !locs.is_empty()
         {
             if let Some(loc) = locs.iter().find(|loc| {
-                self.cluster_enabled
-                    && loc.home_proxy.as_ref().is_some_and(|home_proxy| {
-                        loc.registered_aor.as_ref().is_some_and(|registered_aor| {
-                            registered_aor == uri
-                                || (registered_aor.user() == uri.user()
-                                    && uri.host_with_port == home_proxy.addr)
-                        })
-                    })
+                if !self.cluster_enabled {
+                    return false;
+                }
+                let Some(home_proxy) = loc.home_proxy.as_ref() else {
+                    return false;
+                };
+                let Some(registered_aor) = loc.registered_aor.as_ref() else {
+                    return false;
+                };
+                let host_is_home = uri.host_with_port == home_proxy.addr;
+                let host_is_invalid = is_webrtc_invalid_host(&uri.host().to_string());
+                // Exact canonical AoR match — no host requirement. This is the
+                // original cluster-forwarding path: a lookup by canonical AoR
+                // must always route via home_proxy.
+                if registered_aor == uri {
+                    return true;
+                }
+                // User-level match with a host constraint: either the caller
+                // already rewrote the host to home_proxy, or it is a WebRTC
+                // .invalid contact (JsSIP).
+                registered_aor.user() == uri.user() && (host_is_home || host_is_invalid)
             }) {
                 if let Some(home_proxy) = &loc.home_proxy {
                     if self.is_local_home_proxy(home_proxy)
@@ -121,6 +335,15 @@ impl TargetLocator for DialogTargetLocator {
             }
 
             if let Some(loc) = locs.first() {
+                // Cluster safety: never hand out a destination that belongs to a
+                // remote home node — route to its home_proxy instead so the
+                // request is forwarded to the node that owns the connection.
+                if self.cluster_enabled
+                    && let Some(home_proxy) = &loc.home_proxy
+                    && !self.is_local_home_proxy(home_proxy)
+                {
+                    return Ok(home_proxy.clone());
+                }
                 if let Some(dest) = &loc.destination {
                     return Ok(dest.clone());
                 }
@@ -232,6 +455,18 @@ impl Locator for MemoryLocator {
         let mut location = location;
         let key = location.binding_key();
         let mut locations = self.locations.lock().await;
+
+        // Opportunistic GC: prune expired bindings for THIS identifier on
+        // every register. Without this, clients that crash without sending
+        // REGISTER expires=0 leave stale entries forever (lookup() only
+        // sweeps the entries it actually visits, so never-looked-up AoRs
+        // would accumulate). This stays O(1) amortised because each AoR's
+        // binding map is small (typically a single binding).
+        if let Some(map) = locations.get_mut(&identifier) {
+            let now = Instant::now();
+            map.retain(|_, loc| !loc.is_expired_at(now));
+        }
+
         let entry = locations
             .entry(identifier.clone())
             .or_insert_with(HashMap::new);
@@ -551,6 +786,98 @@ mod tests {
     use rsipstack::transport::SipAddr;
     use std::time::Duration;
 
+    // ── shared helper unit tests ────────────────────────────────────────
+
+    #[test]
+    fn test_is_location_expired() {
+        // expires == 0 means never expire
+        assert!(!is_location_expired(0, 100, 999_999));
+        // not yet expired
+        assert!(!is_location_expired(3600, 1000, 2000));
+        // exactly at expiry boundary
+        assert!(is_location_expired(3600, 1000, 4600));
+        // long expired
+        assert!(is_location_expired(60, 1000, 999_999));
+    }
+
+    #[test]
+    fn test_is_within_unregister_grace() {
+        // freshly registered → within grace
+        assert!(is_within_unregister_grace(1000, 1000));
+        assert!(is_within_unregister_grace(1000, 1003));
+        // at the boundary (exactly GRACE_SECS ago) → still within
+        assert!(is_within_unregister_grace(
+            1000,
+            1000 + UNREGISTER_GRACE_SECS
+        ));
+        // older than grace → outside
+        assert!(!is_within_unregister_grace(
+            1000,
+            1000 + UNREGISTER_GRACE_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn test_is_webrtc_invalid_host() {
+        assert!(is_webrtc_invalid_host("abc123.invalid"));
+        assert!(is_webrtc_invalid_host("x.invalid"));
+        assert!(!is_webrtc_invalid_host("rustpbx.com"));
+        assert!(!is_webrtc_invalid_host("10.0.0.1"));
+        assert!(!is_webrtc_invalid_host(""));
+    }
+
+    #[test]
+    fn test_invalid_host_fallback_extracts_params() {
+        let uri: rsipstack::sip::Uri =
+            "sip:qn27nogk@2kbkhn3beiif.invalid;transport=ws;ob".try_into().unwrap();
+        let fb = invalid_host_fallback(&uri).expect("should produce fallback");
+        assert_eq!(fb.user, "qn27nogk");
+        assert_eq!(fb.host, "2kbkhn3beiif.invalid");
+    }
+
+    #[test]
+    fn test_invalid_host_fallback_returns_none_for_non_invalid() {
+        let uri: rsipstack::sip::Uri = "sip:alice@pbx.example.com".try_into().unwrap();
+        assert!(invalid_host_fallback(&uri).is_none());
+    }
+
+    #[test]
+    fn test_invalid_host_fallback_returns_none_for_no_user() {
+        let uri: rsipstack::sip::Uri = "sip:@2kbkhn3beiif.invalid".try_into().unwrap();
+        assert!(invalid_host_fallback(&uri).is_none());
+    }
+
+    #[test]
+    fn test_aor_like_pattern_format() {
+        let fb = InvalidHostFallback {
+            user: "qn27nogk".into(),
+            host: "2kbkhn3beiif.invalid".into(),
+        };
+        assert_eq!(fb.aor_like_pattern(), "%qn27nogk@2kbkhn3beiif.invalid%");
+    }
+
+    #[test]
+    fn test_invalid_host_fallback_matches_aor_ignores_params() {
+        let fb = InvalidHostFallback {
+            user: "qn27nogk".into(),
+            host: "2kbkhn3beiif.invalid".into(),
+        };
+        // Same user+host, different params → match
+        let aor: rsipstack::sip::Uri =
+            "sip:qn27nogk@2kbkhn3beiif.invalid;transport=ws".try_into().unwrap();
+        assert!(fb.matches_aor(&aor));
+
+        // Different user → no match
+        let aor2: rsipstack::sip::Uri =
+            "sip:other@2kbkhn3beiif.invalid;transport=ws".try_into().unwrap();
+        assert!(!fb.matches_aor(&aor2));
+
+        // Different host → no match
+        let aor3: rsipstack::sip::Uri =
+            "sip:qn27nogk@other.invalid;transport=ws".try_into().unwrap();
+        assert!(!fb.matches_aor(&aor3));
+    }
+
     #[tokio::test]
     async fn memory_locator_orders_by_last_modified() {
         let locator = MemoryLocator::new();
@@ -746,8 +1073,9 @@ mod tests {
         let locator = MemoryLocator::new();
         let registered_uri: rsipstack::sip::Uri =
             "sip:test_user@real-domain.com".try_into().unwrap();
-        let lookup_uri: rsipstack::sip::Uri =
-            "sip:test_user@abcdef123456.invalid;transport=ws".try_into().unwrap();
+        let lookup_uri: rsipstack::sip::Uri = "sip:test_user@abcdef123456.invalid;transport=ws"
+            .try_into()
+            .unwrap();
 
         let destination = SipAddr {
             r#type: Some(Transport::Ws),
@@ -770,7 +1098,11 @@ mod tests {
             .unwrap();
 
         let locations = locator.lookup(&lookup_uri).await.unwrap();
-        assert_eq!(locations.len(), 1, "should find registration via .invalid lookup");
+        assert_eq!(
+            locations.len(),
+            1,
+            "should find registration via .invalid lookup"
+        );
         assert_eq!(
             locations[0].destination,
             Some(destination),
@@ -816,6 +1148,171 @@ mod tests {
         assert_eq!(
             result, home_proxy,
             "DialogTargetLocator should route registered AOR via home_proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_target_locator_routes_invalid_contact_via_remote_home_proxy() {
+        // Cluster scenario: a WebRTC (JsSIP) client is registered on Node A
+        // (remote) with a .invalid contact. Node B (local) must route the BYE
+        // — whose Request-URI is the .invalid contact — to the remote
+        // home_proxy (Node A), NOT to the WebSocket destination which is a
+        // private socket only reachable from Node A.
+        let locator = MemoryLocator::new();
+
+        // Canonical AoR + the .invalid WebRTC contact
+        let registered_aor: rsipstack::sip::Uri = "sip:bob@rustpbx.com".try_into().unwrap();
+        let contact_uri: rsipstack::sip::Uri =
+            "sip:bob@7s8f2k.invalid;transport=ws".try_into().unwrap();
+
+        // WebSocket connection private to Node A (not reachable from Node B)
+        let ws_destination = SipAddr {
+            r#type: Some(Transport::Wss),
+            addr: HostWithPort::try_from("198.51.100.10:51234").unwrap(),
+        };
+
+        // Node A's advertised SIP address (home_proxy, remote)
+        let home_proxy = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.5:5060").unwrap(),
+        };
+
+        locator
+            .register(
+                "bob",
+                Some("rustpbx.com"),
+                Location {
+                    aor: contact_uri.clone(),
+                    expires: 3600,
+                    destination: Some(ws_destination.clone()),
+                    home_proxy: Some(home_proxy.clone()),
+                    registered_aor: Some(registered_aor),
+                    transport: Some(Transport::Wss),
+                    supports_webrtc: true,
+                    last_modified: Some(Instant::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // DialogTargetLocator running on Node B (local_addrs = Node B),
+        // cluster enabled. Node A's home_proxy is NOT in local_addrs.
+        let node_b = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.6:5060").unwrap(),
+        };
+        let target_locator =
+            DialogTargetLocator::new(Arc::new(Box::new(locator)), vec![node_b], true);
+
+        // The BYE Request-URI is the .invalid contact
+        let result = target_locator.locate(&contact_uri).await.unwrap();
+        assert_eq!(
+            result, home_proxy,
+            "DialogTargetLocator must route .invalid contact to remote home_proxy in cluster, \
+             not to the remote node's private WS destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_target_locator_routes_canonical_aor_via_home_proxy() {
+        // Regression guard: an exact canonical-AoR lookup (registered_aor == uri)
+        // must route via home_proxy with NO host requirement. This is the original
+        // cluster-forwarding path and must not be broken by the .invalid changes.
+        let locator = MemoryLocator::new();
+        let canonical_aor: rsipstack::sip::Uri = "sip:alice@rustpbx.com".try_into().unwrap();
+
+        let destination = SipAddr {
+            r#type: Some(Transport::Wss),
+            addr: HostWithPort::try_from("198.51.100.10:51234").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.5:5060").unwrap(),
+        };
+
+        locator
+            .register(
+                "alice",
+                Some("rustpbx.com"),
+                Location {
+                    aor: canonical_aor.clone(),
+                    expires: 3600,
+                    destination: Some(destination),
+                    home_proxy: Some(home_proxy.clone()),
+                    registered_aor: Some(canonical_aor.clone()),
+                    last_modified: Some(Instant::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Node B (local); home_proxy 10.0.0.5 is remote.
+        let node_b = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.6:5060").unwrap(),
+        };
+        let target_locator =
+            DialogTargetLocator::new(Arc::new(Box::new(locator)), vec![node_b], true);
+
+        // Lookup by canonical AoR — uri.host (rustpbx.com) != home_proxy.addr.
+        let result = target_locator.locate(&canonical_aor).await.unwrap();
+        assert_eq!(
+            result, home_proxy,
+            "canonical AoR exact match must route via home_proxy regardless of uri host"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_target_locator_fallback_never_leaks_remote_destination() {
+        // Fix 2 guard: even when the cluster-match predicate (Fix 1) does not
+        // match — here because registered_aor is absent — the fallback must
+        // still route to a remote home_proxy instead of returning the remote
+        // node's private WS destination.
+        let locator = MemoryLocator::new();
+        let contact_uri: rsipstack::sip::Uri =
+            "sip:bob@9x2k4j.invalid;transport=ws".try_into().unwrap();
+
+        let ws_destination = SipAddr {
+            r#type: Some(Transport::Wss),
+            addr: HostWithPort::try_from("198.51.100.10:51234").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.5:5060").unwrap(),
+        };
+
+        locator
+            .register(
+                "bob",
+                Some("rustpbx.com"),
+                Location {
+                    aor: contact_uri.clone(),
+                    expires: 3600,
+                    destination: Some(ws_destination),
+                    home_proxy: Some(home_proxy.clone()),
+                    transport: Some(Transport::Wss),
+                    // registered_aor intentionally None so Fix 1 predicate
+                    // cannot match, forcing the fallback (Fix 2) path.
+                    last_modified: Some(Instant::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let node_b = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort::try_from("10.0.0.6:5060").unwrap(),
+        };
+        let target_locator =
+            DialogTargetLocator::new(Arc::new(Box::new(locator)), vec![node_b], true);
+
+        let result = target_locator.locate(&contact_uri).await.unwrap();
+        assert_eq!(
+            result, home_proxy,
+            "fallback must route to remote home_proxy, never leak the remote WS destination"
         );
     }
 

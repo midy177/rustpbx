@@ -84,6 +84,7 @@ mod controller;
 mod event_loop;
 
 pub mod agent_registry;
+pub mod conference;
 pub mod ivr;
 pub mod ivr_config;
 pub mod queue;
@@ -103,7 +104,9 @@ mod ivr_test;
 #[cfg(test)]
 mod queue_test;
 
-pub use app_context::{AppSharedState, ApplicationContext, CallInfo, extract_sip_headers};
+pub use app_context::{
+    AppSharedState, ApplicationContext, CallInfo, PendingQueuePlan, extract_sip_headers,
+};
 pub use controller::{
     CallController, ControllerEvent, DtmfCollectConfig, HangupDuringCollection, PlaybackHandle,
     RecordingHandle, RecordingInfo,

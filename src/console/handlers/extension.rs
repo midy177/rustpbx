@@ -1,4 +1,5 @@
 use crate::call::Location;
+use crate::console::config_helpers::{bad_request, find_or_404, internal_error};
 use crate::console::handlers::forms::{self, ExtensionPayload, ListQuery};
 use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::models::{
@@ -11,7 +12,7 @@ use crate::models::{
     },
 };
 use crate::proxy::server::SipServerRef;
-use axum::routing::{get, patch, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use axum::{
     extract::{Path as AxumPath, State},
@@ -52,7 +53,6 @@ struct QueryExtensionsFilters {
     #[serde(default)]
     registered_at_to: Option<String>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct ExtensionLocatorRecord {
@@ -124,13 +124,7 @@ async fn fetch_extension_locator_summary(
         return summary;
     }
 
-    let query_uri = if trimmed_ext.starts_with("sip:") {
-        trimmed_ext.to_string()
-    } else if trimmed_ext.contains('@') {
-        format!("sip:{}", trimmed_ext)
-    } else {
-        format!("sip:{}@{}", trimmed_ext, realm)
-    };
+    let query_uri = crate::call::build_sip_uri(trimmed_ext, realm);
     summary.query_uri = Some(query_uri.clone());
 
     let Some(server) = server else {
@@ -264,14 +258,12 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
 
 pub fn api_urls() -> Router<Arc<ConsoleState>> {
     Router::new()
-        .route(
-            "/extensions",
-            put(create_extension).post(query_extensions),
-        )
+        .route("/extensions", put(create_extension).post(query_extensions))
         .route(
             "/extensions/{id}",
             patch(update_extension).delete(delete_extension),
         )
+        .route("/extensions/import", post(csv_import_extensions))
 }
 
 async fn build_filters(state: Arc<ConsoleState>) -> serde_json::Value {
@@ -418,22 +410,14 @@ async fn create_extension(
     AuthRequired(user): AuthRequired,
     Json(payload): Json<ExtensionPayload>,
 ) -> Response {
-    if !state.has_permission(&user, "extensions", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "extensions", "write").await {
+        return resp;
     }
     let db = state.db();
     let extension = match payload.extension {
         Some(ref ext) if !ext.is_empty() => ext,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"message": "Extension is required"})),
-            )
-                .into_response();
+            return bad_request("Extension is required");
         }
     };
     let now = chrono::Utc::now();
@@ -457,11 +441,7 @@ async fn create_extension(
         Ok(model) => model,
         Err(err) => {
             warn!("failed to create extension: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": err.to_string()})),
-            )
-                .into_response();
+            return internal_error(err.to_string());
         }
     };
 
@@ -472,11 +452,15 @@ async fn create_extension(
             "failed to set departments for extension {}: {}",
             model.id, err
         );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": err.to_string()})),
-        )
-            .into_response();
+        return internal_error(err.to_string());
+    }
+
+    // Notify addons that an extension was created.
+    if let Some(app_state) = state.app_state() {
+        app_state
+            .addon_registry
+            .on_extension_created(app_state.config(), db, extension)
+            .await;
     }
 
     Json(json!({"status": "ok", "id": model.id})).into_response()
@@ -661,36 +645,18 @@ async fn update_extension(
     AuthRequired(user): AuthRequired,
     Json(payload): Json<ExtensionPayload>,
 ) -> Response {
-    if !state.has_permission(&user, "extensions", "write").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state.require_permission(&user, "extensions", "write").await {
+        return resp;
     }
     let db = state.db();
-    let model = match ExtensionEntity::find_by_id(id).one(db).await {
-        Ok(Some(result)) => result,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "Extension not found"})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("failed to load extension {} for update: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": err.to_string()})),
-            )
-                .into_response();
-        }
-    };
+    let model = find_or_404!(ExtensionEntity, id, db, "Extension");
+
+    // Capture the original extension before model is consumed.
+    let current_ext = model.extension.clone();
 
     let mut active: ExtensionActiveModel = model.into();
-    if let Some(extension) = payload.extension {
-        active.extension = Set(extension);
+    if let Some(ref extension) = payload.extension {
+        active.extension = Set(extension.clone());
     }
     if let Some(display_name) = payload.display_name {
         active.display_name = Set(Some(display_name));
@@ -742,6 +708,18 @@ async fn update_extension(
         )
             .into_response();
     }
+
+    // Notify addons that an extension was updated.
+    let ext = payload.extension.clone().unwrap_or(current_ext);
+    if !ext.is_empty() {
+        if let Some(app_state) = state.app_state() {
+            app_state
+                .addon_registry
+                .on_extension_updated(app_state.config(), db, &ext)
+                .await;
+        }
+    }
+
     Json(json!({"status": "ok"})).into_response()
 }
 
@@ -750,15 +728,35 @@ async fn delete_extension(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    if !state.has_permission(&user, "extensions", "delete").await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"message": "Permission denied"})),
-        )
-            .into_response();
+    if let Err(resp) = state
+        .require_permission(&user, "extensions", "delete")
+        .await
+    {
+        return resp;
     }
-    match ExtensionEntity::delete_by_id(id).exec(state.db()).await {
-        Ok(r) => Json(json!({"status": r.rows_affected})).into_response(),
+    let db = state.db();
+
+    // Resolve extension number before deletion for addon hooks.
+    let ext_number = ExtensionEntity::find_by_id(id)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.extension)
+        .unwrap_or_default();
+
+    match ExtensionEntity::delete_by_id(id).exec(db).await {
+        Ok(r) => {
+            if !ext_number.is_empty() {
+                if let Some(app_state) = state.app_state() {
+                    app_state
+                        .addon_registry
+                        .on_extension_deleting(app_state.config(), db, &ext_number)
+                        .await;
+                }
+            }
+            Json(json!({"status": r.rows_affected})).into_response()
+        }
         Err(err) => {
             warn!("failed to delete extension {}: {}", id, err);
             (
@@ -770,54 +768,298 @@ async fn delete_extension(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        config::ConsoleConfig,
-        console::handlers::forms::ListQuery,
-        models::{department, extension::Model as ExtensionModel, migration::Migrator, user},
-    };
-    use axum::{Json, body::to_bytes, extract::State, http::StatusCode};
-    use chrono::Utc;
-    use sea_orm::{ActiveValue::Set, Database};
-    use sea_orm_migration::MigratorTrait;
-    use serde_json::Value;
-    use std::sync::Arc;
+fn parse_bool_string(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Some(true),
+        "false" | "no" | "0" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
 
-    fn dummy_user() -> user::Model {
-        let now = Utc::now();
-        user::Model {
-            id: 1,
-            email: "tester@rustpbx.com".into(),
-            username: "tester".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: true,
-            is_superuser: true,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
+fn parse_i32_string(s: &str) -> Option<i32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<i32>().ok()
+}
+
+#[derive(Deserialize, Default)]
+pub struct CsvExtensionRow {
+    pub extension: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub sip_password: Option<String>,
+    #[serde(default)]
+    pub login_disabled: Option<String>,
+    #[serde(default)]
+    pub voicemail_disabled: Option<String>,
+    #[serde(default)]
+    pub allow_guest_calls: Option<String>,
+    #[serde(default)]
+    pub call_forwarding_mode: Option<String>,
+    #[serde(default)]
+    pub call_forwarding_destination: Option<String>,
+    #[serde(default)]
+    pub call_forwarding_timeout: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub departments: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CsvExtensionImportPayload {
+    pub extensions: Vec<CsvExtensionRow>,
+}
+
+pub async fn csv_import_extensions(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<CsvExtensionImportPayload>,
+) -> Response {
+    if let Err(resp) = state.require_permission(&user, "extensions", "write").await {
+        return resp;
+    }
+    let db = state.db();
+    let now = Utc::now();
+
+    let mut existing_extensions: std::collections::HashSet<String> = ExtensionEntity::find()
+        .all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.extension)
+        .collect();
+
+    let all_depts = DepartmentEntity::find().all(db).await.unwrap_or_default();
+    let dept_map: std::collections::HashMap<String, i64> =
+        all_depts.iter().map(|d| (d.name.clone(), d.id)).collect();
+
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, row) in payload.extensions.iter().enumerate() {
+        let ext_number = row.extension.trim().to_string();
+
+        if ext_number.is_empty() {
+            skipped += 1;
+            errors.push(format!("Row {}: extension number is required", i + 1));
+            continue;
+        }
+
+        if ext_number.len() > 32 {
+            skipped += 1;
+            errors.push(format!(
+                "Row {}: extension '{}' exceeds maximum length of 32 characters",
+                i + 1,
+                ext_number
+            ));
+            continue;
+        }
+
+        if existing_extensions.contains(&ext_number) {
+            skipped += 1;
+            errors.push(format!(
+                "Row {}: extension '{}' already exists",
+                i + 1,
+                ext_number
+            ));
+            continue;
+        }
+
+        let validate_bool = |val: &Option<String>| -> Option<bool> {
+            val.as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .and_then(parse_bool_string)
+        };
+
+        let login_disabled = validate_bool(&row.login_disabled).unwrap_or(false);
+        let voicemail_disabled = validate_bool(&row.voicemail_disabled).unwrap_or(false);
+        let allow_guest_calls = validate_bool(&row.allow_guest_calls).unwrap_or(false);
+
+        if let Some(ref raw) = row.login_disabled {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && parse_bool_string(trimmed).is_none() {
+                skipped += 1;
+                errors.push(format!(
+                    "Row {}: extension '{}' has invalid login_disabled value '{}'",
+                    i + 1,
+                    ext_number,
+                    raw
+                ));
+                continue;
+            }
+        }
+        if let Some(ref raw) = row.voicemail_disabled {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && parse_bool_string(trimmed).is_none() {
+                skipped += 1;
+                errors.push(format!(
+                    "Row {}: extension '{}' has invalid voicemail_disabled value '{}'",
+                    i + 1,
+                    ext_number,
+                    raw
+                ));
+                continue;
+            }
+        }
+        if let Some(ref raw) = row.allow_guest_calls {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && parse_bool_string(trimmed).is_none() {
+                skipped += 1;
+                errors.push(format!(
+                    "Row {}: extension '{}' has invalid allow_guest_calls value '{}'",
+                    i + 1,
+                    ext_number,
+                    raw
+                ));
+                continue;
+            }
+        }
+
+        let call_forwarding_timeout = row
+            .call_forwarding_timeout
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(parse_i32_string);
+
+        if let Some(ref raw) = row.call_forwarding_timeout {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && parse_i32_string(trimmed).is_none() {
+                skipped += 1;
+                errors.push(format!(
+                    "Row {}: extension '{}' has invalid call_forwarding_timeout value '{}'",
+                    i + 1,
+                    ext_number,
+                    raw
+                ));
+                continue;
+            }
+        }
+
+        let display_name = row.display_name.clone().filter(|s| !s.is_empty());
+        let email = row.email.clone().filter(|s| !s.is_empty());
+        let sip_password = row.sip_password.clone().filter(|s| !s.is_empty());
+        let call_forwarding_mode = row.call_forwarding_mode.clone().filter(|s| !s.is_empty());
+        let call_forwarding_destination = row
+            .call_forwarding_destination
+            .clone()
+            .filter(|s| !s.is_empty());
+        let notes = row.notes.clone().filter(|s| !s.is_empty());
+
+        let dept_names: Vec<&str> = row
+            .departments
+            .as_deref()
+            .map(|d| {
+                d.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut dept_ids = Vec::new();
+        let mut unknown_depts = Vec::new();
+        for name in &dept_names {
+            if let Some(&id) = dept_map.get(*name) {
+                dept_ids.push(id);
+            } else {
+                unknown_depts.push(*name);
+            }
+        }
+        if !unknown_depts.is_empty() {
+            skipped += 1;
+            errors.push(format!(
+                "Row {}: extension '{}' has unknown departments: {}",
+                i + 1,
+                ext_number,
+                unknown_depts.join(", ")
+            ));
+            continue;
+        }
+
+        let active = ExtensionActiveModel {
+            extension: Set(ext_number.clone()),
+            display_name: Set(display_name),
+            email: Set(email),
+            sip_password: Set(sip_password),
+            login_disabled: Set(login_disabled),
+            voicemail_disabled: Set(voicemail_disabled),
+            allow_guest_calls: Set(allow_guest_calls),
+            call_forwarding_mode: Set(call_forwarding_mode),
+            call_forwarding_destination: Set(call_forwarding_destination),
+            call_forwarding_timeout: Set(call_forwarding_timeout),
+            notes: Set(notes),
+            created_at: Set(now.into()),
+            updated_at: Set(now.into()),
+            registered_at: Set(None),
+            status: Set(None),
+            ..Default::default()
+        };
+
+        match active.insert(db).await {
+            Ok(model) => {
+                if !dept_ids.is_empty() {
+                    if let Err(err) =
+                        ExtensionEntity::replace_departments(db, model.id, &dept_ids).await
+                    {
+                        errors.push(format!(
+                            "Row {}: extension '{}' imported but department assignment failed: {}",
+                            i + 1,
+                            ext_number,
+                            err
+                        ));
+                    }
+                }
+                // Notify addons that an extension was created via CSV import.
+                if let Some(app_state) = state.app_state() {
+                    app_state
+                        .addon_registry
+                        .on_extension_created(app_state.config(), db, &ext_number)
+                        .await;
+                }
+                imported += 1;
+                existing_extensions.insert(ext_number);
+            }
+            Err(e) => {
+                skipped += 1;
+                errors.push(format!(
+                    "Row {}: extension '{}' failed to insert: {}",
+                    i + 1,
+                    ext_number,
+                    e
+                ));
+            }
         }
     }
 
-    async fn setup_state() -> Arc<ConsoleState> {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("run migrations");
-        ConsoleState::initialize(db,
-            ConsoleConfig::default(),
-        )
-        .await
-        .expect("initialize console state")
-    }
+    Json(json!({
+        "status": if imported > 0 { "ok" } else { "error" },
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::console::handlers::test_helpers::{setup_state, superuser, unprivileged_user};
+
+    use super::*;
+    use crate::{
+        console::handlers::forms::ListQuery,
+        models::{department, extension::Model as ExtensionModel},
+    };
+    use axum::{Json, body::to_bytes, extract::State, http::StatusCode};
+    use sea_orm::ActiveValue::Set;
+    use serde_json::Value;
+    use std::sync::Arc;
 
     async fn insert_extension(db: &sea_orm::DatabaseConnection, extension: &str) -> ExtensionModel {
         ExtensionActiveModel {
@@ -875,7 +1117,7 @@ mod tests {
             });
 
             let response =
-                query_extensions(State(state), AuthRequired(dummy_user()), Json(query)).await;
+                query_extensions(State(state), AuthRequired(superuser()), Json(query)).await;
 
             assert_eq!(response.status(), StatusCode::OK);
 
@@ -905,28 +1147,6 @@ mod tests {
 
         let combined_ids = fetch_extension_ids(state.clone(), vec![sales.id, support.id]).await;
         assert_eq!(combined_ids, vec![ext_both.id]);
-    }
-
-    fn unprivileged_user() -> user::Model {
-        let now = Utc::now();
-        user::Model {
-            id: 99,
-            email: "limited@rustpbx.com".into(),
-            username: "limited".into(),
-            password_hash: "hashed".into(),
-            reset_token: None,
-            reset_token_expires: None,
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: now,
-            updated_at: now,
-            is_active: true,
-            is_staff: false,
-            is_superuser: false,
-            mfa_enabled: false,
-            mfa_secret: None,
-            auth_source: "local".into(),
-        }
     }
 
     #[tokio::test]
@@ -972,12 +1192,205 @@ mod tests {
     #[tokio::test]
     async fn create_extension_allowed_for_superuser() {
         let state = setup_state().await;
-        let user = dummy_user();
+        let user = superuser();
         let payload = ExtensionPayload {
             extension: Some("5003".into()),
             ..Default::default()
         };
         let resp = create_extension(State(state), AuthRequired(user), Json(payload)).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csv_import_extensions_basic() {
+        let state = setup_state().await;
+        let user = superuser();
+        let payload = CsvExtensionImportPayload {
+            extensions: vec![
+                CsvExtensionRow {
+                    extension: "2001".into(),
+                    display_name: Some("Alice".into()),
+                    email: Some("alice@test.com".into()),
+                    sip_password: Some("secret123".into()),
+                    login_disabled: Some("false".into()),
+                    voicemail_disabled: Some("false".into()),
+                    allow_guest_calls: Some("true".into()),
+                    call_forwarding_mode: Some("".into()),
+                    call_forwarding_destination: Some("".into()),
+                    call_forwarding_timeout: Some("".into()),
+                    notes: Some("test".into()),
+                    departments: Some("".into()),
+                },
+                CsvExtensionRow {
+                    extension: "2002".into(),
+                    display_name: Some("Bob".into()),
+                    email: Some("".into()),
+                    sip_password: Some("".into()),
+                    login_disabled: Some("true".into()),
+                    voicemail_disabled: Some("true".into()),
+                    allow_guest_calls: Some("false".into()),
+                    call_forwarding_mode: Some("always".into()),
+                    call_forwarding_destination: Some("1001".into()),
+                    call_forwarding_timeout: Some("30".into()),
+                    notes: Some("".into()),
+                    departments: Some("".into()),
+                },
+            ],
+        };
+        let resp =
+            csv_import_extensions(State(state.clone()), AuthRequired(user), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["imported"], 2);
+        assert_eq!(parsed["skipped"], 0);
+
+        let extensions = ExtensionEntity::find().all(state.db()).await.unwrap();
+        let ext_names: Vec<&str> = extensions.iter().map(|e| e.extension.as_str()).collect();
+        assert!(ext_names.contains(&"2001"));
+        assert!(ext_names.contains(&"2002"));
+    }
+
+    #[tokio::test]
+    async fn csv_import_extensions_duplicate() {
+        let state = setup_state().await;
+        insert_extension(state.db(), "3001").await;
+        let user = superuser();
+        let payload = CsvExtensionImportPayload {
+            extensions: vec![
+                CsvExtensionRow {
+                    extension: "3001".into(),
+                    ..Default::default()
+                },
+                CsvExtensionRow {
+                    extension: "3002".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let resp =
+            csv_import_extensions(State(state.clone()), AuthRequired(user), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["imported"], 1);
+        assert_eq!(parsed["skipped"], 1);
+        let errors = parsed["errors"].as_array().unwrap();
+        assert!(errors[0].as_str().unwrap().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn csv_import_extensions_empty_extension() {
+        let state = setup_state().await;
+        let user = superuser();
+        let payload = CsvExtensionImportPayload {
+            extensions: vec![CsvExtensionRow {
+                extension: "".into(),
+                ..Default::default()
+            }],
+        };
+        let resp = csv_import_extensions(State(state), AuthRequired(user), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["imported"], 0);
+        assert_eq!(parsed["skipped"], 1);
+        assert!(
+            parsed["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("extension number is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_import_extensions_with_departments() {
+        let state = setup_state().await;
+        let db = state.db();
+        let _ = department::ActiveModel {
+            name: Set("Sales".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert sales");
+        let _ = department::ActiveModel {
+            name: Set("Support".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert support");
+
+        let user = superuser();
+        let payload = CsvExtensionImportPayload {
+            extensions: vec![CsvExtensionRow {
+                extension: "4001".into(),
+                display_name: Some("Dept Test".into()),
+                departments: Some("Sales,Support".into()),
+                ..Default::default()
+            }],
+        };
+        let resp =
+            csv_import_extensions(State(state.clone()), AuthRequired(user), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["imported"], 1);
+
+        let ext = ExtensionEntity::find()
+            .filter(ExtensionColumn::Extension.eq("4001"))
+            .one(db)
+            .await
+            .unwrap()
+            .expect("extension found");
+        let ext_depts = ext
+            .find_related(crate::models::department::Entity)
+            .all(db)
+            .await
+            .unwrap();
+        let dept_names: Vec<&str> = ext_depts.iter().map(|d| d.name.as_str()).collect();
+        assert!(dept_names.contains(&"Sales"));
+        assert!(dept_names.contains(&"Support"));
+    }
+
+    #[tokio::test]
+    async fn csv_import_extensions_invalid_bool() {
+        let state = setup_state().await;
+        let user = superuser();
+        let payload = CsvExtensionImportPayload {
+            extensions: vec![CsvExtensionRow {
+                extension: "5001".into(),
+                login_disabled: Some("invalid".into()),
+                ..Default::default()
+            }],
+        };
+        let resp = csv_import_extensions(State(state), AuthRequired(user), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["imported"], 0);
+        assert_eq!(parsed["skipped"], 1);
+        assert!(
+            parsed["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("invalid login_disabled")
+        );
     }
 }

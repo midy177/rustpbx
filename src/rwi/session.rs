@@ -529,32 +529,15 @@ pub struct ConferenceCreateRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ConferenceAddRequest {
+pub struct ConferenceMemberRequest {
     #[serde(alias = "conference_id")]
     pub conf_id: Option<String>,
     pub call_id: Option<String>,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConferenceRemoveRequest {
-    #[serde(alias = "conference_id")]
-    pub conf_id: Option<String>,
-    pub call_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConferenceMuteRequest {
-    #[serde(alias = "conference_id")]
-    pub conf_id: Option<String>,
-    pub call_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConferenceUnmuteRequest {
-    #[serde(alias = "conference_id")]
-    pub conf_id: Option<String>,
-    pub call_id: Option<String>,
-}
+pub type ConferenceAddRequest = ConferenceMemberRequest;
+pub type ConferenceRemoveRequest = ConferenceMemberRequest;
+pub type ConferenceMuteRequest = ConferenceMemberRequest;
+pub type ConferenceUnmuteRequest = ConferenceMemberRequest;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConferenceDestroyRequest {
@@ -1166,12 +1149,13 @@ impl From<RwiRequest> for RwiCommandPayload {
             RwiRequestPayload::ConferenceDestroy(r) => RwiCommandPayload::ConferenceDestroy {
                 conf_id: r.conf_id.unwrap_or_default(),
             },
-            RwiRequestPayload::ConferenceEnd { conf_id, host_call_id } => {
-                RwiCommandPayload::ConferenceEnd {
-                    conf_id: conf_id.unwrap_or_default(),
-                    host_call_id: host_call_id.unwrap_or_default(),
-                }
-            }
+            RwiRequestPayload::ConferenceEnd {
+                conf_id,
+                host_call_id,
+            } => RwiCommandPayload::ConferenceEnd {
+                conf_id: conf_id.unwrap_or_default(),
+                host_call_id: host_call_id.unwrap_or_default(),
+            },
             RwiRequestPayload::ConferenceMerge(r) => RwiCommandPayload::ConferenceMerge {
                 conf_id: r.conf_id.unwrap_or_default(),
                 call_id: r.call_id.unwrap_or_default(),
