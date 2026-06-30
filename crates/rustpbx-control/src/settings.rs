@@ -3,7 +3,9 @@
 //! `base_domain` used to mint each tenant's default `{id}.{base_domain}` domain.
 
 use anyhow::Result;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait, Value,
+};
 
 pub const KEY_BASE_DOMAIN: &str = "base_domain";
 pub const KEY_STUN_SERVERS: &str = "stun_servers";
@@ -63,9 +65,72 @@ impl<'a> PlatformSettings<'a> {
 
     /// Increment and persist the configuration version.
     pub async fn bump_config_version(&self) -> Result<u64> {
-        let next = self.config_version().await.saturating_add(1);
-        self.set(KEY_CONFIG_VERSION, &next.to_string()).await?;
-        Ok(next)
+        let backend = self.db.get_database_backend();
+        let txn = self.db.begin().await?;
+        let key_value = || Value::String(Some(Box::new(KEY_CONFIG_VERSION.to_string())));
+
+        let insert_sql = match backend {
+            DatabaseBackend::MySql => {
+                "INSERT IGNORE INTO rustpbx_platform_settings (key, value) VALUES (?, '0')"
+            }
+            DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+                "INSERT INTO rustpbx_platform_settings (key, value) VALUES ($1, '0') \
+                 ON CONFLICT (key) DO NOTHING"
+            }
+        };
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            insert_sql,
+            vec![key_value()],
+        ))
+        .await?;
+
+        let update_sql = match backend {
+            DatabaseBackend::Postgres => {
+                "UPDATE rustpbx_platform_settings \
+                 SET value = ((COALESCE(NULLIF(value, ''), '0'))::bigint + 1)::text, \
+                     updated_at = CURRENT_TIMESTAMP \
+                 WHERE key = $1"
+            }
+            DatabaseBackend::Sqlite => {
+                "UPDATE rustpbx_platform_settings \
+                 SET value = CAST(CAST(COALESCE(NULLIF(value, ''), '0') AS INTEGER) + 1 AS TEXT), \
+                     updated_at = CURRENT_TIMESTAMP \
+                 WHERE key = $1"
+            }
+            DatabaseBackend::MySql => {
+                "UPDATE rustpbx_platform_settings \
+                 SET value = CAST(CAST(COALESCE(NULLIF(value, ''), '0') AS UNSIGNED) + 1 AS CHAR), \
+                     updated_at = CURRENT_TIMESTAMP \
+                 WHERE key = ?"
+            }
+        };
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            update_sql,
+            vec![key_value()],
+        ))
+        .await?;
+
+        let select_sql = match backend {
+            DatabaseBackend::MySql => "SELECT value FROM rustpbx_platform_settings WHERE key = ?",
+            DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+                "SELECT value FROM rustpbx_platform_settings WHERE key = $1"
+            }
+        };
+        let row = txn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                select_sql,
+                vec![key_value()],
+            ))
+            .await?;
+        let version = row
+            .and_then(|r| r.try_get::<Option<String>>("", "value").ok().flatten())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_default();
+        txn.commit().await?;
+        Ok(version)
     }
 
     /// Convenience: the configured wildcard base domain (empty string if unset).
@@ -129,5 +194,27 @@ impl<'a> PlatformSettings<'a> {
             self.set(KEY_BASE_DOMAIN, from_config).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::Database;
+    use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+    #[tokio::test]
+    async fn bump_config_version_is_monotonic() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::migration::create_platform_settings::Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+        let settings = PlatformSettings::new(&db);
+
+        assert_eq!(settings.bump_config_version().await.unwrap(), 1);
+        assert_eq!(settings.bump_config_version().await.unwrap(), 2);
+        assert_eq!(settings.bump_config_version().await.unwrap(), 3);
+        assert_eq!(settings.config_version().await, 3);
     }
 }

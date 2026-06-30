@@ -288,8 +288,11 @@ Worker → Edge 的 CDR 时间线状态上报。
 - 多 Edge：Edge 会在成功 INVITE 响应里加入指向本 Edge 的 `Record-Route`，让后续
   in-dialog 请求回到同一 Edge；入站首呼仍可横向扩展。外层 LB/SBC 仍建议保持
   5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。
-- 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置变更仍需
-  确认只有 leader 广播或具备幂等版本推进。
+- 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置版本号已在
+  `rustpbx_platform_settings` 内原子递增，Edge/Worker 重连 watch 时如果
+  `from_version` 落后会收到 `PlatformChanged` resync 事件。实时广播仍是当前
+  Control 进程内的本地 stream，跨 Control 节点的即时广播可后续接入 Raft event bus
+  或数据库通知机制。
 
 验证基线：
 

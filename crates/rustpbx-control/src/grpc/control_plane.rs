@@ -7,6 +7,7 @@ use crate::{
         WorkerInfo, WorkerList, control_plane_server::ControlPlane,
     },
     raft::registry::RaftRegistry,
+    settings::PlatformSettings,
     store::Store,
 };
 use futures::Stream;
@@ -76,7 +77,7 @@ impl ControlPlane for ControlPlaneService {
         info!(count = trunks.len(), "trunk configs sent");
         Ok(Response::new(TrunkConfigList {
             trunks,
-            version: version_now(),
+            version: PlatformSettings::new(&self.store.db).config_version().await,
         }))
     }
 
@@ -95,7 +96,7 @@ impl ControlPlane for ControlPlaneService {
         info!(count = rules.len(), "route rules sent");
         Ok(Response::new(RouteRuleList {
             rules,
-            version: version_now(),
+            version: PlatformSettings::new(&self.store.db).config_version().await,
         }))
     }
 
@@ -114,7 +115,7 @@ impl ControlPlane for ControlPlaneService {
 
         Ok(Response::new(AclRuleList {
             rules,
-            version: version_now(),
+            version: PlatformSettings::new(&self.store.db).config_version().await,
         }))
     }
 
@@ -167,13 +168,30 @@ impl ControlPlane for ControlPlaneService {
         request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchConfigChangesStream>, Status> {
         let req = request.into_inner();
-        info!(edge_id = ?req.edge_id, worker_id = ?req.worker_id, "watch_config_changes subscribed");
+        info!(
+            edge_id = ?req.edge_id,
+            worker_id = ?req.worker_id,
+            from_version = req.from_version,
+            "watch_config_changes subscribed"
+        );
 
+        let current_version = PlatformSettings::new(&self.store.db).config_version().await;
+        let initial = (req.from_version < current_version).then(|| {
+            Ok(ConfigChangeEvent {
+                change_type:
+                    crate::grpc::proto::control::config_change_event::ChangeType::PlatformChanged
+                        as i32,
+                name: Some("resync".to_string()),
+                trunk: None,
+                version: current_version,
+            })
+        });
         let rx = self.change_tx.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        let live = BroadcastStream::new(rx).filter_map(|result| match result {
             Ok(event) => Some(Ok(event)),
             Err(_) => None, // lagged receiver — drop and continue
         });
+        let stream = tokio_stream::iter(initial.into_iter()).chain(live);
 
         Ok(Response::new(Box::pin(stream)))
     }
@@ -488,14 +506,6 @@ impl ControlPlane for ControlPlaneService {
             },
         ))
     }
-}
-
-/// Use current unix seconds as a cheap monotonic version number.
-fn version_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn extension_affinity_key(tenant_id: Option<i64>, extension: &str) -> String {
