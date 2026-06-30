@@ -110,6 +110,19 @@ impl WorkerRecord {
             .unwrap_or(100)
     }
 
+    pub fn failure_domain(&self) -> String {
+        self.labels
+            .get("failure_domain")
+            .or_else(|| self.labels.get("availability_zone"))
+            .or_else(|| self.labels.get("az"))
+            .or_else(|| self.labels.get("zone"))
+            .or_else(|| self.labels.get("region"))
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("worker:{}", self.worker_id))
+    }
+
     /// Healthy = not draining and heartbeat within `timeout_ms` of `now_ms`.
     pub fn is_healthy(&self, now_ms: i64, timeout_ms: i64) -> bool {
         !self.draining && now_ms.saturating_sub(self.last_heartbeat_ms) < timeout_ms

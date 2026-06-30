@@ -5,7 +5,7 @@
 //! join), and reads are served from the local state machine. In single-node
 //! mode this node is the only voter, so writes commit immediately.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -557,6 +557,7 @@ impl RaftRegistry {
                 w.worker_id.clone(),
             )
         });
+        workers = interleave_failure_domains(workers);
         if let Some(affinity_key) = affinity_key.filter(|key| !key.trim().is_empty()) {
             let bound_ids: BTreeSet<String> = self
                 .sm
@@ -586,6 +587,36 @@ impl RaftRegistry {
         }
         workers
     }
+}
+
+fn interleave_failure_domains(workers: Vec<WorkerRecord>) -> Vec<WorkerRecord> {
+    if workers.len() < 3 {
+        return workers;
+    }
+
+    let mut groups: Vec<(String, VecDeque<WorkerRecord>)> = Vec::new();
+    for worker in workers {
+        let domain = worker.failure_domain();
+        if let Some((_, group)) = groups.iter_mut().find(|(key, _)| key == &domain) {
+            group.push_back(worker);
+        } else {
+            groups.push((domain, VecDeque::from([worker])));
+        }
+    }
+
+    if groups.len() <= 1 {
+        return groups.into_iter().flat_map(|(_, group)| group).collect();
+    }
+
+    let mut out = Vec::new();
+    while groups.iter().any(|(_, group)| !group.is_empty()) {
+        for (_, group) in &mut groups {
+            if let Some(worker) = group.pop_front() {
+                out.push(worker);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -980,6 +1011,40 @@ mod tests {
                 "low-cost".to_string(),
                 "invalid-cost".to_string(),
                 "high-cost".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn available_interleaves_failure_domains_for_candidate_spread() {
+        let reg = start().await;
+
+        for (id, zone) in [
+            ("a1", "az-a"),
+            ("a2", "az-a"),
+            ("a3", "az-a"),
+            ("b1", "az-b"),
+            ("b2", "az-b"),
+        ] {
+            let mut worker = rec(id);
+            worker
+                .labels
+                .insert("failure_domain".to_string(), zone.to_string());
+            reg.register(worker).await.unwrap();
+        }
+
+        let avail = reg
+            .available_with_constraints(None, &HashMap::new(), &[], None)
+            .await;
+        let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "a1".to_string(),
+                "b1".to_string(),
+                "a2".to_string(),
+                "b2".to_string(),
+                "a3".to_string()
             ]
         );
     }

@@ -150,6 +150,8 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
   或 `tenant:<id> = "true"` 标签的 Worker，并按 NAT 可达性排序。
 - 如果容量、租户亲和与 NAT 可达性相同，Control 会按 Worker label
   `schedule_cost`（或 `cost`）升序选择；未设置或非法值按 `100` 处理。
+- Control 会读取 Worker 的 `failure_domain`、`availability_zone`、`az`、`zone`
+  或 `region` 标签，对候选列表做跨故障域交错，优先让 failover/fork 跨 AZ。
 - 会议应用会生成 `conference:<tenant>:<room>` affinity key；Control 会把同一房间
   粘到同一个健康 Worker，避免多 Worker 下同名会议室被拆成多个本地 mixer。
 - Worker 会在分机 REGISTER 成功后上报 `extension:<tenant>:<ext>` affinity；同一分机
@@ -274,15 +276,17 @@ Worker → Edge 的 CDR 时间线状态上报。
    元数据，并按最高 q 值排序同一分机的 Worker 目标；Edge 已接收 Contact 明细并写入
    内部 INVITE 的 `X-Targets`，让 Worker 对同一节点上的多个 Contact 精确 fork。
    后续可继续补跨 Worker 的 Contact 全局去重/冲突处理策略。
-2. **多 Control 即时配置广播**：当前已有数据库单调版本、watch 重连 resync 和 Edge
-   周期 poll 兜底；后续接入 Raft event bus 或数据库通知，把配置事件从写入节点广播
-   到所有 Control 节点的本地 watch stream。
+2. **多 Control 即时配置广播**：Control 现在会轮询共享 `config_version`，把其他
+   Control 节点写入的配置变化广播到本节点的 watch stream；Edge/Worker 的 watch
+   重连 resync 和 Edge 周期 poll 仍作为兜底。后续如果限定 Postgres，可再替换为
+   LISTEN/NOTIFY 或 Raft event bus，降低到亚秒级推送。
 3. **RTP Gateway Phase 2 实体处理**：`MediaThreadCallSink` 与
    `spawn_media_thread_bridge` 已建立可调用的专用线程边界；后续把 PCM 注入、SDP
    renegotiate 和真实 RTP/codec 循环接入该线程，并通过 `MediaEvent` 返回成功/失败。
+   真正挂入当前运行的 `CallModule` 需要修改根 `src/` 的通话会话边界，当前按约束暂不动。
 4. **调度 failure-domain 策略**：Control 已按健康、draining、容量、labels、
-   capabilities、租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序；后续补跨 AZ
-   分散、故障域避让和更细的权重组合。
+   capabilities、租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序，并对候选 Worker
+   按故障域交错；后续可继续补基于实时域内负载的权重组合。
 5. **受根 `src/` 限制的事项**：共享 Dialplan Resolver 接入单体
    `CallModule::default_resolve`，以及真正实时的 ringing/answered 状态 hook，都需要
    修改根 `src/` 的通话状态机；在允许改根 `src/` 前只保留设计边界，不落代码。
@@ -299,10 +303,10 @@ Worker → Edge 的 CDR 时间线状态上报。
   in-dialog 请求回到同一 Edge；入站首呼仍可横向扩展。外层 LB/SBC 仍建议保持
   5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置版本号已在
-  `rustpbx_platform_settings` 内原子递增，Edge/Worker 重连 watch 时如果
-  `from_version` 落后会收到 `PlatformChanged` resync 事件。Edge 还会按
-  `config_poll_secs` 周期重拉配置，作为跨 Control live stream 未即时广播的兜底；
-  后续可继续接入 Raft event bus 或数据库通知机制来实现真正跨节点即时广播。
+  `rustpbx_platform_settings` 内原子递增。每个 Control 会按
+  `config_version_poll_secs` 观察共享版本并向本地 watch stream 广播其他节点写入的
+  `PlatformChanged`；Edge/Worker 重连 watch 时如果 `from_version` 落后也会收到
+  resync 事件。Edge 还会按 `config_poll_secs` 周期重拉配置作为兜底。
 
 验证基线：
 
