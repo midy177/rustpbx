@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
-    extract::FromRequestParts,
+    extract::{FromRequestParts, State},
     http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TENANT_ID: &str = "default";
@@ -91,14 +92,19 @@ impl TenantRole {
 struct TenantSummary {
     id: String,
     name: String,
-    status: TenantStatus,
+    status: String,
     domain: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TenantStatus {
-    Active,
+impl From<crate::models::tenant::Model> for TenantSummary {
+    fn from(value: crate::models::tenant::Model) -> Self {
+        Self {
+            id: value.slug,
+            name: value.name,
+            status: value.status,
+            domain: value.domain,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,11 +120,12 @@ struct ErrorBody {
     message: &'static str,
 }
 
-pub fn router() -> Router {
+pub fn router(state: crate::app::AppState) -> Router {
     Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(session))
         .route("/api/tenants", get(list_tenants))
+        .with_state(state)
 }
 
 async fn login(Json(payload): Json<LoginRequest>) -> Response {
@@ -144,13 +151,31 @@ async fn session() -> Response {
         .into_response()
 }
 
-async fn list_tenants(ctx: TenantContext) -> Json<Vec<TenantSummary>> {
-    Json(vec![TenantSummary {
-        id: ctx.id,
-        name: ctx.name,
-        status: TenantStatus::Active,
-        domain: None,
-    }])
+async fn list_tenants(State(state): State<crate::app::AppState>, ctx: TenantContext) -> Response {
+    use crate::models::tenant::{Column, Entity};
+
+    let mut query = Entity::find().order_by_asc(Column::Name);
+    if ctx.role != TenantRole::PlatformAdmin {
+        query = query.filter(Column::Slug.eq(ctx.id.clone()));
+    }
+
+    match query.all(state.db()).await {
+        Ok(tenants) => Json(
+            tenants
+                .into_iter()
+                .map(TenantSummary::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "tenant_query_failed",
+                message: "Failed to load tenants.",
+            }),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

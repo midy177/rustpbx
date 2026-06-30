@@ -864,7 +864,7 @@ pub fn create_router(state: AppState) -> Router {
             get(iceservers_handler).with_state(state.clone()),
         )
         .merge(state.addon_registry.get_routers(state.clone()))
-        .merge(crate::cloudpbx::router())
+        .merge(crate::cloudpbx::router(state.clone()))
         .nest_service(&static_path, static_files_service)
         .merge(call_routes)
         .layer(cors);
