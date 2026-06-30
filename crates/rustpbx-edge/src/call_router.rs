@@ -272,9 +272,9 @@ impl EdgeCallRouter {
         ctx: &InternalCallContext,
     ) -> std::result::Result<Dialplan, RouteError> {
         let affinity_key = extension_affinity_key(ctx.tenant_id, ctx);
-        let worker = self
+        let workers = self
             .worker_selector
-            .select(ctx.tenant_id, affinity_key.clone())
+            .select_all(ctx.tenant_id, affinity_key.clone())
             .await
             .map_err(|e| {
                 warn!(error = %e, "no worker available for internal extension call");
@@ -285,30 +285,51 @@ impl EdgeCallRouter {
             .call_id_header()
             .map(|h| h.value().to_string())
             .unwrap_or_else(|_| format!("edge-internal-{}", std::process::id()));
-        let worker_contact = self
-            .allocate_on_worker(
-                &worker,
-                &session_id,
-                ctx.tenant_id,
-                &ctx.original_from,
-                &ctx.original_to,
-                "internal",
-            )
-            .await
-            .map_err(|e| {
-                warn!(worker_id = %worker.worker_id, error = %e, "target worker allocation failed");
-                RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
+        let mut locations = Vec::new();
+        for worker in workers {
+            let worker_contact = match self
+                .allocate_on_worker(
+                    &worker,
+                    &session_id,
+                    ctx.tenant_id,
+                    &ctx.original_from,
+                    &ctx.original_to,
+                    "internal",
+                )
+                .await
+            {
+                Ok(contact) => contact,
+                Err(e) => {
+                    warn!(worker_id = %worker.worker_id, error = %e, "target worker allocation failed");
+                    continue;
+                }
+            };
+            let worker_uri = Uri::try_from(worker_contact.as_str()).map_err(|e| {
+                RouteError::from((anyhow!("invalid worker sip_contact: {}", e), None))
             })?;
-        let worker_uri = Uri::try_from(worker_contact.as_str())
-            .map_err(|e| RouteError::from((anyhow!("invalid worker sip_contact: {}", e), None)))?;
-
-        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Internal)
-            .with_targets(DialStrategy::Sequential(vec![Location {
+            locations.push(Location {
                 aor: worker_uri,
                 headers: Some(encode_headers(ctx)),
                 transport: Some(Transport::Tcp),
                 ..Default::default()
-            }]));
+            });
+        }
+
+        if locations.is_empty() {
+            return Err(RouteError::from((
+                anyhow!("all target worker allocations failed"),
+                Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+            )));
+        }
+
+        let strategy = if locations.len() > 1 {
+            DialStrategy::Parallel(locations)
+        } else {
+            DialStrategy::Sequential(locations)
+        };
+
+        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Internal)
+            .with_targets(strategy);
 
         dialplan.media.proxy_mode = MediaProxyMode::None;
         dialplan = dialplan.with_passthrough_failure(true);

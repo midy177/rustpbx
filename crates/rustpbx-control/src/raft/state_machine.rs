@@ -50,6 +50,10 @@ pub struct StoredSnapshot {
     /// Optional sticky routing expiry: affinity_key -> unix millis.
     #[serde(default)]
     pub worker_affinity_expires: BTreeMap<String, i64>,
+    /// Multi-member sticky routing map: affinity_key -> worker_id -> expires_at_ms.
+    /// An expiry of `0` means the member does not expire by TTL.
+    #[serde(default)]
+    pub worker_affinity_members: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -69,6 +73,8 @@ struct StateMachineData {
     worker_affinity: BTreeMap<String, String>,
     /// affinity_key -> unix millis
     worker_affinity_expires: BTreeMap<String, i64>,
+    /// affinity_key -> worker_id -> unix millis; 0 means no expiry
+    worker_affinity_members: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -116,16 +122,56 @@ impl StateMachineStore {
 
     /// Resolve a sticky worker binding by affinity key.
     pub async fn worker_for_affinity(&self, affinity_key: &str) -> Option<String> {
+        self.worker_ids_for_affinity(affinity_key)
+            .await
+            .into_iter()
+            .next()
+    }
+
+    /// Resolve sticky worker bindings by affinity key, excluding expired members.
+    pub async fn worker_ids_for_affinity(&self, affinity_key: &str) -> Vec<String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let data = self.data.lock().await;
+        if let Some(members) = data.worker_affinity_members.get(affinity_key) {
+            return members
+                .iter()
+                .filter_map(|(worker_id, expires_at_ms)| {
+                    (*expires_at_ms == 0 || *expires_at_ms > now_ms).then(|| worker_id.clone())
+                })
+                .collect();
+        }
         if data
             .worker_affinity_expires
             .get(affinity_key)
-            .is_some_and(|expires_at_ms| *expires_at_ms <= chrono::Utc::now().timestamp_millis())
+            .is_some_and(|expires_at_ms| *expires_at_ms <= now_ms)
         {
-            return None;
+            return Vec::new();
         }
-        data.worker_affinity.get(affinity_key).cloned()
+        data.worker_affinity
+            .get(affinity_key)
+            .cloned()
+            .into_iter()
+            .collect()
     }
+}
+
+fn remove_worker_from_affinity(data: &mut StateMachineData, worker_id: &str) {
+    data.worker_affinity.retain(|_, id| id != worker_id);
+    data.worker_affinity_members.retain(|key, members| {
+        members.remove(worker_id);
+        if let Some(primary) = data.worker_affinity.get(key)
+            && primary == worker_id
+        {
+            if let Some(next) = members.keys().next() {
+                data.worker_affinity.insert(key.clone(), next.clone());
+            } else {
+                data.worker_affinity.remove(key);
+            }
+        }
+        !members.is_empty()
+    });
+    data.worker_affinity_expires
+        .retain(|key, _| data.worker_affinity.contains_key(key));
 }
 
 /// Count a tenant's currently-held slots in the map.
@@ -194,13 +240,7 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
         RegistryCommand::Remove { worker_id } => {
             let removed = workers.remove(&worker_id).is_some() as u32;
             if removed > 0 {
-                let before = data.worker_affinity.len();
-                data.worker_affinity.retain(|_, id| id != &worker_id);
-                let affinity_removed = before - data.worker_affinity.len();
-                if affinity_removed > 0 {
-                    data.worker_affinity_expires
-                        .retain(|key, _| data.worker_affinity.contains_key(key));
-                }
+                remove_worker_from_affinity(data, &worker_id);
             }
             RegistryResponse::known(removed > 0, removed)
         }
@@ -211,6 +251,19 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             if removed > 0 {
                 data.worker_affinity
                     .retain(|_, worker_id| workers.contains_key(worker_id));
+                data.worker_affinity_members.retain(|key, members| {
+                    members.retain(|worker_id, _| workers.contains_key(worker_id));
+                    if let Some(primary) = data.worker_affinity.get(key)
+                        && !members.contains_key(primary)
+                    {
+                        if let Some(next) = members.keys().next() {
+                            data.worker_affinity.insert(key.clone(), next.clone());
+                        } else {
+                            data.worker_affinity.remove(key);
+                        }
+                    }
+                    !members.is_empty()
+                });
                 data.worker_affinity_expires
                     .retain(|key, _| data.worker_affinity.contains_key(key));
             }
@@ -369,25 +422,52 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             worker_id,
             expires_at_ms,
         } => {
+            let member_expires_at_ms = expires_at_ms.unwrap_or(0);
             data.worker_affinity
-                .insert(affinity_key.clone(), worker_id);
-            if let Some(expires_at_ms) = expires_at_ms {
-                data.worker_affinity_expires
-                    .insert(affinity_key, expires_at_ms);
-            } else {
+                .insert(affinity_key.clone(), worker_id.clone());
+            if expires_at_ms.is_none() {
                 data.worker_affinity_expires.remove(&affinity_key);
             }
+            data.worker_affinity_members
+                .entry(affinity_key)
+                .or_default()
+                .insert(worker_id, member_expires_at_ms);
             RegistryResponse::known(true, 0)
         }
         RegistryCommand::UnbindAffinity { affinity_key } => {
             let removed = data.worker_affinity.remove(&affinity_key).is_some() as u32;
             data.worker_affinity_expires.remove(&affinity_key);
+            data.worker_affinity_members.remove(&affinity_key);
+            RegistryResponse::known(removed > 0, removed)
+        }
+        RegistryCommand::UnbindAffinityWorker {
+            affinity_key,
+            worker_id,
+        } => {
+            let mut removed = 0;
+            if let Some(members) = data.worker_affinity_members.get_mut(&affinity_key) {
+                removed = members.remove(&worker_id).is_some() as u32;
+                if members.is_empty() {
+                    data.worker_affinity_members.remove(&affinity_key);
+                    data.worker_affinity.remove(&affinity_key);
+                    data.worker_affinity_expires.remove(&affinity_key);
+                } else if data.worker_affinity.get(&affinity_key) == Some(&worker_id)
+                    && let Some(next) = members.keys().next()
+                {
+                    data.worker_affinity
+                        .insert(affinity_key.clone(), next.clone());
+                }
+            } else if data.worker_affinity.get(&affinity_key) == Some(&worker_id) {
+                removed = data.worker_affinity.remove(&affinity_key).is_some() as u32;
+                data.worker_affinity_expires.remove(&affinity_key);
+            }
             RegistryResponse::known(removed > 0, removed)
         }
         RegistryCommand::ReapAffinity { before_ms } => {
             let expired: Vec<String> = data
                 .worker_affinity_expires
                 .iter()
+                .filter(|(key, _)| !data.worker_affinity_members.contains_key(*key))
                 .filter_map(|(key, expires_at_ms)| {
                     (*expires_at_ms <= before_ms).then(|| key.clone())
                 })
@@ -395,8 +475,31 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             for key in &expired {
                 data.worker_affinity.remove(key);
                 data.worker_affinity_expires.remove(key);
+                data.worker_affinity_members.remove(key);
             }
-            RegistryResponse::known(true, expired.len() as u32)
+            let mut removed = expired.len() as u32;
+            let keys: Vec<String> = data.worker_affinity_members.keys().cloned().collect();
+            for key in keys {
+                let Some(members) = data.worker_affinity_members.get_mut(&key) else {
+                    continue;
+                };
+                let before = members.len();
+                members.retain(|_, expires_at_ms| *expires_at_ms == 0 || *expires_at_ms > before_ms);
+                removed += (before - members.len()) as u32;
+                if members.is_empty() {
+                    data.worker_affinity_members.remove(&key);
+                    data.worker_affinity.remove(&key);
+                    data.worker_affinity_expires.remove(&key);
+                } else if data
+                    .worker_affinity
+                    .get(&key)
+                    .is_none_or(|primary| !members.contains_key(primary))
+                    && let Some(next) = members.keys().next()
+                {
+                    data.worker_affinity.insert(key, next.clone());
+                }
+            }
+            RegistryResponse::known(true, removed)
         }
     }
 }
@@ -412,6 +515,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             call_starts,
             worker_affinity,
             worker_affinity_expires,
+            worker_affinity_members,
         ) = {
             let data = self.data.lock().await;
             (
@@ -423,6 +527,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
                 data.call_starts.clone(),
                 data.worker_affinity.clone(),
                 data.worker_affinity_expires.clone(),
+                data.worker_affinity_members.clone(),
             )
         };
 
@@ -444,6 +549,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             call_starts,
             worker_affinity,
             worker_affinity_expires,
+            worker_affinity_members,
         };
         let bytes =
             serde_json::to_vec(&stored).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -535,6 +641,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.call_starts = stored.call_starts;
         data.worker_affinity = stored.worker_affinity;
         data.worker_affinity_expires = stored.worker_affinity_expires;
+        data.worker_affinity_members = stored.worker_affinity_members;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {

@@ -225,6 +225,11 @@ pub enum RegistryCommand {
     },
     /// Remove an affinity binding.
     UnbindAffinity { affinity_key: String },
+    /// Remove one worker from an affinity binding.
+    UnbindAffinityWorker {
+        affinity_key: String,
+        worker_id: String,
+    },
     /// Remove affinity bindings whose expiry is at or before `before_ms`.
     ReapAffinity { before_ms: i64 },
 }

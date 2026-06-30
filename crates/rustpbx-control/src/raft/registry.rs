@@ -5,7 +5,7 @@
 //! join), and reads are served from the local state machine. In single-node
 //! mode this node is the only voter, so writes commit immediately.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -451,9 +451,25 @@ impl RaftRegistry {
     }
 
     /// Remove a sticky routing key.
+    #[allow(dead_code)]
     pub async fn unbind_affinity(&self, affinity_key: String) -> Result<bool> {
         let resp = self
             .propose(RegistryCommand::UnbindAffinity { affinity_key })
+            .await?;
+        Ok(resp.removed > 0)
+    }
+
+    /// Remove one worker from a sticky routing key.
+    pub async fn unbind_affinity_worker(
+        &self,
+        affinity_key: String,
+        worker_id: String,
+    ) -> Result<bool> {
+        let resp = self
+            .propose(RegistryCommand::UnbindAffinityWorker {
+                affinity_key,
+                worker_id,
+            })
             .await?;
         Ok(resp.removed > 0)
     }
@@ -510,6 +526,16 @@ impl RaftRegistry {
             ))
         });
         if let Some(affinity_key) = affinity_key.filter(|key| !key.trim().is_empty()) {
+            let bound_ids: BTreeSet<String> = self
+                .sm
+                .worker_ids_for_affinity(affinity_key)
+                .await
+                .into_iter()
+                .collect();
+            if !bound_ids.is_empty() {
+                workers.retain(|w| bound_ids.contains(&w.worker_id));
+                return workers;
+            }
             if let Some(worker_id) = self.sm.worker_for_affinity(affinity_key).await
                 && let Some(pos) = workers.iter().position(|w| w.worker_id == worker_id)
             {
@@ -524,6 +550,7 @@ impl RaftRegistry {
             {
                 tracing::warn!(affinity_key, error = %e, "failed to bind worker affinity");
             }
+            workers.truncate(1);
         }
         workers
     }
@@ -951,7 +978,38 @@ mod tests {
             .await
             .unwrap();
         let removed = reg.reap_affinity().await.unwrap();
-        assert_eq!(removed, 1, "expired binding should be removed");
+        assert_eq!(removed, 2, "expired bindings should be removed");
+    }
+
+    #[tokio::test]
+    async fn available_returns_all_healthy_affinity_members() {
+        let reg = start().await;
+
+        reg.register(rec("worker-a")).await.unwrap();
+        reg.register(rec("worker-b")).await.unwrap();
+        reg.register(rec("worker-c")).await.unwrap();
+
+        let key = "extension:1:1001";
+        reg.bind_affinity_ttl(
+            key.to_string(),
+            "worker-a".to_string(),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        reg.bind_affinity_ttl(
+            key.to_string(),
+            "worker-b".to_string(),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+        let workers = reg
+            .available_with_constraints(None, &HashMap::new(), &[], Some(key))
+            .await;
+        let ids: Vec<String> = workers.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(ids, vec!["worker-a".to_string(), "worker-b".to_string()]);
     }
 
     #[tokio::test]

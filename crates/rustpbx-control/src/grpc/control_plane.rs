@@ -275,10 +275,14 @@ impl ControlPlane for ControlPlaneService {
         let affinity_key = extension_affinity_key(report.tenant_id, extension);
         if report.expires_secs == 0 {
             self.workers
-                .unbind_affinity(affinity_key.clone())
+                .unbind_affinity_worker(affinity_key.clone(), report.worker_id.clone())
                 .await
                 .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
-            info!(affinity_key = %affinity_key, "extension location unbound");
+            info!(
+                affinity_key = %affinity_key,
+                worker_id = %report.worker_id,
+                "extension location unbound"
+            );
         } else {
             self.workers
                 .bind_affinity_ttl(
