@@ -6,7 +6,8 @@ use axum::{
     routing::{get, post},
 };
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -317,6 +318,18 @@ struct LoginRequest {
     tenant: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateExtensionRequest {
+    extension: String,
+    display_name: Option<String>,
+    email: Option<String>,
+    status: Option<String>,
+    login_disabled: Option<bool>,
+    voicemail_disabled: Option<bool>,
+    allow_guest_calls: Option<bool>,
+    notes: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -328,7 +341,10 @@ pub fn router(state: crate::app::AppState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(session))
         .route("/api/tenants", get(list_tenants))
-        .route("/api/cloudpbx/extensions", get(list_extensions))
+        .route(
+            "/api/cloudpbx/extensions",
+            get(list_extensions).post(create_extension),
+        )
         .route("/api/cloudpbx/sip-trunks", get(list_sip_trunks))
         .route("/api/cloudpbx/routes", get(list_routes))
         .route("/api/cloudpbx/call-records", get(list_call_records))
@@ -411,6 +427,94 @@ async fn list_extensions(
         )
         .into_response(),
         Err(_) => tenant_query_failed(),
+    }
+}
+
+async fn create_extension(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<CreateExtensionRequest>,
+) -> Response {
+    match create_extension_for_tenant(state.db(), &ctx, payload).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn create_extension_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    payload: CreateExtensionRequest,
+) -> Result<ExtensionSummary, Response> {
+    use crate::models::extension::{ActiveModel, Column, Entity};
+
+    let extension = payload.extension.trim();
+    if extension.is_empty() {
+        return Err(bad_request("invalid_extension", "Extension is required."));
+    }
+    if extension.len() > 32 {
+        return Err(bad_request(
+            "invalid_extension",
+            "Extension must be 32 characters or fewer.",
+        ));
+    }
+
+    let tenant_id = match resolve_write_tenant_id(db, ctx).await {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return Err(response),
+    };
+
+    match Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::Extension.eq(extension))
+        .one(db)
+        .await
+    {
+        Ok(Some(_)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "extension_exists",
+                    message: "Extension already exists in this tenant.",
+                }),
+            )
+                .into_response());
+        }
+        Ok(None) => {}
+        Err(_) => return Err(tenant_query_failed()),
+    }
+
+    let now = chrono::Utc::now();
+    let model = ActiveModel {
+        tenant_id: Set(Some(tenant_id)),
+        extension: Set(extension.to_string()),
+        display_name: Set(clean_optional_string(payload.display_name)),
+        email: Set(clean_optional_string(payload.email)),
+        status: Set(clean_optional_string(payload.status).or_else(|| Some("active".to_string()))),
+        login_disabled: Set(payload.login_disabled.unwrap_or(false)),
+        voicemail_disabled: Set(payload.voicemail_disabled.unwrap_or(false)),
+        allow_guest_calls: Set(payload.allow_guest_calls.unwrap_or(false)),
+        sip_password: Set(None),
+        call_forwarding_mode: Set(Some("none".to_string())),
+        call_forwarding_destination: Set(None),
+        call_forwarding_timeout: Set(None),
+        registered_at: Set(None),
+        notes: Set(clean_optional_string(payload.notes)),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+
+    match model.insert(db).await {
+        Ok(model) => Ok(ExtensionSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "extension_create_failed",
+                message: "Failed to create extension.",
+            }),
+        )
+            .into_response()),
     }
 }
 
@@ -548,6 +652,40 @@ async fn resolve_tenant_scope(
     })
 }
 
+async fn resolve_write_tenant_id(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+) -> Result<i64, Response> {
+    use crate::models::tenant::{Column, Entity};
+
+    match Entity::find()
+        .filter(Column::Slug.eq(ctx.id.clone()))
+        .one(db)
+        .await
+    {
+        Ok(Some(tenant)) => Ok(tenant.id),
+        Ok(None) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "tenant_not_found",
+                message: "Tenant does not exist.",
+            }),
+        )
+            .into_response()),
+        Err(_) => Err(tenant_query_failed()),
+    }
+}
+
+fn clean_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn bad_request(error: &'static str, message: &'static str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(ErrorBody { error, message })).into_response()
+}
+
 fn tenant_query_failed() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -563,7 +701,7 @@ fn tenant_query_failed() -> Response {
 mod tests {
     use super::*;
     use crate::models::migration::Migrator;
-    use sea_orm::Database;
+    use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter};
     use sea_orm_migration::MigratorTrait;
 
     #[test]
@@ -621,5 +759,52 @@ mod tests {
             .await
             .expect("missing scope");
         assert!(matches!(missing_scope, TenantDbScope::Missing));
+    }
+
+    #[tokio::test]
+    async fn create_extension_sets_current_tenant_id() {
+        use crate::models::{
+            extension::{Column as ExtensionColumn, Entity as ExtensionEntity},
+            tenant::{Column as TenantColumn, Entity as TenantEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_extension_for_tenant(
+            &db,
+            &ctx,
+            CreateExtensionRequest {
+                extension: "1001".to_string(),
+                display_name: Some("Alice".to_string()),
+                email: None,
+                status: None,
+                login_disabled: None,
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: None,
+            },
+        )
+        .await
+        .expect("create extension");
+
+        let tenant = TenantEntity::find()
+            .filter(TenantColumn::Slug.eq(DEFAULT_TENANT_ID))
+            .one(&db)
+            .await
+            .expect("query tenant")
+            .expect("default tenant");
+        let extension = ExtensionEntity::find()
+            .filter(ExtensionColumn::Extension.eq("1001"))
+            .one(&db)
+            .await
+            .expect("query extension")
+            .expect("extension");
+
+        assert_eq!(summary.tenant_id, Some(tenant.id));
+        assert_eq!(extension.tenant_id, Some(tenant.id));
     }
 }

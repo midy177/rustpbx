@@ -25,6 +25,17 @@ export interface ExtensionSummary {
   allow_guest_calls: boolean;
 }
 
+export interface CreateExtensionRequest {
+  extension: string;
+  display_name?: string | null;
+  email?: string | null;
+  status?: string | null;
+  login_disabled?: boolean;
+  voicemail_disabled?: boolean;
+  allow_guest_calls?: boolean;
+  notes?: string | null;
+}
+
 export interface SipTrunkSummary {
   id: number;
   tenant_id?: number | null;
@@ -132,6 +143,12 @@ export const api = {
   },
   extensions() {
     return request<ExtensionSummary[]>("/cloudpbx/extensions");
+  },
+  createExtension(payload: CreateExtensionRequest) {
+    return request<ExtensionSummary>("/cloudpbx/extensions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
   },
   sipTrunks() {
     return request<SipTrunkSummary[]>("/cloudpbx/sip-trunks");
