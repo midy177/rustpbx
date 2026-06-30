@@ -672,6 +672,7 @@ mod tests {
         let now = Utc::now();
         crate::models::user::Model {
             id,
+            tenant_id: None,
             email: format!("user{}@test.com", id),
             username: format!("user{}", id),
             password_hash: "x".into(),

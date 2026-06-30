@@ -151,6 +151,7 @@ fn make_synthetic_user() -> crate::models::user::Model {
     use chrono::Utc;
     crate::models::user::Model {
         id: 0,
+        tenant_id: None,
         email: "api-token@system".to_string(),
         username: "api-token".to_string(),
         password_hash: String::new(),

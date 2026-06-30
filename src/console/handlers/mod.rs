@@ -135,6 +135,7 @@ pub mod test_helpers {
         let now = chrono::Utc::now();
         crate::models::user::Model {
             id: 1,
+            tenant_id: None,
             email: "admin@rustpbx.com".into(),
             username: "admin".into(),
             password_hash: "hashed".into(),
@@ -157,6 +158,7 @@ pub mod test_helpers {
         let now = chrono::Utc::now();
         crate::models::user::Model {
             id: 2,
+            tenant_id: None,
             email: "user@rustpbx.com".into(),
             username: "user".into(),
             password_hash: "hashed".into(),

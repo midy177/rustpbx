@@ -20,6 +20,7 @@ use serde::Serialize;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
+    pub tenant_id: Option<i64>,
     #[sea_orm(unique)]
     pub email: String,
     #[sea_orm(unique)]

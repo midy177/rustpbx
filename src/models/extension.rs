@@ -18,6 +18,7 @@ pub const MAX_FORWARDING_TIMEOUT: i32 = 120;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
+    pub tenant_id: Option<i64>,
     #[sea_orm(unique)]
     pub extension: String,
     pub display_name: Option<String>,

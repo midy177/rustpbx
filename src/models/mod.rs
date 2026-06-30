@@ -7,6 +7,7 @@ pub mod add_metadata_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_register_columns;
 pub mod add_sip_trunk_rewrite_hostport;
+pub mod add_tenant_scope_columns;
 pub mod add_user_mfa_columns;
 pub mod alter_rewrite_columns_length;
 pub mod call_record;

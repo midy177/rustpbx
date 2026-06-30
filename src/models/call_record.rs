@@ -294,6 +294,7 @@ fn normalize_endpoint_uri(value: &str) -> Option<String> {
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
+    pub tenant_id: Option<i64>,
     #[sea_orm(unique)]
     pub call_id: String,
     pub display_id: Option<String>,
