@@ -104,6 +104,7 @@ edge_worker_addr   = "127.0.0.1:9092"  # Edge → Worker AllocateCall
 advertise_sip_addr = "127.0.0.1:5070"  # AllocateCall 返回给 Edge 的 SIP contact
 edge_state_addr    = "127.0.0.1:9093"  # Worker → Edge CallStateUpdate
 cdr_spool_dir      = "./generated/cdr-spool" # CDR 上传失败时本地暂存并重试
+extension_location_spool_dir = "./generated/extension-location-spool"
 heartbeat_secs     = 10
 log                = "info"
 ```
@@ -153,7 +154,8 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
   粘到同一个健康 Worker，避免多 Worker 下同名会议室被拆成多个本地 mixer。
 - Worker 会在分机 REGISTER 成功后上报 `extension:<tenant>:<ext>` affinity；同一分机
   可绑定多个 Worker。Worker 侧分机互打若未命中出局 trunk，会经 Edge 按目标分机
-  affinity 转发；多 Worker 注册时 Edge 会并行 fork 到这些 Worker。
+  affinity 转发；多 Worker 注册时 Edge 会并行 fork 到这些 Worker。上报失败会先写入
+  `extension_location_spool_dir` 并后台重放，Worker 重启后也会继续补报未过期位置。
 - Trunk 的 `max_concurrent` 会作为 trunk 级并发限制下发；`max_cps` 会作为
   trunk 级每秒新呼叫限制下发。两者都在 Control Raft 状态机里线性化执行，
   与租户 `max_concurrent_calls` 一起生效。
@@ -285,9 +287,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 多节点仍需关注：
 
 - 多 Worker：会议室与分机已具备 sticky routing；分机 affinity 在 REGISTER 成功后
-  上报，失败时有限重试，按 expires 过期并由 Control 定期清理。多 Worker 注册同一
-  分机时 Edge 会并行 fork 到已上报的 Worker；后续应补 Contact 粒度去重/优先级，
-  以及跨 Worker 重启保留的持久上报队列。
+  上报，失败时写入持久 spool 并后台重放，按 expires 过期并由 Control 定期清理。
+  多 Worker 注册同一分机时 Edge 会并行 fork 到已上报的 Worker；后续应补 Contact
+  粒度去重/优先级。
 - 多 Edge：Edge 会在成功 INVITE 响应里加入指向本 Edge 的 `Record-Route`，让后续
   in-dialog 请求回到同一 Edge；入站首呼仍可横向扩展。外层 LB/SBC 仍建议保持
   5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。

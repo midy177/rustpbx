@@ -23,7 +23,10 @@ use crate::{
     cdr_hook::{CdrSpool, GrpcCdrHook},
     config::WorkerConfig,
     control_client::{ControlClient, run_heartbeat},
-    extension_location::{ExtensionLocationModule, init_extension_location_reporter},
+    extension_location::{
+        ExtensionLocationModule, init_extension_location_reporter,
+        run_extension_location_spool_replay,
+    },
     internal_peer::InternalPeerModule,
     internal_peer::init_trusted_edges,
     metrics::{WorkerMetrics, start_metrics_server},
@@ -150,6 +153,7 @@ async fn main() -> Result<()> {
         cfg.control_plane_addr.clone(),
         cp_tls.clone(),
         cfg.worker_id.clone(),
+        cfg.extension_location_spool_dir.clone(),
     );
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -201,6 +205,7 @@ async fn main() -> Result<()> {
     let cdr_sender = cdr_manager.sender.clone();
     tokio::spawn(async move { cdr_manager.serve().await });
     tokio::spawn(cdr_spool.run_replay_loop(Arc::clone(&cp_client), cancel.clone()));
+    tokio::spawn(run_extension_location_spool_replay(cancel.clone()));
 
     // ── RTP config ────────────────────────────────────────────────────────────
     let rtp_config = RtpConfig {

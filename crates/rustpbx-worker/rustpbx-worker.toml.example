@@ -40,6 +40,7 @@ capabilities = ["rtp-gateway", "recording"]
 # database_url = "sqlite://rustpbx-worker.sqlite3?mode=rwc"
 # recording_path = "/var/lib/rustpbx/recordings"
 # cdr_spool_dir = "/var/lib/rustpbx/cdr-spool"
+# extension_location_spool_dir = "/var/lib/rustpbx/extension-location-spool"
 
 # Heartbeat interval (seconds).
 heartbeat_secs = 5

@@ -60,6 +60,10 @@ pub struct WorkerConfig {
     #[serde(default = "default_cdr_spool_dir")]
     pub cdr_spool_dir: String,
 
+    /// Local spool directory for extension-location reports that fail to upload.
+    #[serde(default = "default_extension_location_spool_dir")]
+    pub extension_location_spool_dir: String,
+
     /// Heartbeat interval in seconds
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
@@ -207,6 +211,7 @@ impl Default for WorkerConfig {
             database_url: default_database_url(),
             recording_path: default_recording_path(),
             cdr_spool_dir: default_cdr_spool_dir(),
+            extension_location_spool_dir: default_extension_location_spool_dir(),
             heartbeat_secs: default_heartbeat_secs(),
             config_poll_secs: default_config_poll_secs(),
             ivr_dir: default_ivr_dir(),
@@ -269,6 +274,10 @@ fn default_recording_path() -> String {
 }
 fn default_cdr_spool_dir() -> String {
     "./generated/cdr-spool".to_string()
+}
+
+fn default_extension_location_spool_dir() -> String {
+    "./generated/extension-location-spool".to_string()
 }
 fn default_stun_servers() -> Vec<String> {
     rustpbx_core::stun::default_stun_servers()
