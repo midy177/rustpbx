@@ -282,8 +282,9 @@ Worker → Edge 的 CDR 时间线状态上报。
   上报，失败时有限重试，按 expires 过期并由 Control 定期清理。多 Worker 注册同一
   分机时 Edge 会并行 fork 到已上报的 Worker；后续应补 Contact 粒度去重/优先级，
   以及跨 Worker 重启保留的持久上报队列。
-- 多 Edge：Edge 当前无共享会话状态，入站流量可横向扩展；但同一 SIP dialog 的
-  后续请求应由 LB 保持到同一 Edge，或补 Record-Route/路径固定策略。
+- 多 Edge：Edge 会在成功 INVITE 响应里加入指向本 Edge 的 `Record-Route`，让后续
+  in-dialog 请求回到同一 Edge；入站首呼仍可横向扩展。外层 LB/SBC 仍建议保持
+  5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置变更仍需
   确认只有 leader 广播或具备幂等版本推进。
 

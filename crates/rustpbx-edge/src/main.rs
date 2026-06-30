@@ -3,6 +3,7 @@ mod call_router;
 mod config;
 mod config_source;
 mod config_watcher;
+mod dialog_path;
 mod edge_worker_server;
 mod grpc_client;
 mod headers;
@@ -16,6 +17,7 @@ use crate::{
     config::EdgeConfig,
     config_source::{ConfigSource, GrpcConfigSource},
     config_watcher::run_config_watcher,
+    dialog_path::{DialogPathModule, build_record_route, init_record_route},
     grpc_client::GrpcControlClient,
     internal_peer::InternalPeerModule,
     internal_peer::init_trusted_workers,
@@ -156,6 +158,14 @@ async fn main() -> Result<()> {
         info!(%ip, "using STUN-detected public IP as the edge public IP");
         cfg.public_ip = Some(ip);
     }
+    let record_route = build_record_route(
+        cfg.public_ip.as_deref().unwrap_or(&cfg.sip_addr),
+        cfg.udp_port,
+    );
+    if record_route.is_none() {
+        warn!("edge Record-Route disabled because no public SIP address is known");
+    }
+    init_record_route(record_route);
 
     // ── Register with Control Plane + heartbeat (observability only) ──────────
     // Edges aren't load-selected; this just lets the admin console see which
@@ -278,6 +288,7 @@ async fn main() -> Result<()> {
         .register_module("acl", AclModule::create)
         .register_module("auth", AuthModule::create)
         .register_module("call", CallModule::create)
+        .register_module("dialog-path", DialogPathModule::create)
         .build()
         .await?;
 
@@ -347,6 +358,7 @@ fn build_proxy_config(cfg: &EdgeConfig) -> ProxyConfig {
             "acl".into(),
             "auth".into(),
             "call".into(),
+            "dialog-path".into(),
         ]),
         ..Default::default()
     }
