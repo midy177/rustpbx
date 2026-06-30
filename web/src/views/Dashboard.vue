@@ -9,21 +9,31 @@ import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
 const tenants = ref<TenantSummary[]>([]);
+const extensionCount = ref(0);
+const sipTrunkCount = ref(0);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 
-const resources = [
-  { label: "Extensions", value: "0", icon: Phone },
-  { label: "SIP trunks", value: "0", icon: Cable },
+const resources = computed(() => [
+  { label: "Extensions", value: String(extensionCount.value), icon: Phone },
+  { label: "SIP trunks", value: String(sipTrunkCount.value), icon: Cable },
   { label: "Routes", value: "0", icon: GitBranch },
   { label: "DID numbers", value: "0", icon: RadioTower },
   { label: "Users", value: "0", icon: Users },
-];
+]);
 
 onMounted(async () => {
   try {
     tenants.value = await api.tenants();
   } catch {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
+  }
+  try {
+    const [extensions, trunks] = await Promise.all([api.extensions(), api.sipTrunks()]);
+    extensionCount.value = extensions.length;
+    sipTrunkCount.value = trunks.length;
+  } catch {
+    extensionCount.value = 0;
+    sipTrunkCount.value = 0;
   }
 });
 </script>

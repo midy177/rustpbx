@@ -13,6 +13,32 @@ export interface SessionUser {
   tenant?: TenantSummary;
 }
 
+export interface ExtensionSummary {
+  id: number;
+  tenant_id?: number | null;
+  extension: string;
+  display_name?: string | null;
+  email?: string | null;
+  status?: string | null;
+  login_disabled: boolean;
+  voicemail_disabled: boolean;
+  allow_guest_calls: boolean;
+}
+
+export interface SipTrunkSummary {
+  id: number;
+  tenant_id?: number | null;
+  name: string;
+  display_name?: string | null;
+  carrier?: string | null;
+  status: string;
+  direction: string;
+  sip_server?: string | null;
+  sip_transport: string;
+  is_active: boolean;
+  register_enabled: boolean;
+}
+
 export interface LoginRequest {
   username: string;
   password: string;
@@ -51,5 +77,11 @@ export const api = {
   },
   tenants() {
     return request<TenantSummary[]>("/tenants");
+  },
+  extensions() {
+    return request<ExtensionSummary[]>("/cloudpbx/extensions");
+  },
+  sipTrunks() {
+    return request<SipTrunkSummary[]>("/cloudpbx/sip-trunks");
   },
 };
