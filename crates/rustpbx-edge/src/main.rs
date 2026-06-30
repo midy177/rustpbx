@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
         Arc::clone(&grpc_client),
         Arc::clone(&config_source),
         Arc::clone(&data_context),
+        cfg.config_poll_secs,
         cancel.clone(),
     ));
 

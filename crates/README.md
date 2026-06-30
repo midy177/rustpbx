@@ -295,9 +295,9 @@ Worker → Edge 的 CDR 时间线状态上报。
   5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置版本号已在
   `rustpbx_platform_settings` 内原子递增，Edge/Worker 重连 watch 时如果
-  `from_version` 落后会收到 `PlatformChanged` resync 事件。实时广播仍是当前
-  Control 进程内的本地 stream，跨 Control 节点的即时广播可后续接入 Raft event bus
-  或数据库通知机制。
+  `from_version` 落后会收到 `PlatformChanged` resync 事件。Edge 还会按
+  `config_poll_secs` 周期重拉配置，作为跨 Control live stream 未即时广播的兜底；
+  后续可继续接入 Raft event bus 或数据库通知机制来实现真正跨节点即时广播。
 
 验证基线：
 

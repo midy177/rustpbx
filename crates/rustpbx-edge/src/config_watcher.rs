@@ -16,6 +16,7 @@ pub async fn run_config_watcher(
     client: Arc<RwLock<GrpcControlClient>>,
     config_source: Arc<GrpcConfigSource>,
     data_context: Arc<ProxyDataContext>,
+    poll_secs: u64,
     cancel: CancellationToken,
 ) {
     let mut version = 0u64;
@@ -30,6 +31,7 @@ pub async fn run_config_watcher(
             Arc::clone(&config_source),
             Arc::clone(&data_context),
             version,
+            poll_secs,
             &cancel,
         )
         .await
@@ -55,6 +57,7 @@ async fn watch_once(
     config_source: Arc<GrpcConfigSource>,
     data_context: Arc<ProxyDataContext>,
     from_version: u64,
+    poll_secs: u64,
     cancel: &CancellationToken,
 ) -> Result<u64> {
     let mut stream = {
@@ -64,9 +67,32 @@ async fn watch_once(
 
     info!(from_version, "config watch stream opened");
     let mut last_version = from_version;
+    let mut poll = (poll_secs > 0).then(|| tokio::time::interval(Duration::from_secs(poll_secs)));
+    if let Some(poll) = poll.as_mut() {
+        poll.tick().await;
+    }
 
     loop {
         tokio::select! {
+            _ = async {
+                if let Some(poll) = poll.as_mut() {
+                    poll.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!(poll_secs, "config poll tick — re-pulling edge-facing config");
+                handle_event(
+                    &config_source,
+                    &data_context,
+                    crate::proto::control::ConfigChangeEvent {
+                        change_type: crate::proto::control::config_change_event::ChangeType::PlatformChanged as i32,
+                        name: Some("poll".to_string()),
+                        trunk: None,
+                        version: last_version,
+                    },
+                ).await;
+            }
             msg = stream.message() => {
                 match msg? {
                     Some(event) => {
