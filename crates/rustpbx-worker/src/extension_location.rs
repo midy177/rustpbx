@@ -18,8 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use tokio::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
+
+const REPORT_RETRY_DELAYS_SECS: &[u64] = &[1, 2, 4, 8, 16];
 
 #[derive(Clone)]
 struct ReporterConfig {
@@ -143,9 +146,7 @@ impl ProxyModule for ExtensionLocationModule {
         }
 
         tokio::spawn(async move {
-            if let Err(e) = report_location(report).await {
-                warn!(error = %e, "extension location report failed");
-            }
+            report_location_with_retry(report).await;
         });
         Ok(())
     }
@@ -195,14 +196,56 @@ fn register_succeeded(tx: &Transaction) -> bool {
         .is_some_and(|resp| *resp.status_code() == rsipstack::sip::StatusCode::OK)
 }
 
-async fn report_location(report: PendingReport) -> Result<()> {
+async fn report_location_with_retry(report: PendingReport) {
+    let mut elapsed_secs = 0u64;
+    for attempt in 0..=REPORT_RETRY_DELAYS_SECS.len() {
+        match report_location(&report).await {
+            Ok(()) => return,
+            Err(e) => {
+                if attempt == REPORT_RETRY_DELAYS_SECS.len() {
+                    warn!(
+                        error = %e,
+                        extension = %report.extension,
+                        expires_secs = report.expires_secs,
+                        "extension location report failed after retries"
+                    );
+                    return;
+                }
+
+                let delay_secs = REPORT_RETRY_DELAYS_SECS[attempt];
+                let max_retry_window = report.expires_secs.max(30) as u64;
+                if elapsed_secs.saturating_add(delay_secs) > max_retry_window {
+                    warn!(
+                        error = %e,
+                        extension = %report.extension,
+                        expires_secs = report.expires_secs,
+                        "extension location report retry window expired"
+                    );
+                    return;
+                }
+
+                warn!(
+                    error = %e,
+                    extension = %report.extension,
+                    delay_secs,
+                    attempt = attempt + 1,
+                    "extension location report failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                elapsed_secs = elapsed_secs.saturating_add(delay_secs);
+            }
+        }
+    }
+}
+
+async fn report_location(report: &PendingReport) -> Result<()> {
     let mut client = connect_control(&report.cfg).await?;
     client
         .report_extension_location(ExtensionLocationReport {
             tenant_id: report.tenant_id,
             extension: report.extension.clone(),
             worker_id: report.cfg.worker_id.clone(),
-            contact: report.contact,
+            contact: report.contact.clone(),
             expires_secs: report.expires_secs,
         })
         .await?;
