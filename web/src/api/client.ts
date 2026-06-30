@@ -36,6 +36,17 @@ export interface CreateExtensionRequest {
   notes?: string | null;
 }
 
+export interface UpdateExtensionRequest {
+  extension?: string;
+  display_name?: string | null;
+  email?: string | null;
+  status?: string | null;
+  login_disabled?: boolean;
+  voicemail_disabled?: boolean;
+  allow_guest_calls?: boolean;
+  notes?: string | null;
+}
+
 export interface SipTrunkSummary {
   id: number;
   tenant_id?: number | null;
@@ -164,6 +175,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     throw new Error(`API ${response.status}: ${response.statusText}`);
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return response.json() as Promise<T>;
 }
 
@@ -187,6 +201,17 @@ export const api = {
     return request<ExtensionSummary>("/cloudpbx/extensions", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  updateExtension(id: number, payload: UpdateExtensionRequest) {
+    return request<ExtensionSummary>(`/cloudpbx/extensions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteExtension(id: number) {
+    return request<void>(`/cloudpbx/extensions/${id}`, {
+      method: "DELETE",
     });
   },
   sipTrunks() {

@@ -3,14 +3,14 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::{Argon2, PasswordHasher};
 use axum::{
     Json, Router,
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts, Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ impl TenantContext {
         }
         if let Some(role) = headers
             .get("x-tenant-role")
-            .and_then(|value| TenantRole::from_header(value))
+            .and_then(TenantRole::from_header)
         {
             tenant.role = role;
         }
@@ -334,6 +334,18 @@ struct CreateExtensionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateExtensionRequest {
+    extension: Option<String>,
+    display_name: Option<String>,
+    email: Option<String>,
+    status: Option<String>,
+    login_disabled: Option<bool>,
+    voicemail_disabled: Option<bool>,
+    allow_guest_calls: Option<bool>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateSipTrunkRequest {
     name: String,
     display_name: Option<String>,
@@ -389,6 +401,10 @@ pub fn router(state: crate::app::AppState) -> Router {
         .route(
             "/api/cloudpbx/extensions",
             get(list_extensions).post(create_extension),
+        )
+        .route(
+            "/api/cloudpbx/extensions/{id}",
+            axum::routing::patch(update_extension).delete(delete_extension),
         )
         .route(
             "/api/cloudpbx/sip-trunks",
@@ -563,6 +579,155 @@ async fn create_extension_for_tenant(
             }),
         )
             .into_response()),
+    }
+}
+
+async fn update_extension(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<UpdateExtensionRequest>,
+) -> Response {
+    match update_extension_for_tenant(state.db(), &ctx, id, payload).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn update_extension_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+    payload: UpdateExtensionRequest,
+) -> Result<ExtensionSummary, Response> {
+    use crate::models::extension::{Column, Entity};
+
+    let model = load_extension_for_write(db, ctx, id).await?;
+    let original_tenant_id = model.tenant_id;
+    let mut active = model.into_active_model();
+
+    if let Some(extension) = payload.extension {
+        let extension = extension.trim();
+        if extension.is_empty() {
+            return Err(bad_request("invalid_extension", "Extension is required."));
+        }
+        if extension.len() > 32 {
+            return Err(bad_request(
+                "invalid_extension",
+                "Extension must be 32 characters or fewer.",
+            ));
+        }
+
+        if let Some(tenant_id) = original_tenant_id {
+            match Entity::find()
+                .filter(Column::TenantId.eq(tenant_id))
+                .filter(Column::Extension.eq(extension))
+                .filter(Column::Id.ne(id))
+                .one(db)
+                .await
+            {
+                Ok(Some(_)) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(ErrorBody {
+                            error: "extension_exists",
+                            message: "Extension already exists in this tenant.",
+                        }),
+                    )
+                        .into_response());
+                }
+                Ok(None) => {}
+                Err(_) => return Err(tenant_query_failed()),
+            }
+        }
+
+        active.extension = Set(extension.to_string());
+    }
+    if payload.display_name.is_some() {
+        active.display_name = Set(clean_optional_string(payload.display_name));
+    }
+    if payload.email.is_some() {
+        active.email = Set(clean_optional_string(payload.email));
+    }
+    if payload.status.is_some() {
+        active.status = Set(clean_optional_string(payload.status));
+    }
+    if let Some(login_disabled) = payload.login_disabled {
+        active.login_disabled = Set(login_disabled);
+    }
+    if let Some(voicemail_disabled) = payload.voicemail_disabled {
+        active.voicemail_disabled = Set(voicemail_disabled);
+    }
+    if let Some(allow_guest_calls) = payload.allow_guest_calls {
+        active.allow_guest_calls = Set(allow_guest_calls);
+    }
+    if payload.notes.is_some() {
+        active.notes = Set(clean_optional_string(payload.notes));
+    }
+    active.updated_at = Set(chrono::Utc::now());
+
+    match active.update(db).await {
+        Ok(model) => Ok(ExtensionSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "extension_update_failed",
+                message: "Failed to update extension.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+async fn delete_extension(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+) -> Response {
+    match delete_extension_for_tenant(state.db(), &ctx, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn delete_extension_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<(), Response> {
+    use crate::models::extension::Entity;
+
+    let model = load_extension_for_write(db, ctx, id).await?;
+    match Entity::delete_by_id(model.id).exec(db).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(tenant_query_failed()),
+    }
+}
+
+async fn load_extension_for_write(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<crate::models::extension::Model, Response> {
+    use crate::models::extension::{Column, Entity};
+
+    let mut query = Entity::find().filter(Column::Id.eq(id));
+    if ctx.role != TenantRole::PlatformAdmin {
+        let tenant_id = resolve_write_tenant_id(db, ctx).await?;
+        query = query.filter(Column::TenantId.eq(tenant_id));
+    }
+
+    match query.one(db).await {
+        Ok(Some(model)) => Ok(model),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "extension_not_found",
+                message: "Extension not found.",
+            }),
+        )
+            .into_response()),
+        Err(_) => Err(tenant_query_failed()),
     }
 }
 
@@ -1168,6 +1333,153 @@ mod tests {
 
         assert_eq!(summary.tenant_id, Some(tenant.id));
         assert_eq!(extension.tenant_id, Some(tenant.id));
+    }
+
+    #[tokio::test]
+    async fn update_extension_preserves_tenant_scope() {
+        use crate::models::{
+            extension::{Column as ExtensionColumn, Entity as ExtensionEntity},
+            tenant::{ActiveModel as TenantActiveModel, Entity as TenantEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_extension_for_tenant(
+            &db,
+            &ctx,
+            CreateExtensionRequest {
+                extension: "1002".to_string(),
+                display_name: Some("Bob".to_string()),
+                email: None,
+                status: None,
+                login_disabled: None,
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: None,
+            },
+        )
+        .await
+        .expect("create extension");
+
+        let updated = update_extension_for_tenant(
+            &db,
+            &ctx,
+            summary.id,
+            UpdateExtensionRequest {
+                extension: Some("1003".to_string()),
+                display_name: Some("Bob Updated".to_string()),
+                email: Some("bob@example.com".to_string()),
+                status: Some("disabled".to_string()),
+                login_disabled: Some(true),
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: Some("updated".to_string()),
+            },
+        )
+        .await
+        .expect("update extension");
+
+        assert_eq!(updated.extension, "1003");
+        assert_eq!(updated.display_name.as_deref(), Some("Bob Updated"));
+        assert_eq!(updated.email.as_deref(), Some("bob@example.com"));
+        assert_eq!(updated.status.as_deref(), Some("disabled"));
+        assert!(updated.login_disabled);
+        assert_eq!(updated.tenant_id, summary.tenant_id);
+
+        let now = chrono::Utc::now();
+        TenantActiveModel {
+            slug: Set("tenant-b".to_string()),
+            name: Set("Tenant B".to_string()),
+            status: Set("active".to_string()),
+            domain: Set(None),
+            max_concurrent_calls: Set(None),
+            max_trunks: Set(None),
+            storage_prefix: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert tenant b");
+
+        let other_ctx = TenantContext {
+            id: "tenant-b".to_string(),
+            name: "Tenant B".to_string(),
+            role: TenantRole::TenantAdmin,
+        };
+        let response = update_extension_for_tenant(
+            &db,
+            &other_ctx,
+            summary.id,
+            UpdateExtensionRequest {
+                extension: None,
+                display_name: Some("Should Not Apply".to_string()),
+                email: None,
+                status: None,
+                login_disabled: None,
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: None,
+            },
+        )
+        .await
+        .expect_err("cross tenant update is hidden");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let unchanged = ExtensionEntity::find()
+            .filter(ExtensionColumn::Id.eq(summary.id))
+            .one(&db)
+            .await
+            .expect("query extension")
+            .expect("extension");
+        assert_eq!(unchanged.display_name.as_deref(), Some("Bob Updated"));
+        assert_eq!(
+            TenantEntity::find().all(&db).await.expect("tenants").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_extension_requires_tenant_scope() {
+        use crate::models::extension::Entity as ExtensionEntity;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_extension_for_tenant(
+            &db,
+            &ctx,
+            CreateExtensionRequest {
+                extension: "1004".to_string(),
+                display_name: Some("Carol".to_string()),
+                email: None,
+                status: None,
+                login_disabled: None,
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: None,
+            },
+        )
+        .await
+        .expect("create extension");
+
+        delete_extension_for_tenant(&db, &ctx, summary.id)
+            .await
+            .expect("delete extension");
+
+        let deleted = ExtensionEntity::find_by_id(summary.id)
+            .one(&db)
+            .await
+            .expect("query extension");
+        assert!(deleted.is_none());
     }
 
     #[tokio::test]

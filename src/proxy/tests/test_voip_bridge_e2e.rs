@@ -157,12 +157,11 @@ async fn test_voip_bridge_e2e_transfer_command() -> Result<()> {
         let mut sid = None;
         for _ in 0..80 {
             let sessions = registry.list_recent(10);
-            for entry in &sessions {
+            if let Some(entry) = sessions.first() {
                 // Keep dialog events flowing
                 let _ = alice.process_dialog_events().await;
                 // Session is active — use the first available one
                 sid = Some(entry.session_id.clone());
-                break;
             }
             if sid.is_some() {
                 break;
