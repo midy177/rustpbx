@@ -348,6 +348,10 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             data.worker_affinity.insert(affinity_key, worker_id);
             RegistryResponse::known(true, 0)
         }
+        RegistryCommand::UnbindAffinity { affinity_key } => {
+            let removed = data.worker_affinity.remove(&affinity_key).is_some() as u32;
+            RegistryResponse::known(removed > 0, removed)
+        }
     }
 }
 

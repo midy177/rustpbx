@@ -20,8 +20,8 @@ use rsipstack::sip::Transport;
 use rsipstack::sip::Uri;
 use rsipstack::sip::prelude::HeadersExt;
 use rustpbx::call::{
-    DialDirection, DialStrategy, Dialplan, Location, RouteInvite, RoutingState, TransactionCookie,
-    user::SipUser,
+    DialDirection, DialStrategy, Dialplan, Location, RouteInvite, RoutingState, TenantId,
+    TransactionCookie, user::SipUser,
 };
 use rustpbx::config::{DialplanHints, MediaProxyMode, RouteResult, RtpConfig};
 use rustpbx::proxy::call::{CallRouter, RouteError};
@@ -291,7 +291,7 @@ impl WorkerCallRouter {
         &self,
         original: &rsipstack::sip::Request,
         caller: &SipUser,
-        _cookie: &TransactionCookie,
+        cookie: &TransactionCookie,
     ) -> std::result::Result<Dialplan, RouteError> {
         // edge_sip_addr presence is guaranteed by the caller.
         let edge_addr = self.edge_sip_addr.as_deref().unwrap_or_default();
@@ -358,28 +358,29 @@ impl WorkerCallRouter {
             }
         }
 
-        let trunk_name = trace.selected_trunk.ok_or_else(|| {
-            RouteError::from((
-                anyhow!("worker: outbound call matched no egress trunk"),
-                Some(rsipstack::sip::StatusCode::NotFound),
-            ))
-        })?;
+        let tenant_id = cookie.get_extension::<TenantId>().map(|t| t.0);
+        let (trunk_name, direction) = if let Some(trunk_name) = trace.selected_trunk {
+            (trunk_name, InternalDirection::Outbound)
+        } else {
+            (String::new(), InternalDirection::Internal)
+        };
 
         info!(
             trunk = %trunk_name,
             caller = %caller_uri,
             callee = %callee_uri,
             edge = %edge_addr,
+            direction = direction.as_str(),
             "worker originating outbound call → edge"
         );
 
         // ── Encode the routing decision for the Edge ──────────────────────────
         let internal_ctx = InternalCallContext {
             edge_id: String::new(),
-            tenant_id: None,
+            tenant_id,
             trunk_name,
             trunk_id: None,
-            direction: InternalDirection::Outbound,
+            direction,
             action: RouteAction::Forward,
             original_from: caller_uri.to_string(),
             original_to: callee_uri.to_string(),

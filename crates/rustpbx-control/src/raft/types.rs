@@ -219,6 +219,8 @@ pub enum RegistryCommand {
         affinity_key: String,
         worker_id: String,
     },
+    /// Remove an affinity binding.
+    UnbindAffinity { affinity_key: String },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any

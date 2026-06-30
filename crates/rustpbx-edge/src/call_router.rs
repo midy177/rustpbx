@@ -85,6 +85,7 @@ impl EdgeCallRouter {
         tenant_id: Option<i64>,
         caller: &str,
         callee: &str,
+        direction: &str,
     ) -> Result<String> {
         use rustpbx_proto::edge::{AllocateCallRequest, edge_worker_client::EdgeWorkerClient};
 
@@ -108,7 +109,7 @@ impl EdgeCallRouter {
                 trunk_name: String::new(),
                 caller: caller.to_string(),
                 callee: callee.to_string(),
-                direction: "inbound".to_string(),
+                direction: direction.to_string(),
                 custom_headers: Default::default(),
             })
             .await
@@ -144,6 +145,8 @@ impl CallRouter for EdgeCallRouter {
                 return self
                     .resolve_outbound(original, &internal_ctx, caller, cookie)
                     .await;
+            } else if matches!(internal_ctx.direction, InternalDirection::Internal) {
+                return self.resolve_worker_internal(original, &internal_ctx).await;
             }
         }
 
@@ -263,6 +266,56 @@ impl EdgeCallRouter {
         Ok(dialplan)
     }
 
+    async fn resolve_worker_internal(
+        &self,
+        original: &rsipstack::sip::Request,
+        ctx: &InternalCallContext,
+    ) -> std::result::Result<Dialplan, RouteError> {
+        let affinity_key = extension_affinity_key(ctx.tenant_id, ctx);
+        let worker = self
+            .worker_selector
+            .select(ctx.tenant_id, affinity_key.clone())
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "no worker available for internal extension call");
+                RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
+            })?;
+
+        let session_id = original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_else(|_| format!("edge-internal-{}", std::process::id()));
+        let worker_contact = self
+            .allocate_on_worker(
+                &worker,
+                &session_id,
+                ctx.tenant_id,
+                &ctx.original_from,
+                &ctx.original_to,
+                "internal",
+            )
+            .await
+            .map_err(|e| {
+                warn!(worker_id = %worker.worker_id, error = %e, "target worker allocation failed");
+                RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
+            })?;
+        let worker_uri = Uri::try_from(worker_contact.as_str())
+            .map_err(|e| RouteError::from((anyhow!("invalid worker sip_contact: {}", e), None)))?;
+
+        let mut dialplan = Dialplan::new(session_id, original.clone(), DialDirection::Internal)
+            .with_targets(DialStrategy::Sequential(vec![Location {
+                aor: worker_uri,
+                headers: Some(encode_headers(ctx)),
+                transport: Some(Transport::Tcp),
+                ..Default::default()
+            }]));
+
+        dialplan.media.proxy_mode = MediaProxyMode::None;
+        dialplan = dialplan.with_passthrough_failure(true);
+        self.active_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(dialplan)
+    }
+
     async fn resolve_inbound(
         &self,
         original: &rsipstack::sip::Request,
@@ -342,6 +395,7 @@ impl EdgeCallRouter {
                 trunk_ctx.tenant_id,
                 &caller_uri.to_string(),
                 &callee_uri.to_string(),
+                "inbound",
             )
             .await
             .map_err(|e| {
@@ -567,6 +621,25 @@ fn conference_affinity_key(tenant_id: Option<i64>, ctx: &InternalCallContext) ->
     ))
 }
 
+fn extension_affinity_key(tenant_id: Option<i64>, ctx: &InternalCallContext) -> Option<String> {
+    let target = ctx
+        .targets
+        .first()
+        .and_then(|target| Uri::try_from(target.as_str()).ok())
+        .or_else(|| Uri::try_from(ctx.original_to.as_str()).ok())?;
+    let extension = target.user()?.trim();
+    if extension.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "extension:{}:{}",
+        tenant_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "global".to_string()),
+        extension
+    ))
+}
+
 /// Build the carrier-facing Request-URI: keep the dialed number (callee user
 /// part) and swap the host/port to the trunk's destination. Mirrors the
 /// `rewrite_hostport` behaviour of the monolith's `apply_trunk_config`.
@@ -630,5 +703,20 @@ mod tests {
         };
 
         assert!(conference_affinity_key(Some(42), &ctx).is_none());
+    }
+
+    #[test]
+    fn extension_affinity_uses_target_extension() {
+        let ctx = InternalCallContext {
+            tenant_id: Some(7),
+            targets: vec!["sip:1002@example.com".to_string()],
+            original_to: "sip:ignored@example.com".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            extension_affinity_key(ctx.tenant_id, &ctx).as_deref(),
+            Some("extension:7:1002")
+        );
     }
 }

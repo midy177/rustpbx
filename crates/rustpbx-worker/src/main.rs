@@ -5,6 +5,7 @@ mod config;
 mod control_client;
 mod dialplan_resolver;
 mod edge_worker;
+mod extension_location;
 mod headers;
 mod internal_peer;
 mod metrics;
@@ -22,6 +23,7 @@ use crate::{
     cdr_hook::GrpcCdrHook,
     config::WorkerConfig,
     control_client::{ControlClient, run_heartbeat},
+    extension_location::{ExtensionLocationModule, init_extension_location_reporter},
     internal_peer::InternalPeerModule,
     internal_peer::init_trusted_edges,
     metrics::{WorkerMetrics, start_metrics_server},
@@ -144,6 +146,11 @@ async fn main() -> Result<()> {
         anyhow::bail!("control plane rejected worker registration");
     }
     info!("registered with control plane");
+    init_extension_location_reporter(
+        cfg.control_plane_addr.clone(),
+        cp_tls.clone(),
+        cfg.worker_id.clone(),
+    );
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let cp_client = Arc::new(Mutex::new(cp_client));
@@ -379,7 +386,7 @@ async fn main() -> Result<()> {
     }
 
     // ── SIP Server ────────────────────────────────────────────────────────────
-    // Module chain: internal-peer → acl → auth → registrar → presence → call
+    // Module chain: internal-peer → acl → auth → extension-location → registrar → presence → call
     //
     // Uses the main crate's CallModule (full B2BUA/IVR/Queue) with WorkerCallRouter
     // that decodes Edge-encoded routing decisions into Dialplan objects.
@@ -393,6 +400,7 @@ async fn main() -> Result<()> {
         .register_module("internal-peer", InternalPeerModule::create)
         .register_module("acl", AclModule::create)
         .register_module("auth", AuthModule::create)
+        .register_module("extension-location", ExtensionLocationModule::create)
         .register_module("registrar", RegistrarModule::create)
         .register_module("presence", PresenceModule::create)
         .register_module("call", CallModule::create)
@@ -445,6 +453,7 @@ fn build_proxy_config(cfg: &WorkerConfig) -> ProxyConfig {
         "internal-peer".into(),
         "acl".into(),
         "auth".into(),
+        "extension-location".into(),
         "registrar".into(),
         "presence".into(),
         "call".into(),

@@ -19,6 +19,7 @@ service ControlPlane {
   // ── Worker lifecycle ──────────────────────────────────────────────────────
   rpc RegisterWorker(WorkerInfo)        returns (RegisterAck);
   rpc WorkerHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportExtensionLocation(ExtensionLocationReport) returns (ReportAck);
 
   // ── Edge lifecycle (observability) ────────────────────────────────────────
   // Edges aren't load-selected by the control plane (carriers reach them by
@@ -312,6 +313,13 @@ message HeartbeatRequest {
   uint32 rtp_ports_used = 4;
 }
 message HeartbeatResponse  { bool drain = 1; }
+message ExtensionLocationReport {
+  optional int64 tenant_id = 1;
+  string extension = 2;
+  string worker_id = 3;
+  string contact = 4;
+  uint32 expires_secs = 5;
+}
 message GetWorkersRequest  {
   optional int64 tenant_id = 1;
   // All requested labels must be present with the same value on the worker.

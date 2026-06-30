@@ -1,10 +1,10 @@
 use crate::{
     grpc::proto::control::{
         AclRuleList, AcquireSlotRequest, AcquireSlotResponse, CallRecordReport, ConfigChangeEvent,
-        EdgeHeartbeatRequest, EdgeInfo, GetAclRulesRequest, GetRouteRulesRequest,
-        GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest, HeartbeatResponse,
-        RegisterAck, ReportAck, RouteRuleList, TrunkConfigList, WatchRequest, WorkerInfo,
-        WorkerList, control_plane_server::ControlPlane,
+        EdgeHeartbeatRequest, EdgeInfo, ExtensionLocationReport, GetAclRulesRequest,
+        GetRouteRulesRequest, GetTrunkConfigsRequest, GetWorkersRequest, HeartbeatRequest,
+        HeartbeatResponse, RegisterAck, ReportAck, RouteRuleList, TrunkConfigList, WatchRequest,
+        WorkerInfo, WorkerList, control_plane_server::ControlPlane,
     },
     raft::registry::RaftRegistry,
     store::Store,
@@ -260,6 +260,41 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(HeartbeatResponse { drain: !known }))
     }
 
+    async fn report_extension_location(
+        &self,
+        request: Request<ExtensionLocationReport>,
+    ) -> Result<Response<ReportAck>, Status> {
+        let report = request.into_inner();
+        let extension = report.extension.trim();
+        if extension.is_empty() || report.worker_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "extension and worker_id are required",
+            ));
+        }
+
+        let affinity_key = extension_affinity_key(report.tenant_id, extension);
+        if report.expires_secs == 0 {
+            self.workers
+                .unbind_affinity(affinity_key.clone())
+                .await
+                .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+            info!(affinity_key = %affinity_key, "extension location unbound");
+        } else {
+            self.workers
+                .bind_affinity(affinity_key.clone(), report.worker_id.clone())
+                .await
+                .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+            info!(
+                affinity_key = %affinity_key,
+                worker_id = %report.worker_id,
+                expires_secs = report.expires_secs,
+                "extension location bound"
+            );
+        }
+
+        Ok(Response::new(ReportAck { accepted: true }))
+    }
+
     // ── Edge lifecycle ────────────────────────────────────────────────────────
 
     async fn register_edge(
@@ -453,4 +488,14 @@ fn version_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn extension_affinity_key(tenant_id: Option<i64>, extension: &str) -> String {
+    format!(
+        "extension:{}:{}",
+        tenant_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "global".to_string()),
+        extension
+    )
 }

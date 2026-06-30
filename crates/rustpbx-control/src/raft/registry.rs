@@ -422,6 +422,24 @@ impl RaftRegistry {
         self.sm.call_slot_count().await
     }
 
+    /// Bind a sticky routing key to a worker.
+    pub async fn bind_affinity(&self, affinity_key: String, worker_id: String) -> Result<()> {
+        self.propose(RegistryCommand::BindAffinity {
+            affinity_key,
+            worker_id,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a sticky routing key.
+    pub async fn unbind_affinity(&self, affinity_key: String) -> Result<bool> {
+        let resp = self
+            .propose(RegistryCommand::UnbindAffinity { affinity_key })
+            .await?;
+        Ok(resp.removed > 0)
+    }
+
     /// Healthy workers with spare capacity, most-available first.
     #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
