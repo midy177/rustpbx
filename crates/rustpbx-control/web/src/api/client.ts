@@ -522,3 +522,18 @@ export interface Worker {
   healthy: boolean;
   draining: boolean;
 }
+
+export interface WorkerContactConflictCandidate {
+  worker_id: string;
+  contact: string;
+  q_milli: number;
+  expires_at_ms: number;
+}
+
+export interface WorkerContactConflict {
+  affinity_key: string;
+  contact_key: string;
+  selected_worker_id: string;
+  selected_contact: string;
+  candidates: WorkerContactConflictCandidate[];
+}

@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
-import { api, type Worker } from "@/api/client";
+import { api, type Worker, type WorkerContactConflict } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmpty,
 } from "@/components/ui/table";
-import { RefreshCw, Pause, Trash2 } from "lucide-vue-next";
+import { AlertTriangle, RefreshCw, Pause, Trash2 } from "lucide-vue-next";
 
 const { t, te } = useI18n();
 const workers = ref<Worker[]>([]);
+const contactConflicts = ref<WorkerContactConflict[]>([]);
 const loading = ref(true);
 const error = ref("");
 
@@ -54,7 +55,12 @@ function natVariant(n: string) {
 async function load() {
   loading.value = true;
   try {
-    workers.value = await api.get<Worker[]>("/workers");
+    const [workerRows, conflictRows] = await Promise.all([
+      api.get<Worker[]>("/workers"),
+      api.get<WorkerContactConflict[]>("/workers/contact-conflicts"),
+    ]);
+    workers.value = workerRows;
+    contactConflicts.value = conflictRows;
   } finally {
     loading.value = false;
   }
@@ -75,6 +81,39 @@ onMounted(load);
     </div>
 
     <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+
+    <Card v-if="contactConflicts.length > 0" class="border-amber-500/30">
+      <div class="border-b px-4 py-3">
+        <h3 class="flex items-center gap-2 text-sm font-semibold">
+          <AlertTriangle class="size-4 text-amber-500" />
+          {{ t("workers.contactConflicts") }}
+        </h3>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{{ t("workers.affinityKey") }}</TableHead>
+            <TableHead>{{ t("workers.contact") }}</TableHead>
+            <TableHead>{{ t("workers.selectedWorker") }}</TableHead>
+            <TableHead>{{ t("workers.candidates") }}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRow v-for="c in contactConflicts" :key="`${c.affinity_key}:${c.contact_key}`">
+            <TableCell class="font-mono text-xs">{{ c.affinity_key }}</TableCell>
+            <TableCell class="font-mono text-xs">{{ c.contact_key }}</TableCell>
+            <TableCell>
+              <Badge variant="warning">{{ c.selected_worker_id }}</Badge>
+            </TableCell>
+            <TableCell class="space-y-1">
+              <div v-for="candidate in c.candidates" :key="`${c.affinity_key}:${candidate.worker_id}:${candidate.contact}`" class="font-mono text-xs">
+                {{ candidate.worker_id }} · q={{ (candidate.q_milli / 1000).toFixed(3) }} · {{ candidate.contact }}
+              </div>
+            </TableCell>
+          </TableRow>
+        </TableBody>
+      </Table>
+    </Card>
 
     <Card>
       <Table>
