@@ -148,7 +148,7 @@ cargo run --bin rustpbx-edge -p rustpbx-edge -- /crates/rustpbx-edge/rustpbx-edg
   或 `tenant:<id> = "true"` 标签的 Worker，并按 NAT 可达性排序。
 - 会议应用会生成 `conference:<tenant>:<room>` affinity key；Control 会把同一房间
   粘到同一个健康 Worker，避免多 Worker 下同名会议室被拆成多个本地 mixer。
-- Worker 会把分机 REGISTER 上报为 `extension:<tenant>:<ext>` affinity；Worker
+- Worker 会在分机 REGISTER 成功后上报 `extension:<tenant>:<ext>` affinity；Worker
   侧分机互打若未命中出局 trunk，会经 Edge 按目标分机 affinity 转发到目标 Worker。
 - Trunk 的 `max_concurrent` 会作为 trunk 级并发限制下发；`max_cps` 会作为
   trunk 级每秒新呼叫限制下发。两者都在 Control Raft 状态机里线性化执行，
@@ -277,9 +277,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 多节点仍需关注：
 
-- 多 Worker：会议室与分机已具备 sticky routing；分机 affinity 已按 REGISTER
-  expires 过期并由 Control 定期清理。分机位置上报仍是认证后的 best-effort
-  观察，后续应改为 registrar 成功事件驱动，并补多 Contact/fork 注册模型。
+- 多 Worker：会议室与分机已具备 sticky routing；分机 affinity 在 REGISTER 成功后
+  上报，按 expires 过期并由 Control 定期清理。后续应补多 Contact/fork 注册模型，
+  以及 Control 上报失败后的重试队列。
 - 多 Edge：Edge 当前无共享会话状态，入站流量可横向扩展；但同一 SIP dialog 的
   后续请求应由 LB 保持到同一 Edge，或补 Record-Route/路径固定策略。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置变更仍需

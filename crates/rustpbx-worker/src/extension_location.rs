@@ -14,7 +14,9 @@ use rustpbx::config::ProxyConfig;
 use rustpbx::proxy::server::SipServerRef;
 use rustpbx::proxy::{ProxyAction, ProxyModule};
 use rustpbx_proto::control::{ExtensionLocationReport, control_plane_client::ControlPlaneClient};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
@@ -27,6 +29,15 @@ struct ReporterConfig {
 }
 
 static REPORTER: OnceLock<ReporterConfig> = OnceLock::new();
+
+#[derive(Clone)]
+struct PendingReport {
+    cfg: ReporterConfig,
+    tenant_id: Option<i64>,
+    extension: String,
+    contact: String,
+    expires_secs: u32,
+}
 
 pub fn init_extension_location_reporter(
     control_plane_addr: String,
@@ -45,14 +56,18 @@ pub fn init_extension_location_reporter(
     }
 }
 
-pub struct ExtensionLocationModule;
+pub struct ExtensionLocationModule {
+    pending: Arc<Mutex<HashMap<String, PendingReport>>>,
+}
 
 impl ExtensionLocationModule {
     pub fn create(
         _server: SipServerRef,
         _config: Arc<ProxyConfig>,
     ) -> Result<Box<dyn ProxyModule>> {
-        Ok(Box::new(Self))
+        Ok(Box::new(Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }))
     }
 }
 
@@ -91,17 +106,48 @@ impl ProxyModule for ExtensionLocationModule {
             return Ok(ProxyAction::Continue);
         };
         let tenant_id = cookie.get_extension::<TenantId>().map(|t| t.0);
-        let expires_secs = register_expires(tx);
-        let contact = first_contact_header(tx).unwrap_or_default();
+        let report = PendingReport {
+            cfg,
+            tenant_id,
+            extension,
+            contact: first_contact_header(tx).unwrap_or_default(),
+            expires_secs: register_expires(tx),
+        };
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(tx.key.to_string(), report);
+        } else {
+            warn!("extension location pending map is poisoned");
+        }
+
+        Ok(ProxyAction::Continue)
+    }
+
+    async fn on_transaction_end(&self, tx: &mut Transaction) -> Result<()> {
+        if tx.original.method != Method::Register {
+            return Ok(());
+        }
+
+        let report = match self.pending.lock() {
+            Ok(mut pending) => pending.remove(&tx.key.to_string()),
+            Err(_) => {
+                warn!("extension location pending map is poisoned");
+                None
+            }
+        };
+        let Some(report) = report else {
+            return Ok(());
+        };
+        if !register_succeeded(tx) {
+            debug!(key = %tx.key, "skip extension location report for failed register");
+            return Ok(());
+        }
 
         tokio::spawn(async move {
-            if let Err(e) = report_location(cfg, tenant_id, extension, contact, expires_secs).await
-            {
+            if let Err(e) = report_location(report).await {
                 warn!(error = %e, "extension location report failed");
             }
         });
-
-        Ok(ProxyAction::Continue)
+        Ok(())
     }
 }
 
@@ -143,28 +189,28 @@ fn expires_param(contact: &str) -> Option<u32> {
     })
 }
 
-async fn report_location(
-    cfg: ReporterConfig,
-    tenant_id: Option<i64>,
-    extension: String,
-    contact: String,
-    expires_secs: u32,
-) -> Result<()> {
-    let mut client = connect_control(&cfg).await?;
+fn register_succeeded(tx: &Transaction) -> bool {
+    tx.last_response
+        .as_ref()
+        .is_some_and(|resp| *resp.status_code() == rsipstack::sip::StatusCode::OK)
+}
+
+async fn report_location(report: PendingReport) -> Result<()> {
+    let mut client = connect_control(&report.cfg).await?;
     client
         .report_extension_location(ExtensionLocationReport {
-            tenant_id,
-            extension: extension.clone(),
-            worker_id: cfg.worker_id.clone(),
-            contact,
-            expires_secs,
+            tenant_id: report.tenant_id,
+            extension: report.extension.clone(),
+            worker_id: report.cfg.worker_id.clone(),
+            contact: report.contact,
+            expires_secs: report.expires_secs,
         })
         .await?;
     debug!(
-        extension = %extension,
-        tenant_id = ?tenant_id,
-        worker_id = %cfg.worker_id,
-        expires_secs,
+        extension = %report.extension,
+        tenant_id = ?report.tenant_id,
+        worker_id = %report.cfg.worker_id,
+        expires_secs = report.expires_secs,
         "reported extension location"
     );
     Ok(())
