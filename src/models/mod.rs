@@ -26,6 +26,7 @@ pub mod rbac;
 pub mod routing;
 pub mod sip_trunk;
 pub mod system_notification;
+pub mod tenant;
 pub mod user;
 
 pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {

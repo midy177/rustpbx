@@ -5,6 +5,7 @@ pub struct Migrator;
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
         vec![
+            Box::new(super::tenant::Migration),
             Box::new(super::user::Migration),
             Box::new(super::department::Migration),
             Box::new(super::extension::Migration),
