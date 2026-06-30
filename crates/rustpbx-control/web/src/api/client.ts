@@ -511,7 +511,11 @@ export interface Worker {
   active_calls: number;
   max_concurrent: number;
   available_capacity: number;
+  failure_domain: string;
+  schedule_cost: number;
   cpu_usage: number;
+  labels: Record<string, string>;
+  capabilities: string[];
   nat_type: string;
   registered_at: string;
   last_heartbeat_secs_ago: number;

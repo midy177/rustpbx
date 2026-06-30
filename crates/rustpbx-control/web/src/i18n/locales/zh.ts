@@ -154,6 +154,8 @@ export default {
     rtpIp: "RTP 外网 IP",
     load: "负载",
     capacity: "容量",
+    failureDomain: "故障域",
+    cost: "调度成本",
     cpu: "CPU",
     nat: "NAT 类型",
     lastHeartbeat: "最近心跳",

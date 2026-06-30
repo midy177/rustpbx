@@ -84,6 +84,8 @@ onMounted(load);
             <TableHead>{{ t("workers.sipAddr") }}</TableHead>
             <TableHead>{{ t("workers.rtpIp") }}</TableHead>
             <TableHead>{{ t("workers.nat") }}</TableHead>
+            <TableHead>{{ t("workers.failureDomain") }}</TableHead>
+            <TableHead>{{ t("workers.cost") }}</TableHead>
             <TableHead>{{ t("workers.load") }}</TableHead>
             <TableHead>{{ t("workers.cpu") }}</TableHead>
             <TableHead>{{ t("workers.lastHeartbeat") }}</TableHead>
@@ -92,8 +94,8 @@ onMounted(load);
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableEmpty v-if="loading" :colspan="9">{{ t("common.loading") }}</TableEmpty>
-          <TableEmpty v-else-if="workers.length === 0" :colspan="9">{{ t("workers.noWorkers") }}</TableEmpty>
+          <TableEmpty v-if="loading" :colspan="11">{{ t("common.loading") }}</TableEmpty>
+          <TableEmpty v-else-if="workers.length === 0" :colspan="11">{{ t("workers.noWorkers") }}</TableEmpty>
           <TableRow v-for="w in workers" :key="w.worker_id">
             <TableCell class="font-medium">{{ w.worker_id }}</TableCell>
             <TableCell class="font-mono text-xs">{{ w.sip_addr }}</TableCell>
@@ -102,6 +104,8 @@ onMounted(load);
               <Badge v-if="w.nat_type" :variant="natVariant(w.nat_type)" :title="w.nat_type">{{ natLabel(w.nat_type) }}</Badge>
               <span v-else class="text-muted-foreground">—</span>
             </TableCell>
+            <TableCell class="font-mono text-xs">{{ w.failure_domain }}</TableCell>
+            <TableCell>{{ w.schedule_cost }}</TableCell>
             <TableCell>{{ w.active_calls }} / {{ w.max_concurrent }}</TableCell>
             <TableCell>{{ w.cpu_usage.toFixed(1) }}%</TableCell>
             <TableCell class="text-muted-foreground">

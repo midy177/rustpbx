@@ -2048,6 +2048,8 @@ struct WorkerView {
     active_calls: u32,
     max_concurrent: u32,
     available_capacity: u32,
+    failure_domain: String,
+    schedule_cost: u32,
     cpu_usage: f32,
     labels: HashMap<String, String>,
     capabilities: Vec<String>,
@@ -2073,6 +2075,8 @@ async fn list_workers(
         .map(|w| WorkerView {
             healthy: w.is_healthy(now_ms, timeout_ms),
             available_capacity: w.available_capacity(),
+            failure_domain: w.failure_domain(),
+            schedule_cost: w.scheduling_cost(),
             last_heartbeat_secs_ago: now_ms.saturating_sub(w.last_heartbeat_ms).max(0) as u64
                 / 1000,
             registered_at: chrono::DateTime::from_timestamp_millis(w.registered_at_ms)

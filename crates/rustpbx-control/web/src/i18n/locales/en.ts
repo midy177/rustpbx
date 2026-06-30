@@ -155,6 +155,8 @@ export default {
     rtpIp: "RTP external IP",
     load: "Load",
     capacity: "Capacity",
+    failureDomain: "Failure domain",
+    cost: "Cost",
     cpu: "CPU",
     nat: "NAT",
     lastHeartbeat: "Last heartbeat",
