@@ -223,7 +223,6 @@ mod tests {
             action: Some("update".into()),
             target_type: Some("trunk".into()),
             limit: 100,
-            ..Default::default()
         };
         assert_eq!(svc.list(&f).await.unwrap().len(), 1);
 

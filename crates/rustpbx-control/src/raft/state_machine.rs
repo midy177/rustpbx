@@ -143,9 +143,8 @@ impl StateMachineStore {
             let contacts = data.worker_affinity_contacts.get(affinity_key);
             let mut ids: Vec<String> = members
                 .iter()
-                .filter_map(|(worker_id, expires_at_ms)| {
-                    (*expires_at_ms == 0 || *expires_at_ms > now_ms).then(|| worker_id.clone())
-                })
+                .filter(|&(_, expires_at_ms)| *expires_at_ms == 0 || *expires_at_ms > now_ms)
+                .map(|(worker_id, _)| worker_id.clone())
                 .collect();
             ids.sort_by_key(|worker_id| {
                 (
@@ -567,9 +566,8 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
                 .worker_affinity_expires
                 .iter()
                 .filter(|(key, _)| !data.worker_affinity_members.contains_key(*key))
-                .filter_map(|(key, expires_at_ms)| {
-                    (*expires_at_ms <= before_ms).then(|| key.clone())
-                })
+                .filter(|&(_, expires_at_ms)| *expires_at_ms <= before_ms)
+                .map(|(key, _)| key.clone())
                 .collect();
             for key in &expired {
                 data.worker_affinity.remove(key);

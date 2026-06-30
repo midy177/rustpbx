@@ -48,6 +48,12 @@ pub struct ControlConfig {
     #[serde(default = "default_call_slot_ttl_secs")]
     pub call_slot_ttl_secs: u64,
 
+    /// Poll interval for Control replicas to observe shared config-version
+    /// changes written by other Control nodes and broadcast them to local
+    /// config-watch subscribers.
+    #[serde(default = "default_config_version_poll_secs")]
+    pub config_version_poll_secs: u64,
+
     /// Raft cluster settings for control-plane replication.
     #[serde(default)]
     pub raft: RaftConfig,
@@ -190,6 +196,7 @@ impl Default for ControlConfig {
             base_domain: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
             call_slot_ttl_secs: default_call_slot_ttl_secs(),
+            config_version_poll_secs: default_config_version_poll_secs(),
             raft: RaftConfig::default(),
             tls: TlsConfig::default(),
         }
@@ -234,6 +241,10 @@ fn default_heartbeat_timeout_secs() -> u64 {
 
 fn default_call_slot_ttl_secs() -> u64 {
     4 * 60 * 60 // 4 hours
+}
+
+fn default_config_version_poll_secs() -> u64 {
+    2
 }
 
 fn default_raft_node_id() -> u64 {

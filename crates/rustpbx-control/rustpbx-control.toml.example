@@ -36,6 +36,10 @@ log = "info"
 # 30s, reaped at 60s).
 heartbeat_timeout_secs = 30
 
+# Poll shared config_version so each Control replica can broadcast config
+# changes made through a different Control node to its own watch subscribers.
+config_version_poll_secs = 2
+
 # ── Raft (control-plane HA) ───────────────────────────────────────────────────
 # Replicate the high-churn worker/edge registry across control replicas (the
 # persistent config/CDR stays in the shared DB). With no `addr`, the node runs

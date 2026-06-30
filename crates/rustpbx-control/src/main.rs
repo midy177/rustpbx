@@ -1,6 +1,7 @@
 mod audit_service;
 mod auth;
 mod config;
+mod config_change_watcher;
 mod did_service;
 mod grpc;
 mod http_api;
@@ -26,7 +27,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use sea_orm::Database;
 use sea_orm_migration::{MigratorTrait, SchemaManager};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicU64};
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 use tracing::info;
@@ -183,6 +184,22 @@ async fn main() -> Result<()> {
     });
 
     let (config_change_tx, _) = broadcast::channel(256);
+    let config_version_observed = Arc::new(AtomicU64::new(
+        settings::PlatformSettings::new(&db).config_version().await,
+    ));
+    let config_watch_db = db.clone();
+    let config_watch_tx = config_change_tx.clone();
+    let config_watch_observed = Arc::clone(&config_version_observed);
+    let config_version_poll = Duration::from_secs(cfg.config_version_poll_secs.max(1));
+    tokio::spawn(async move {
+        config_change_watcher::run_config_version_watcher(
+            config_watch_db,
+            config_watch_tx,
+            config_watch_observed,
+            config_version_poll,
+        )
+        .await;
+    });
     let svc = ControlPlaneService::with_change_tx(
         Arc::clone(&store),
         workers.clone(),
@@ -200,6 +217,7 @@ async fn main() -> Result<()> {
         admin_username: cfg.admin_username.clone(),
         admin_password: cfg.admin_password.clone(),
         config_change_tx,
+        config_version_observed,
     };
     let http_router = http_api::build_router(http_state);
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;

@@ -176,22 +176,21 @@ impl ControlPlane for ControlPlaneService {
         );
 
         let current_version = PlatformSettings::new(&self.store.db).config_version().await;
-        let initial = (req.from_version < current_version).then(|| {
-            Ok(ConfigChangeEvent {
+        let initial =
+            (req.from_version < current_version).then(|| ConfigChangeEvent {
                 change_type:
                     crate::grpc::proto::control::config_change_event::ChangeType::PlatformChanged
                         as i32,
                 name: Some("resync".to_string()),
                 trunk: None,
                 version: current_version,
-            })
-        });
+            });
         let rx = self.change_tx.subscribe();
         let live = BroadcastStream::new(rx).filter_map(|result| match result {
             Ok(event) => Some(Ok(event)),
             Err(_) => None, // lagged receiver — drop and continue
         });
-        let stream = tokio_stream::iter(initial.into_iter()).chain(live);
+        let stream = tokio_stream::iter(initial).map(Ok).chain(live);
 
         Ok(Response::new(Box::pin(stream)))
     }

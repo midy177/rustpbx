@@ -42,7 +42,10 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
@@ -80,6 +83,7 @@ pub struct HttpState {
     pub admin_username: String,
     pub admin_password: String,
     pub config_change_tx: broadcast::Sender<ConfigChangeEvent>,
+    pub config_version_observed: Arc<AtomicU64>,
 }
 
 impl HttpState {
@@ -123,6 +127,8 @@ impl HttpState {
             trunk: None,
             version,
         };
+        self.config_version_observed
+            .fetch_max(version, Ordering::Relaxed);
         let _ = self.config_change_tx.send(event);
         Ok(version)
     }
