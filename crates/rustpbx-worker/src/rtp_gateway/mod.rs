@@ -14,11 +14,12 @@
 //! calls. The channel boundary exists in code structure but media still runs
 //! inside the main crate's `SipSession` (tokio-hosted).
 //!
-//! # Phase 2 (planned)
+//! # Phase 2 (current boundary)
 //!
-//! RTP send/receive and codec processing move to a dedicated media thread,
-//! communicating with tokio via SPSC channels. This removes media from
-//! tokio's scheduler and makes latency deterministic.
+//! `MediaThreadCallSink` lets a bridge forward translated commands to a
+//! dedicated media thread over an SPSC channel. RTP send/receive and codec
+//! processing still need to move into that loop, but the tokio-to-thread
+//! boundary is now a concrete API.
 //!
 //! # Architecture
 //!
@@ -50,7 +51,7 @@ pub mod logging_sink;
 pub mod media_thread;
 
 #[allow(dead_code, unused_imports)]
-pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge};
+pub use bridge::{CallCommandSink, ChannelCallSink, spawn_bridge, spawn_media_thread_bridge};
 #[allow(dead_code, unused_imports)]
 pub use command::{
     MediaCommand, MediaEvent, MediaSourceSpec, QualityReport, RecordingFormat, RecordingResult,

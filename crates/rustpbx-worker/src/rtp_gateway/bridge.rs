@@ -10,11 +10,12 @@
 //! (inside the main crate's call flow) implements `CallCommandSink` and
 //! passes it to `spawn_bridge`.
 //!
-//! Phase 2 will add a `MediaThreadSink` that forwards commands to a
-//! dedicated media thread instead of the session.
+//! Phase 2 adds a `MediaThreadCallSink` that forwards commands to a dedicated
+//! media thread instead of the session.
 
 use super::command::{MediaCommand, MediaEvent, MediaSourceSpec, RecordingFormat, TrackSelector};
 use super::handle::RtpGatewayHandle;
+use super::media_thread::MediaThreadCallSink;
 use anyhow::{Error, Result};
 use rustpbx::call::domain::{CallCommand, LegId, MediaSource, PlayOptions, RecordConfig};
 use std::sync::Arc;
@@ -107,6 +108,11 @@ pub fn spawn_bridge(sink: Arc<dyn CallCommandSink>) -> RtpGatewayHandle {
     });
 
     handle
+}
+
+/// Spawn a bridge backed by a dedicated media thread.
+pub fn spawn_media_thread_bridge(id: impl Into<String>) -> RtpGatewayHandle {
+    spawn_bridge(Arc::new(MediaThreadCallSink::spawn(id)))
 }
 
 /// Translate a `MediaCommand` into the main crate's `CallCommand`.
@@ -246,7 +252,11 @@ mod tests {
             interrupt_on_dtmf: true,
         };
         match translate_command(&file_cmd).unwrap() {
-            CallCommand::Play { source, options, leg_id } => {
+            CallCommand::Play {
+                source,
+                options,
+                leg_id,
+            } => {
                 assert!(leg_id.is_none());
                 assert!(matches!(source, MediaSource::File { .. }));
                 assert_eq!(options.unwrap().track_id.as_deref(), Some("t1"));
@@ -261,7 +271,9 @@ mod tests {
             interrupt_on_dtmf: false,
         };
         match translate_command(&url_cmd).unwrap() {
-            CallCommand::Play { source, options, .. } => {
+            CallCommand::Play {
+                source, options, ..
+            } => {
                 assert!(matches!(source, MediaSource::Url { .. }));
                 assert!(options.unwrap().loop_playback);
             }
@@ -309,7 +321,9 @@ mod tests {
                 sample_rate: 16000,
                 track: TrackSelector::Caller,
             },
-            MediaCommand::InjectPcmChunk { samples: vec![0i16; 160] },
+            MediaCommand::InjectPcmChunk {
+                samples: vec![0i16; 160],
+            },
             MediaCommand::InjectPcmStop,
             MediaCommand::Renegotiate { offer_sdp: vec![] },
         ];
@@ -358,7 +372,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let received = received_ptr.received.lock().unwrap();
-        assert!(received.iter().any(|c| matches!(c, CallCommand::StopRecording)));
+        assert!(
+            received
+                .iter()
+                .any(|c| matches!(c, CallCommand::StopRecording))
+        );
         assert!(received.iter().any(|c| matches!(c, CallCommand::Hangup(_))));
     }
 
@@ -375,5 +393,20 @@ mod tests {
             other => panic!("expected StopPlayback, got {other:?}"),
         }
     }
-}
 
+    #[tokio::test]
+    async fn media_thread_sink_processes_bridge_commands() {
+        let sink = Arc::new(MediaThreadCallSink::spawn("bridge-media-thread"));
+        let handle = spawn_bridge(sink.clone());
+
+        handle.stop_recording().await.unwrap();
+        for _ in 0..50 {
+            if sink.processed_count() >= 1 {
+                handle.teardown().await.unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("media thread sink did not process bridge command");
+    }
+}

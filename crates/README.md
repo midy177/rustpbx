@@ -273,9 +273,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 1. **抽共享 Dialplan Resolver**：Worker 已抽出 `dialplan_resolver` 边界承载内部
    INVITE → `Dialplan` 构建；单体 `CallModule::default_resolve` 接入需等根 `src/`
    允许修改后再做，避免两套路由行为分叉。
-2. **RTP Gateway Phase 2**：`MediaThreadCallSink` 已建立专用线程边界；后续把
-   PCM 注入、SDP renegotiate 和真实 RTP/codec 循环接入该线程，并通过
-   `MediaEvent` 返回成功/失败。
+2. **RTP Gateway Phase 2**：`MediaThreadCallSink` 与 `spawn_media_thread_bridge`
+   已建立可调用的专用线程边界；后续把 PCM 注入、SDP renegotiate 和真实
+   RTP/codec 循环接入该线程，并通过 `MediaEvent` 返回成功/失败。
 3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities、
    租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序；后续可继续补跨 AZ
    failure-domain 分散或更复杂的成本模型。

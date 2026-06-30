@@ -48,7 +48,7 @@ impl MediaThreadCallSink {
     }
 
     #[cfg(test)]
-    fn processed_count(&self) -> usize {
+    pub(crate) fn processed_count(&self) -> usize {
         self.processed.load(Ordering::Relaxed)
     }
 }
