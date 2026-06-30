@@ -69,6 +69,31 @@ impl CallStateReporter {
     }
 }
 
+#[async_trait]
+impl CallRecordHook for CallStateReporter {
+    async fn on_record_completed(&self, record: &mut CallRecord) -> Result<()> {
+        let events = self.events_for_record(record);
+
+        // Best-effort: connect + send, log on failure but don't propagate.
+        match EdgeWorkerClient::connect(self.edge_endpoint.clone()).await {
+            Ok(mut client) => {
+                for event in events {
+                    let state = CallState::try_from(event.state).unwrap_or(CallState::Failed);
+                    if let Err(e) = client.call_state_update(event).await {
+                        warn!(call_id = %record.call_id, ?state, error = %e, "CallStateUpdate to edge failed");
+                    } else {
+                        debug!(call_id = %record.call_id, ?state, "reported call state to edge");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(edge = %self.edge_endpoint, error = %e, "connect to edge for CallStateUpdate failed");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,30 +152,5 @@ mod tests {
         assert_eq!(events[1].event_time_unix_ms, Some(6_000));
         assert_eq!(events[1].hangup_cause, Some(486));
         assert!(events[1].reason.as_deref().unwrap_or("").contains("Failed"));
-    }
-}
-
-#[async_trait]
-impl CallRecordHook for CallStateReporter {
-    async fn on_record_completed(&self, record: &mut CallRecord) -> Result<()> {
-        let events = self.events_for_record(record);
-
-        // Best-effort: connect + send, log on failure but don't propagate.
-        match EdgeWorkerClient::connect(self.edge_endpoint.clone()).await {
-            Ok(mut client) => {
-                for event in events {
-                    let state = CallState::try_from(event.state).unwrap_or(CallState::Failed);
-                    if let Err(e) = client.call_state_update(event).await {
-                        warn!(call_id = %record.call_id, ?state, error = %e, "CallStateUpdate to edge failed");
-                    } else {
-                        debug!(call_id = %record.call_id, ?state, "reported call state to edge");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(edge = %self.edge_endpoint, error = %e, "connect to edge for CallStateUpdate failed");
-            }
-        }
-        Ok(())
     }
 }

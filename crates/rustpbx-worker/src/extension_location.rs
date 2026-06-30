@@ -226,11 +226,17 @@ fn register_succeeded(tx: &Transaction) -> bool {
 
 async fn report_location_with_retry(report: PendingReport) {
     let mut elapsed_secs = 0u64;
-    for attempt in 0..=REPORT_RETRY_DELAYS_SECS.len() {
+    for (attempt, delay_secs) in REPORT_RETRY_DELAYS_SECS
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
         match report_location(&report).await {
             Ok(()) => return,
             Err(e) => {
-                if attempt == REPORT_RETRY_DELAYS_SECS.len() {
+                let Some(delay_secs) = delay_secs else {
                     warn!(
                         error = %e,
                         extension = %report.extension,
@@ -238,9 +244,8 @@ async fn report_location_with_retry(report: PendingReport) {
                         "extension location report failed after retries"
                     );
                     return;
-                }
+                };
 
-                let delay_secs = REPORT_RETRY_DELAYS_SECS[attempt];
                 let max_retry_window = report.expires_secs.max(30) as u64;
                 if elapsed_secs.saturating_add(delay_secs) > max_retry_window {
                     warn!(
@@ -288,15 +293,19 @@ async fn spool_and_report_location(report: PendingReport) {
 
 async fn report_location_with_retry_result(report: &PendingReport) -> Result<()> {
     let mut elapsed_secs = 0u64;
-    for attempt in 0..=REPORT_RETRY_DELAYS_SECS.len() {
+    for delay_secs in REPORT_RETRY_DELAYS_SECS
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
         match report_location(report).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if attempt == REPORT_RETRY_DELAYS_SECS.len() {
+                let Some(delay_secs) = delay_secs else {
                     return Err(e);
-                }
+                };
 
-                let delay_secs = REPORT_RETRY_DELAYS_SECS[attempt];
                 let max_retry_window = report.expires_secs.max(30) as u64;
                 if elapsed_secs.saturating_add(delay_secs) > max_retry_window {
                     return Err(e);

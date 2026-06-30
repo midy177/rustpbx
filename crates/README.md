@@ -105,6 +105,7 @@ advertise_sip_addr = "127.0.0.1:5070"  # AllocateCall 返回给 Edge 的 SIP con
 edge_state_addr    = "127.0.0.1:9093"  # Worker → Edge CallStateUpdate
 cdr_spool_dir      = "./generated/cdr-spool" # CDR 上传失败时本地暂存并重试
 extension_location_spool_dir = "./generated/extension-location-spool"
+metrics_addr       = "127.0.0.1:9095"  # Prometheus metrics；生产可设 0.0.0.0:9095
 heartbeat_secs     = 10
 log                = "info"
 ```
@@ -291,7 +292,10 @@ Worker → Edge 的 CDR 时间线状态上报。
    `CallModule::default_resolve`，以及真正实时的 ringing/answered 状态 hook，都需要
    修改根 `src/` 的通话状态机；在允许改根 `src/` 前只保留设计边界，不落代码。
 6. **CDR 可靠性运维化**：Worker 已在 Control 上传失败时把 CDR 落盘到
-   `cdr_spool_dir` 并后台重试；生产环境应把该目录挂到持久卷，并补监控/告警指标。
+   `cdr_spool_dir` 并后台重试；Prometheus 暴露
+   `worker_cdr_spool_pending`、`worker_cdr_upload_failures_total`、
+   `worker_cdr_replay_success_total` 和 `worker_cdr_replay_failures_total`。
+   生产环境应把该目录挂到持久卷，并对 pending 持续增长或 replay failure 告警。
 
 多节点仍需关注：
 

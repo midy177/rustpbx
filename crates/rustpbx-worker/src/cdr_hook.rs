@@ -3,14 +3,13 @@
 /// After each call completes, converts the CallRecord to a protobuf
 /// CallRecordReport and sends it to the Control Plane via gRPC.
 /// Spools to disk if the Control Plane is unreachable.
-use crate::{
-    control_client::ControlClient,
-    proto::control::CallRecordReport,
-};
+use crate::{control_client::ControlClient, proto::control::CallRecordReport};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use metrics::{counter, gauge};
 use prost::Message;
 use rustpbx::callrecord::{CallRecord, CallRecordHook};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -55,8 +54,16 @@ impl CallRecordHook for GrpcCdrHook {
         };
         if let Err(e) = upload {
             warn!(error = %e, "CDR upload failed — spooling for retry");
-            if let Err(spool_err) = self.spool.enqueue(&report).await {
-                warn!(error = %spool_err, call_id = %report.call_id, "CDR spool write failed");
+            counter!("worker_cdr_upload_failures_total").increment(1);
+            match self.spool.enqueue(&report).await {
+                Ok(_) => {
+                    counter!("worker_cdr_spooled_total").increment(1);
+                    self.spool.update_pending_gauge().await;
+                }
+                Err(spool_err) => {
+                    counter!("worker_cdr_spool_write_failures_total").increment(1);
+                    warn!(error = %spool_err, call_id = %report.call_id, "CDR spool write failed");
+                }
             }
         }
 
@@ -91,6 +98,7 @@ impl CdrSpool {
         fs::rename(&tmp, &path)
             .await
             .with_context(|| format!("commit CDR spool file {}", path.display()))?;
+        self.update_pending_gauge().await;
         Ok(path)
     }
 
@@ -129,16 +137,43 @@ impl CdrSpool {
                         warn!(error = %e, path = %path.display(), "failed to remove sent CDR spool file");
                     } else {
                         sent += 1;
+                        counter!("worker_cdr_replay_success_total").increment(1);
                         info!(call_id = %call_id, path = %path.display(), "replayed spooled CDR");
                     }
                 }
                 Err(e) => {
+                    counter!("worker_cdr_replay_failures_total").increment(1);
                     warn!(error = %e, call_id = %call_id, "spooled CDR replay failed");
                     break;
                 }
             }
         }
+        self.update_pending_gauge().await;
         Ok(sent)
+    }
+
+    async fn pending_count(&self) -> Result<u64> {
+        let mut entries = match fs::read_dir(self.dir.as_ref()).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut count = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("pb") {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn update_pending_gauge(&self) {
+        match self.pending_count().await {
+            Ok(count) => gauge!("worker_cdr_spool_pending").set(count as f64),
+            Err(e) => {
+                warn!(error = %e, dir = %self.dir.display(), "failed to count CDR spool files")
+            }
+        }
     }
 
     pub async fn run_replay_loop(
@@ -188,20 +223,14 @@ fn sanitize_file_component(value: &str) -> String {
 fn cdr_to_proto(r: &CallRecord, worker_id: &str) -> CallRecordReport {
     let duration_secs = (r.end_time - r.start_time).num_seconds().max(0) as i32;
 
-    let tenant_id = r
-        .extensions
-        .get::<rustpbx::call::TenantId>()
-        .map(|t| t.0);
+    let tenant_id = r.extensions.get::<rustpbx::call::TenantId>().map(|t| t.0);
 
     let trunk_name = r
         .extensions
         .get::<rustpbx::call::TrunkContext>()
         .map(|t| t.name.clone());
 
-    let hangup_cause = r
-        .hangup_reason
-        .as_ref()
-        .map(|_| r.status_code as u32);
+    let hangup_cause = r.hangup_reason.as_ref().map(|_| r.status_code as u32);
 
     CallRecordReport {
         call_id: r.call_id.clone(),
@@ -211,10 +240,7 @@ fn cdr_to_proto(r: &CallRecord, worker_id: &str) -> CallRecordReport {
         direction: r.details.direction.clone(),
         status: r.details.status.clone(),
         start_time_unix_ms: r.start_time.timestamp_millis(),
-        answer_time_unix_ms: r
-            .answer_time
-            .map(|t| t.timestamp_millis())
-            .unwrap_or(0),
+        answer_time_unix_ms: r.answer_time.map(|t| t.timestamp_millis()).unwrap_or(0),
         end_time_unix_ms: r.end_time.timestamp_millis(),
         duration_secs,
         trunk_name,
@@ -247,6 +273,7 @@ mod tests {
 
         let path = spool.enqueue(&report).await.unwrap();
         assert_eq!(path.extension().and_then(|s| s.to_str()), Some("pb"));
+        assert_eq!(spool.pending_count().await.unwrap(), 1);
         let bytes = fs::read(&path).await.unwrap();
         let decoded = CallRecordReport::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.call_id, report.call_id);
@@ -257,7 +284,10 @@ mod tests {
 
     #[test]
     fn sanitize_file_component_replaces_unsafe_chars() {
-        assert_eq!(sanitize_file_component("call/id with spaces"), "call_id_with_spaces");
+        assert_eq!(
+            sanitize_file_component("call/id with spaces"),
+            "call_id_with_spaces"
+        );
         assert_eq!(sanitize_file_component(""), "unknown");
     }
 }
