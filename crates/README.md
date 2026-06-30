@@ -103,6 +103,7 @@ edge_sip_addr      = "127.0.0.1:5060"  # 出站起呼转发目标（Edge）
 edge_worker_addr   = "127.0.0.1:9092"  # Edge → Worker AllocateCall
 advertise_sip_addr = "127.0.0.1:5070"  # AllocateCall 返回给 Edge 的 SIP contact
 edge_state_addr    = "127.0.0.1:9093"  # Worker → Edge CallStateUpdate
+cdr_spool_dir      = "./generated/cdr-spool" # CDR 上传失败时本地暂存并重试
 heartbeat_secs     = 10
 log                = "info"
 ```
@@ -275,6 +276,8 @@ Worker → Edge 的 CDR 时间线状态上报。
    租户亲和、NAT 可达性筛选/排序；后续可继续补更细的跨 AZ/成本权重。
 4. **状态流**：如果需要实时观测，继续补 Worker 呼叫过程中的 ringing/answered
    中间态 hook，而不是仅在 CDR 完成时回放时间线。
+5. **CDR 可靠性**：Worker 已在 Control 上传失败时把 CDR 落盘到 `cdr_spool_dir`
+   并后台重试；生产环境应把该目录挂到持久卷。
 
 多节点仍需关注：
 

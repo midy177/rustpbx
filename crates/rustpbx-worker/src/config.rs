@@ -56,6 +56,10 @@ pub struct WorkerConfig {
     #[allow(dead_code)]
     pub recording_path: String,
 
+    /// Local spool directory for CDRs that fail to upload to Control Plane.
+    #[serde(default = "default_cdr_spool_dir")]
+    pub cdr_spool_dir: String,
+
     /// Heartbeat interval in seconds
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
@@ -202,6 +206,7 @@ impl Default for WorkerConfig {
             worker_id: default_worker_id(),
             database_url: default_database_url(),
             recording_path: default_recording_path(),
+            cdr_spool_dir: default_cdr_spool_dir(),
             heartbeat_secs: default_heartbeat_secs(),
             config_poll_secs: default_config_poll_secs(),
             ivr_dir: default_ivr_dir(),
@@ -261,6 +266,9 @@ fn default_database_url() -> String {
 }
 fn default_recording_path() -> String {
     "./recordings".to_string()
+}
+fn default_cdr_spool_dir() -> String {
+    "./generated/cdr-spool".to_string()
 }
 fn default_stun_servers() -> Vec<String> {
     rustpbx_core::stun::default_stun_servers()

@@ -39,6 +39,7 @@ capabilities = ["rtp-gateway", "recording"]
 # Optional DB for IVR/queue state (empty → stateless) and recording root.
 # database_url = "sqlite://rustpbx-worker.sqlite3?mode=rwc"
 # recording_path = "/var/lib/rustpbx/recordings"
+# cdr_spool_dir = "/var/lib/rustpbx/cdr-spool"
 
 # Heartbeat interval (seconds).
 heartbeat_secs = 5

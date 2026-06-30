@@ -20,7 +20,7 @@ mod worker_call_module;
 use crate::{
     addons::collect_addon_cdr_hooks,
     call_router::WorkerCallRouter,
-    cdr_hook::GrpcCdrHook,
+    cdr_hook::{CdrSpool, GrpcCdrHook},
     config::WorkerConfig,
     control_client::{ControlClient, run_heartbeat},
     extension_location::{ExtensionLocationModule, init_extension_location_reporter},
@@ -169,9 +169,11 @@ async fn main() -> Result<()> {
     //   1. Addon metrics (observability Prometheus counters/histograms)
     //   2. ActiveCallTracker — decrements active_calls counter on call end
     //   3. GrpcCdrHook — uploads CDR to Control Plane
+    let cdr_spool = CdrSpool::new(cfg.cdr_spool_dir.clone());
     let grpc_hook: Box<dyn rustpbx::callrecord::CallRecordHook> = Box::new(GrpcCdrHook::new(
         Arc::clone(&cp_client),
         cfg.worker_id.clone(),
+        cdr_spool.clone(),
     ));
     let tracker_hook: Box<dyn rustpbx::callrecord::CallRecordHook> =
         Box::new(ActiveCallTrackerHook {
@@ -198,6 +200,7 @@ async fn main() -> Result<()> {
     let mut cdr_manager = cdr_builder.build().await?;
     let cdr_sender = cdr_manager.sender.clone();
     tokio::spawn(async move { cdr_manager.serve().await });
+    tokio::spawn(cdr_spool.run_replay_loop(Arc::clone(&cp_client), cancel.clone()));
 
     // ── RTP config ────────────────────────────────────────────────────────────
     let rtp_config = RtpConfig {
