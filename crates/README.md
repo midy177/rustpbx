@@ -276,7 +276,8 @@ Worker → Edge 的 CDR 时间线状态上报。
 1. **分机 Contact 粒度路由**：Control affinity 状态已保留 Contact/q/expires
    元数据，并按最高 q 值排序同一分机的 Worker 目标；Edge 已接收 Contact 明细并写入
    内部 INVITE 的 `X-Targets`，让 Worker 对同一节点上的多个 Contact 精确 fork。
-   后续可继续补跨 Worker 的 Contact 全局去重/冲突处理策略。
+   Control 输出 Contact 明细时会按 URI 去重，忽略 `q`/`expires` 参数，只保留 q 更高、
+   过期更晚的 Worker 归属；后续可继续补异常冲突审计与管理面展示。
 2. **多 Control 即时配置广播**：Control 现在会轮询共享 `config_version`，把其他
    Control 节点写入的配置变化广播到本节点的 watch stream；Edge/Worker 的 watch
    重连 resync 和 Edge 周期 poll 仍作为兜底。后续如果限定 Postgres，可再替换为
@@ -301,8 +302,8 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 - 多 Worker：会议室与分机已具备 sticky routing；分机 affinity 在 REGISTER 成功后
   上报，失败时写入持久 spool 并后台重放，按 expires 过期并由 Control 定期清理。
-  多 Worker 注册同一分机时 Edge 会并行 fork 到已上报的 Worker；后续应补 Contact
-  粒度去重/优先级。
+  多 Worker 注册同一分机时 Edge 会并行 fork 到已上报的 Worker；同一 Contact
+  被多个 Worker 上报时，Control 只把最佳归属下发给 Edge，避免重复 fork。
 - 多 Edge：Edge 会在成功 INVITE 响应里加入指向本 Edge 的 `Record-Route`，让后续
   in-dialog 请求回到同一 Edge；入站首呼仍可横向扩展。外层 LB/SBC 仍建议保持
   5-tuple 或 Call-ID 粘滞，作为 Record-Route 不被对端遵守时的兜底。

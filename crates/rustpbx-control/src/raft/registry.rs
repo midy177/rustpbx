@@ -1184,6 +1184,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contacts_for_affinity_deduplicates_across_workers() {
+        let reg = start().await;
+
+        let key = "extension:1:1001";
+        let low_priority = "<sip:1001@192.0.2.10:5060>;q=0.5;expires=120".to_string();
+        let high_priority = "<sip:1001@192.0.2.10:5060>;q=0.9;expires=300".to_string();
+        reg.bind_affinity_contact_ttl(
+            key.to_string(),
+            "worker-a".to_string(),
+            low_priority,
+            500,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        reg.bind_affinity_contact_ttl(
+            key.to_string(),
+            "worker-b".to_string(),
+            high_priority.clone(),
+            900,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        reg.bind_affinity_contact_ttl(
+            key.to_string(),
+            "worker-a".to_string(),
+            "<sip:1001@192.0.2.11:5060>;q=0.7".to_string(),
+            700,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+        let contacts = reg.contacts_for_affinity(key).await;
+        assert_eq!(
+            contacts
+                .get("worker-a")
+                .unwrap()
+                .iter()
+                .map(|c| c.contact.as_str())
+                .collect::<Vec<_>>(),
+            vec!["<sip:1001@192.0.2.11:5060>;q=0.7"]
+        );
+        assert_eq!(
+            contacts
+                .get("worker-b")
+                .unwrap()
+                .iter()
+                .map(|c| c.contact.as_str())
+                .collect::<Vec<_>>(),
+            vec![high_priority.as_str()]
+        );
+    }
+
+    #[tokio::test]
     async fn heartbeat_updates_load_and_reports_known() {
         let reg = start().await;
         reg.register(rec("w1")).await.unwrap();

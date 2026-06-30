@@ -175,24 +175,75 @@ impl StateMachineStore {
     ) -> BTreeMap<String, Vec<ExtensionContactRecord>> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let data = self.data.lock().await;
-        let mut out = BTreeMap::new();
+        let mut best_by_contact: BTreeMap<String, (String, ExtensionContactRecord)> =
+            BTreeMap::new();
         let Some(members) = data.worker_affinity_contacts.get(affinity_key) else {
-            return out;
+            return BTreeMap::new();
         };
         for (worker_id, contacts) in members {
-            let mut records: Vec<ExtensionContactRecord> = contacts
+            for record in contacts
                 .values()
                 .filter(|record| record.expires_at_ms == 0 || record.expires_at_ms > now_ms)
-                .cloned()
-                .collect();
+            {
+                let candidate = (worker_id.clone(), record.clone());
+                let dedup_key = contact_dedup_key(&record.contact);
+                let replace = best_by_contact
+                    .get(&dedup_key)
+                    .is_none_or(|current| better_contact_owner(&candidate, current));
+                if replace {
+                    best_by_contact.insert(dedup_key, candidate);
+                }
+            }
+        }
+
+        let mut out: BTreeMap<String, Vec<ExtensionContactRecord>> = BTreeMap::new();
+        for (worker_id, record) in best_by_contact.into_values() {
+            out.entry(worker_id).or_default().push(record);
+        }
+        for records in out.values_mut() {
             records
                 .sort_by_key(|record| (std::cmp::Reverse(record.q_milli), record.contact.clone()));
-            if !records.is_empty() {
-                out.insert(worker_id.clone(), records);
-            }
         }
         out
     }
+}
+
+fn better_contact_owner(
+    candidate: &(String, ExtensionContactRecord),
+    current: &(String, ExtensionContactRecord),
+) -> bool {
+    let (candidate_worker, candidate_record) = candidate;
+    let (current_worker, current_record) = current;
+    (
+        candidate_record.q_milli,
+        candidate_record.expires_at_ms,
+        std::cmp::Reverse(candidate_worker),
+    ) > (
+        current_record.q_milli,
+        current_record.expires_at_ms,
+        std::cmp::Reverse(current_worker),
+    )
+}
+
+fn contact_dedup_key(contact: &str) -> String {
+    let mut parts = contact.split(';');
+    let Some(uri) = parts.next() else {
+        return String::new();
+    };
+    let mut key = uri.trim().to_ascii_lowercase();
+    for part in parts {
+        let Some(name) = part.split_once('=').map(|(name, _)| name.trim()) else {
+            key.push(';');
+            key.push_str(part.trim());
+            continue;
+        };
+        if name.eq_ignore_ascii_case("q") || name.eq_ignore_ascii_case("expires") {
+            continue;
+        }
+        key.push(';');
+        key.push_str(part.trim());
+    }
+    key
 }
 
 fn remove_worker_from_affinity(data: &mut StateMachineData, worker_id: &str) {
