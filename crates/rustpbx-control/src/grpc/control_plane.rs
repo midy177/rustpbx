@@ -302,17 +302,29 @@ impl ControlPlane for ControlPlaneService {
                 "extension location unbound"
             );
         } else {
-            self.workers
-                .bind_affinity_ttl(
-                    affinity_key.clone(),
-                    report.worker_id.clone(),
-                    Duration::from_secs(report.expires_secs as u64),
-                )
-                .await
-                .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+            let ttl = Duration::from_secs(report.expires_secs as u64);
+            let contact = report.contact.trim();
+            if contact.is_empty() {
+                self.workers
+                    .bind_affinity_ttl(affinity_key.clone(), report.worker_id.clone(), ttl)
+                    .await
+                    .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+            } else {
+                self.workers
+                    .bind_affinity_contact_ttl(
+                        affinity_key.clone(),
+                        report.worker_id.clone(),
+                        contact.to_string(),
+                        contact_q_milli(contact),
+                        ttl,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
+            }
             info!(
                 affinity_key = %affinity_key,
                 worker_id = %report.worker_id,
+                contact = %report.contact,
                 expires_secs = report.expires_secs,
                 "extension location bound"
             );
@@ -516,4 +528,53 @@ fn extension_affinity_key(tenant_id: Option<i64>, extension: &str) -> String {
             .unwrap_or_else(|| "global".to_string()),
         extension
     )
+}
+
+fn contact_q_milli(contact: &str) -> u16 {
+    contact
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| {
+            key.trim()
+                .eq_ignore_ascii_case("q")
+                .then(|| parse_q_milli(value.trim()))
+                .flatten()
+        })
+        .unwrap_or(1000)
+}
+
+fn parse_q_milli(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    let whole = whole.parse::<u16>().ok()?;
+    if whole > 1 {
+        return Some(1000);
+    }
+    let mut frac_digits = frac
+        .chars()
+        .take(3)
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    while frac_digits.len() < 3 {
+        frac_digits.push('0');
+    }
+    let frac = frac_digits.parse::<u16>().unwrap_or(0);
+    Some(if whole == 1 { 1000 } else { frac.min(1000) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_contact_q_milli() {
+        assert_eq!(contact_q_milli("<sip:1001@host>"), 1000);
+        assert_eq!(contact_q_milli("<sip:1001@host>;q=0.7"), 700);
+        assert_eq!(contact_q_milli("<sip:1001@host>;expires=60;q=0.25"), 250);
+        assert_eq!(contact_q_milli("<sip:1001@host>;q=1.0"), 1000);
+        assert_eq!(contact_q_milli("<sip:1001@host>;q=2"), 1000);
+    }
 }

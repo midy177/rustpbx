@@ -270,9 +270,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 后续按以下顺序推进：
 
-1. **分机 Contact 粒度路由**：在 Control affinity 状态中保留 Contact/q/expires
-   元数据，Edge 按 Contact 去重与优先级生成 fork 目标；仍兼容现有
-   `extension:<tenant>:<ext>` worker 级 sticky routing。
+1. **分机 Contact 粒度路由**：Control affinity 状态已保留 Contact/q/expires
+   元数据，并按最高 q 值排序同一分机的 Worker 目标；后续继续把 Contact 明细透传给
+   Edge，用于 Contact 去重、q 值优先级和同一 Worker 多 Contact 精确 fork。
 2. **多 Control 即时配置广播**：当前已有数据库单调版本、watch 重连 resync 和 Edge
    周期 poll 兜底；后续接入 Raft event bus 或数据库通知，把配置事件从写入节点广播
    到所有 Control 节点的本地 watch stream。

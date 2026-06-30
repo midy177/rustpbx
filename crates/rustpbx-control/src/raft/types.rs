@@ -163,6 +163,21 @@ pub struct CallStartRecord {
     pub at_ms: i64,
 }
 
+/// One registered Contact behind an extension affinity binding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionContactRecord {
+    pub contact: String,
+    /// SIP Contact q-value scaled by 1000. Default Contact priority is 1.0.
+    #[serde(default = "default_contact_q_milli")]
+    pub q_milli: u16,
+    /// Unix-millis expiry. `0` means no TTL, matching worker affinity members.
+    pub expires_at_ms: i64,
+}
+
+fn default_contact_q_milli() -> u16 {
+    1000
+}
+
 /// Commands applied to the replicated worker registry (the Raft `AppData`).
 ///
 /// Every mutation of the registry goes through `Raft::client_write` with one of
@@ -230,6 +245,14 @@ pub enum RegistryCommand {
         /// unbound or the selected worker is removed.
         #[serde(default)]
         expires_at_ms: Option<i64>,
+    },
+    /// Bind one concrete Contact behind an affinity key/worker pair.
+    BindAffinityContact {
+        affinity_key: String,
+        worker_id: String,
+        contact: String,
+        q_milli: u16,
+        expires_at_ms: i64,
     },
     /// Remove an affinity binding.
     UnbindAffinity { affinity_key: String },

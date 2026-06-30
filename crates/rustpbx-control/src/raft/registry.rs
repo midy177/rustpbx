@@ -450,6 +450,27 @@ impl RaftRegistry {
         Ok(())
     }
 
+    /// Bind a concrete extension Contact behind a sticky routing key.
+    pub async fn bind_affinity_contact_ttl(
+        &self,
+        affinity_key: String,
+        worker_id: String,
+        contact: String,
+        q_milli: u16,
+        ttl: Duration,
+    ) -> Result<()> {
+        let expires_at_ms = now_ms() + ttl.as_millis() as i64;
+        self.propose(RegistryCommand::BindAffinityContact {
+            affinity_key,
+            worker_id,
+            contact,
+            q_milli,
+            expires_at_ms,
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Remove a sticky routing key.
     #[allow(dead_code)]
     pub async fn unbind_affinity(&self, affinity_key: String) -> Result<bool> {
@@ -1052,6 +1073,40 @@ mod tests {
             .await;
         let ids: Vec<String> = workers.into_iter().map(|w| w.worker_id).collect();
         assert_eq!(ids, vec!["worker-a".to_string(), "worker-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn affinity_members_are_ordered_by_contact_q() {
+        let reg = start().await;
+
+        reg.register(rec("low-q")).await.unwrap();
+        reg.register(rec("high-q")).await.unwrap();
+
+        let key = "extension:1:1001";
+        reg.bind_affinity_contact_ttl(
+            key.to_string(),
+            "low-q".to_string(),
+            "<sip:1001@low>;q=0.2".to_string(),
+            200,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        reg.bind_affinity_contact_ttl(
+            key.to_string(),
+            "high-q".to_string(),
+            "<sip:1001@high>;q=0.9".to_string(),
+            900,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+        let workers = reg
+            .available_with_constraints(None, &HashMap::new(), &[], Some(key))
+            .await;
+        let ids: Vec<String> = workers.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(ids, vec!["high-q".to_string(), "low-q".to_string()]);
     }
 
     #[tokio::test]
