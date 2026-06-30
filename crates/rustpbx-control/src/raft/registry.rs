@@ -519,11 +519,13 @@ impl RaftRegistry {
             })
             .collect();
         workers.sort_by_key(|w| {
-            std::cmp::Reverse((
-                w.available_capacity(),
-                w.tenant_affinity_score(tenant_id),
-                w.nat_reachability_score(),
-            ))
+            (
+                std::cmp::Reverse(w.available_capacity()),
+                std::cmp::Reverse(w.tenant_affinity_score(tenant_id)),
+                std::cmp::Reverse(w.nat_reachability_score()),
+                w.scheduling_cost(),
+                w.worker_id.clone(),
+            )
         });
         if let Some(affinity_key) = affinity_key.filter(|key| !key.trim().is_empty()) {
             let bound_ids: BTreeSet<String> = self
@@ -908,6 +910,46 @@ mod tests {
                 "higher-capacity".to_string(),
                 "tenant-match".to_string(),
                 "generic".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn available_prefers_lower_cost_when_primary_scores_tie() {
+        let reg = start().await;
+
+        let mut high_cost = rec("high-cost");
+        high_cost
+            .labels
+            .insert("schedule_cost".to_string(), "200".to_string());
+        high_cost.nat_type = "open".to_string();
+
+        let mut low_cost = rec("low-cost");
+        low_cost
+            .labels
+            .insert("schedule_cost".to_string(), "10".to_string());
+        low_cost.nat_type = "open".to_string();
+
+        let mut invalid_cost = rec("invalid-cost");
+        invalid_cost
+            .labels
+            .insert("schedule_cost".to_string(), "not-a-number".to_string());
+        invalid_cost.nat_type = "open".to_string();
+
+        reg.register(high_cost).await.unwrap();
+        reg.register(low_cost).await.unwrap();
+        reg.register(invalid_cost).await.unwrap();
+
+        let avail = reg
+            .available_with_constraints(None, &HashMap::new(), &[], None)
+            .await;
+        let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "low-cost".to_string(),
+                "invalid-cost".to_string(),
+                "high-cost".to_string()
             ]
         );
     }

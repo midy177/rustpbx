@@ -102,6 +102,14 @@ impl WorkerRecord {
         }
     }
 
+    pub fn scheduling_cost(&self) -> u32 {
+        self.labels
+            .get("schedule_cost")
+            .or_else(|| self.labels.get("cost"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(100)
+    }
+
     /// Healthy = not draining and heartbeat within `timeout_ms` of `now_ms`.
     pub fn is_healthy(&self, now_ms: i64, timeout_ms: i64) -> bool {
         !self.draining && now_ms.saturating_sub(self.last_heartbeat_ms) < timeout_ms
