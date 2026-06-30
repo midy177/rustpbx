@@ -129,6 +129,14 @@ impl<'a> PlatformSettings<'a> {
             .and_then(|r| r.try_get::<Option<String>>("", "value").ok().flatten())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_default();
+        if matches!(backend, DatabaseBackend::Postgres) {
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "SELECT pg_notify('rustpbx_config_changed', $1)",
+                vec![Value::String(Some(Box::new(version.to_string())))],
+            ))
+            .await?;
+        }
         txn.commit().await?;
         Ok(version)
     }

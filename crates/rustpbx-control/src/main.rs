@@ -200,6 +200,21 @@ async fn main() -> Result<()> {
         )
         .await;
     });
+    if is_postgres_url(&cfg.database_url) {
+        let config_notify_db = db.clone();
+        let config_notify_url = cfg.database_url.clone();
+        let config_notify_tx = config_change_tx.clone();
+        let config_notify_observed = Arc::clone(&config_version_observed);
+        tokio::spawn(async move {
+            config_change_watcher::run_postgres_config_notify_listener(
+                config_notify_db,
+                config_notify_url,
+                config_notify_tx,
+                config_notify_observed,
+            )
+            .await;
+        });
+    }
     let svc = ControlPlaneService::with_change_tx(
         Arc::clone(&store),
         workers.clone(),
@@ -251,4 +266,19 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_postgres_url(url: &str) -> bool {
+    url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn detects_postgres_urls() {
+        assert!(super::is_postgres_url("postgres://user:pass@localhost/db"));
+        assert!(super::is_postgres_url("postgresql://localhost/db"));
+        assert!(!super::is_postgres_url("sqlite://rustpbx-control.sqlite3"));
+        assert!(!super::is_postgres_url("mysql://localhost/db"));
+    }
 }

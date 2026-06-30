@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::{sync::broadcast, time::Duration};
+use tracing::{info, warn};
 
 /// Periodically observes the shared config version and re-broadcasts changes
 /// made by another Control replica to local config-watch subscribers.
@@ -25,12 +26,64 @@ pub async fn run_config_version_watcher(
     }
 }
 
+/// Postgres acceleration path for cross-Control config broadcasts. The periodic
+/// watcher remains the portable fallback for missed notifications and non-PG DBs.
+pub async fn run_postgres_config_notify_listener(
+    db: DatabaseConnection,
+    database_url: String,
+    change_tx: broadcast::Sender<ConfigChangeEvent>,
+    observed_version: Arc<AtomicU64>,
+) {
+    loop {
+        match listen_once(
+            &db,
+            &database_url,
+            &change_tx,
+            Arc::clone(&observed_version),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => warn!(error = %e, "postgres config notify listener failed; retrying"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn listen_once(
+    db: &DatabaseConnection,
+    database_url: &str,
+    change_tx: &broadcast::Sender<ConfigChangeEvent>,
+    observed_version: Arc<AtomicU64>,
+) -> anyhow::Result<()> {
+    let mut listener = sqlx::postgres::PgListener::connect(database_url).await?;
+    listener.listen("rustpbx_config_changed").await?;
+    info!("postgres config notify listener started");
+    loop {
+        let notification = listener.recv().await?;
+        let payload_version = notification.payload().parse::<u64>().ok();
+        if let Some(version) = payload_version {
+            publish_version_if_advanced(change_tx, &observed_version, version);
+        } else {
+            publish_if_version_advanced(db, change_tx, &observed_version).await;
+        }
+    }
+}
+
 async fn publish_if_version_advanced(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ConfigChangeEvent>,
     observed_version: &AtomicU64,
 ) {
     let current = PlatformSettings::new(db).config_version().await;
+    publish_version_if_advanced(change_tx, observed_version, current);
+}
+
+fn publish_version_if_advanced(
+    change_tx: &broadcast::Sender<ConfigChangeEvent>,
+    observed_version: &AtomicU64,
+    current: u64,
+) {
     let observed = observed_version.load(Ordering::Relaxed);
     if current <= observed {
         return;
