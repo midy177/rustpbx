@@ -425,7 +425,7 @@ impl RaftRegistry {
     /// Healthy workers with spare capacity, most-available first.
     #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
-        self.available_with_constraints(None, &HashMap::new(), &[])
+        self.available_with_constraints(None, &HashMap::new(), &[], None)
             .await
     }
 
@@ -435,6 +435,7 @@ impl RaftRegistry {
         tenant_id: Option<i64>,
         required_labels: &HashMap<String, String>,
         required_capabilities: &[String],
+        affinity_key: Option<&str>,
     ) -> Vec<WorkerRecord> {
         let now = now_ms();
         let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
@@ -462,6 +463,25 @@ impl RaftRegistry {
                 w.nat_reachability_score(),
             ))
         });
+        if let Some(affinity_key) = affinity_key.filter(|key| !key.trim().is_empty()) {
+            if let Some(worker_id) = self.sm.worker_for_affinity(affinity_key).await
+                && let Some(pos) = workers.iter().position(|w| w.worker_id == worker_id)
+            {
+                let worker = workers.remove(pos);
+                workers.insert(0, worker);
+                return workers;
+            }
+            if let Some(worker) = workers.first()
+                && let Err(e) = self
+                    .propose(RegistryCommand::BindAffinity {
+                        affinity_key: affinity_key.to_string(),
+                        worker_id: worker.worker_id.clone(),
+                    })
+                    .await
+            {
+                tracing::warn!(affinity_key, error = %e, "failed to bind worker affinity");
+            }
+        }
         workers
     }
 }
@@ -779,7 +799,7 @@ mod tests {
 
         let required_capabilities = vec!["recording".to_string()];
         let avail = reg
-            .available_with_constraints(None, &labels, &required_capabilities)
+            .available_with_constraints(None, &labels, &required_capabilities, None)
             .await;
         let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
         assert_eq!(ids, vec!["media".to_string()]);
@@ -809,7 +829,7 @@ mod tests {
         reg.register(higher_capacity).await.unwrap();
 
         let avail = reg
-            .available_with_constraints(Some(42), &HashMap::new(), &[])
+            .available_with_constraints(Some(42), &HashMap::new(), &[], None)
             .await;
         let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
         assert_eq!(
@@ -820,6 +840,33 @@ mod tests {
                 "generic".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn available_reuses_affinity_binding() {
+        let reg = start().await;
+
+        let mut first = rec("first");
+        first.active_calls = 50;
+        let mut second = rec("second");
+        second.active_calls = 10;
+
+        reg.register(first).await.unwrap();
+        reg.register(second).await.unwrap();
+
+        let key = "conference:1:room-a";
+        let initial = reg
+            .available_with_constraints(None, &HashMap::new(), &[], Some(key))
+            .await;
+        assert_eq!(initial[0].worker_id, "second");
+
+        reg.heartbeat("first", 0, 0.0).await.unwrap();
+        reg.heartbeat("second", 90, 0.0).await.unwrap();
+
+        let sticky = reg
+            .available_with_constraints(None, &HashMap::new(), &[], Some(key))
+            .await;
+        assert_eq!(sticky[0].worker_id, "second");
     }
 
     #[tokio::test]

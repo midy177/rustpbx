@@ -318,6 +318,9 @@ message GetWorkersRequest  {
   map<string, string> required_labels = 2;
   // All requested capabilities must be advertised by the worker.
   repeated string required_capabilities = 3;
+  // Optional sticky routing key. Calls with the same key prefer the same worker
+  // while that worker remains healthy and matches the requested constraints.
+  optional string affinity_key = 4;
 }
 message WorkerList         { repeated WorkerInfo workers = 1; }
 

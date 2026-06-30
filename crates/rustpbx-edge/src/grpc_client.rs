@@ -89,6 +89,7 @@ impl GrpcControlClient {
         tenant_id: Option<i64>,
         required_labels: HashMap<String, String>,
         required_capabilities: Vec<String>,
+        affinity_key: Option<String>,
     ) -> Result<WorkerList> {
         let resp = self
             .client
@@ -96,6 +97,7 @@ impl GrpcControlClient {
                 tenant_id,
                 required_labels,
                 required_capabilities,
+                affinity_key,
             })
             .await?;
         Ok(resp.into_inner())

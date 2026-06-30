@@ -303,19 +303,21 @@ impl EdgeCallRouter {
         // ── Map RouteResult → InternalCallContext ─────────────────────────────
         let internal_ctx =
             self.build_internal_context(&route_result, &trunk_ctx, &caller_uri, &callee_uri)?;
+        let affinity_key = conference_affinity_key(trunk_ctx.tenant_id, &internal_ctx);
 
         info!(
             call_id = ?original.call_id_header().ok().map(|h| h.value().to_string()),
             trunk = %trunk_ctx.name,
             tenant_id = ?trunk_ctx.tenant_id,
             action = internal_ctx.action.as_str(),
+            affinity_key = ?affinity_key,
             "edge routed call — dispatching to worker"
         );
 
         // ── Select Worker ─────────────────────────────────────────────────────
         let worker = self
             .worker_selector
-            .select(trunk_ctx.tenant_id)
+            .select(trunk_ctx.tenant_id, affinity_key)
             .await
             .map_err(|e| {
                 warn!(error = %e, "no worker available");
@@ -545,6 +547,26 @@ fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<Uri> {
         .map_err(anyhow::Error::from)
 }
 
+fn conference_affinity_key(tenant_id: Option<i64>, ctx: &InternalCallContext) -> Option<String> {
+    if ctx.action != RouteAction::Application || ctx.app_name.as_deref() != Some("conference") {
+        return None;
+    }
+    let room = ctx
+        .app_params
+        .as_ref()
+        .and_then(|params| params.get("id"))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or("default");
+    Some(format!(
+        "conference:{}:{}",
+        tenant_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "global".to_string()),
+        room
+    ))
+}
+
 /// Build the carrier-facing Request-URI: keep the dialed number (callee user
 /// part) and swap the host/port to the trunk's destination. Mirrors the
 /// `rewrite_hostport` behaviour of the monolith's `apply_trunk_config`.
@@ -568,5 +590,45 @@ mod tests {
         assert_eq!(aor.user().unwrap(), "+8613800138000");
         // host/port routed to the carrier
         assert_eq!(aor.host_with_port.to_string(), "carrier.example.com:5060");
+    }
+
+    #[test]
+    fn conference_affinity_uses_tenant_and_room_id() {
+        let ctx = InternalCallContext {
+            action: RouteAction::Application,
+            app_name: Some("conference".to_string()),
+            app_params: Some(serde_json::json!({ "id": "room-a" })),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            conference_affinity_key(Some(42), &ctx).as_deref(),
+            Some("conference:42:room-a")
+        );
+    }
+
+    #[test]
+    fn conference_affinity_defaults_global_room() {
+        let ctx = InternalCallContext {
+            action: RouteAction::Application,
+            app_name: Some("conference".to_string()),
+            app_params: None,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            conference_affinity_key(None, &ctx).as_deref(),
+            Some("conference:global:default")
+        );
+    }
+
+    #[test]
+    fn non_conference_routes_have_no_affinity() {
+        let ctx = InternalCallContext {
+            action: RouteAction::Forward,
+            ..Default::default()
+        };
+
+        assert!(conference_affinity_key(Some(42), &ctx).is_none());
     }
 }

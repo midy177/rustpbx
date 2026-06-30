@@ -44,6 +44,9 @@ pub struct StoredSnapshot {
     /// Recently accepted call starts keyed by call_id (for CPS enforcement).
     #[serde(default)]
     pub call_starts: BTreeMap<String, CallStartRecord>,
+    /// Sticky routing map: affinity_key -> worker_id.
+    #[serde(default)]
+    pub worker_affinity: BTreeMap<String, String>,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -59,6 +62,8 @@ struct StateMachineData {
     call_slots: BTreeMap<String, CallSlotRecord>,
     /// call_id -> recent accepted start (trunk CPS control)
     call_starts: BTreeMap<String, CallStartRecord>,
+    /// affinity_key -> worker_id
+    worker_affinity: BTreeMap<String, String>,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -102,6 +107,16 @@ impl StateMachineStore {
     /// Total reserved call slots across all tenants (read-only, for stats).
     pub async fn call_slot_count(&self) -> u32 {
         self.data.lock().await.call_slots.len() as u32
+    }
+
+    /// Resolve a sticky worker binding by affinity key.
+    pub async fn worker_for_affinity(&self, affinity_key: &str) -> Option<String> {
+        self.data
+            .lock()
+            .await
+            .worker_affinity
+            .get(affinity_key)
+            .cloned()
     }
 }
 
@@ -326,12 +341,27 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             let removed = (before - data.call_slots.len()) as u32;
             RegistryResponse::known(true, removed)
         }
+        RegistryCommand::BindAffinity {
+            affinity_key,
+            worker_id,
+        } => {
+            data.worker_affinity.insert(affinity_key, worker_id);
+            RegistryResponse::known(true, 0)
+        }
     }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (last_applied, last_membership, workers, edges, call_slots, call_starts) = {
+        let (
+            last_applied,
+            last_membership,
+            workers,
+            edges,
+            call_slots,
+            call_starts,
+            worker_affinity,
+        ) = {
             let data = self.data.lock().await;
             (
                 data.last_applied,
@@ -340,6 +370,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
                 data.edges.clone(),
                 data.call_slots.clone(),
                 data.call_starts.clone(),
+                data.worker_affinity.clone(),
             )
         };
 
@@ -359,6 +390,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             edges,
             call_slots,
             call_starts,
+            worker_affinity,
         };
         let bytes =
             serde_json::to_vec(&stored).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -448,6 +480,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.edges = stored.edges;
         data.call_slots = stored.call_slots;
         data.call_starts = stored.call_starts;
+        data.worker_affinity = stored.worker_affinity;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {

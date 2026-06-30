@@ -317,6 +317,7 @@ impl ControlPlane for ControlPlaneService {
                 req.tenant_id,
                 &req.required_labels,
                 &req.required_capabilities,
+                req.affinity_key.as_deref(),
             )
             .await
             .into_iter()

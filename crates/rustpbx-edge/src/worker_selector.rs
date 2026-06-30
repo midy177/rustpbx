@@ -42,21 +42,27 @@ impl WorkerSelector {
     }
 
     /// Query Control Plane and return the best worker for a new call.
-    pub async fn select(&self, tenant_id: Option<i64>) -> Result<WorkerEndpoint> {
+    pub async fn select(
+        &self,
+        tenant_id: Option<i64>,
+        affinity_key: Option<String>,
+    ) -> Result<WorkerEndpoint> {
         let mut client = self.client.write().await;
         let list = client
             .get_available_workers(
                 tenant_id,
                 self.required_labels.clone(),
                 self.required_capabilities.clone(),
+                affinity_key.clone(),
             )
             .await?;
 
         if list.workers.is_empty() {
             return Err(anyhow!(
-                "no available workers matching labels {:?} and capabilities {:?}",
+                "no available workers matching labels {:?}, capabilities {:?}, affinity {:?}",
                 self.required_labels,
-                self.required_capabilities
+                self.required_capabilities,
+                affinity_key
             ));
         }
 
@@ -71,6 +77,7 @@ impl WorkerSelector {
             max = best.max_concurrent,
             labels = ?best.labels,
             capabilities = ?best.capabilities,
+            affinity_key = ?affinity_key,
             "selected worker"
         );
 

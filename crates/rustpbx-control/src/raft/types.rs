@@ -212,6 +212,13 @@ pub enum RegistryCommand {
     ReleaseCallSlot { call_id: String },
     /// Reap slots reserved before `before_ms` (crash/leak backstop).
     ReapCallSlots { before_ms: i64 },
+
+    // ── Worker affinity (sticky routing) ─────────────────────────────────────
+    /// Bind an affinity key (e.g. `conference:<tenant>:<room>`) to a worker.
+    BindAffinity {
+        affinity_key: String,
+        worker_id: String,
+    },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any
