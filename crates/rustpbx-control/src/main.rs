@@ -200,6 +200,18 @@ async fn main() -> Result<()> {
         )
         .await;
     });
+    let config_raft_workers = workers.clone();
+    let config_raft_tx = config_change_tx.clone();
+    let config_raft_observed = Arc::clone(&config_version_observed);
+    tokio::spawn(async move {
+        config_change_watcher::run_raft_config_event_watcher(
+            config_raft_workers,
+            config_raft_tx,
+            config_raft_observed,
+            Duration::from_millis(200),
+        )
+        .await;
+    });
     if is_postgres_url(&cfg.database_url) {
         let config_notify_db = db.clone();
         let config_notify_url = cfg.database_url.clone();

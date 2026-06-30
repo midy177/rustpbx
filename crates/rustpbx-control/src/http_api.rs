@@ -130,6 +130,9 @@ impl HttpState {
         self.config_version_observed
             .fetch_max(version, Ordering::Relaxed);
         let _ = self.config_change_tx.send(event);
+        if let Err(e) = self.workers.publish_config_version(version).await {
+            warn!(error = %e, version, "failed to publish config version through raft");
+        }
         Ok(version)
     }
 }

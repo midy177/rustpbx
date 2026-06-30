@@ -1,5 +1,6 @@
 use crate::{
     grpc::proto::control::{ConfigChangeEvent, config_change_event::ChangeType},
+    raft::registry::RaftRegistry,
     settings::PlatformSettings,
 };
 use sea_orm::DatabaseConnection;
@@ -23,6 +24,24 @@ pub async fn run_config_version_watcher(
     loop {
         tick.tick().await;
         publish_if_version_advanced(&db, &change_tx, &observed_version).await;
+    }
+}
+
+/// Low-latency cross-Control config broadcast path backed by the Raft registry.
+/// The replicated value is only a wakeup/version hint; the DB remains the
+/// source of truth and the DB poller remains the portable backstop.
+pub async fn run_raft_config_event_watcher(
+    registry: RaftRegistry,
+    change_tx: broadcast::Sender<ConfigChangeEvent>,
+    observed_version: Arc<AtomicU64>,
+    interval: Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let version = registry.config_event_version().await;
+        publish_version_if_advanced(&change_tx, &observed_version, version);
     }
 }
 
@@ -105,8 +124,10 @@ fn publish_version_if_advanced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::registry::RaftRegistry;
     use sea_orm::Database;
     use sea_orm_migration::{MigrationTrait, SchemaManager};
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn broadcasts_when_external_config_version_advances() {
@@ -128,5 +149,33 @@ mod tests {
 
         publish_if_version_advanced(&db, &tx, &observed_version).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn raft_watcher_broadcasts_published_config_version() {
+        let registry = RaftRegistry::start(1, Duration::from_secs(30))
+            .await
+            .unwrap();
+        registry.publish_config_version(11).await.unwrap();
+
+        let observed_version = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = broadcast::channel(8);
+        let task = tokio::spawn(run_raft_config_event_watcher(
+            registry,
+            tx,
+            Arc::clone(&observed_version),
+            Duration::from_millis(10),
+        ));
+
+        let event = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.version, 11);
+        assert_eq!(event.change_type, ChangeType::PlatformChanged as i32);
+        assert_eq!(observed_version.load(Ordering::Relaxed), 11);
+        assert!(rx.try_recv().is_err());
+
+        task.abort();
     }
 }

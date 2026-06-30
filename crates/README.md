@@ -280,9 +280,10 @@ Worker → Edge 的 CDR 时间线状态上报。
    过期更晚的 Worker 归属；`GET /api/workers/contact-conflicts` 和 Workers 管理页会展示
    当前同一 Contact 被多个 Worker 上报的冲突候选与最终选中节点。
 2. **多 Control 即时配置广播**：Control 现在会轮询共享 `config_version`，把其他
-   Control 节点写入的配置变化广播到本节点的 watch stream；Postgres 部署会额外通过
-   `LISTEN rustpbx_config_changed` 即时唤醒，Edge/Worker 的 watch 重连 resync 和 Edge
-   周期 poll 仍作为兜底。后续可再接入 Raft event bus，覆盖非 Postgres 的亚秒级推送。
+   Control 节点写入的配置变化广播到本节点的 watch stream；配置写入后也会把最新版本
+   复制到 Raft registry，非 Postgres 部署可通过本地 Raft 内存事件快速唤醒。
+   Postgres 部署会额外通过 `LISTEN rustpbx_config_changed` 即时唤醒，Edge/Worker 的
+   watch 重连 resync、Control DB 轮询和 Edge 周期 poll 仍作为兜底。
 3. **RTP Gateway Phase 2 实体处理**：`MediaThreadCallSink` 与
    `spawn_media_thread_bridge` 已建立可调用的专用线程边界；后续把 PCM 注入、SDP
    renegotiate 和真实 RTP/codec 循环接入该线程，并通过 `MediaEvent` 返回成功/失败。
@@ -315,9 +316,11 @@ Worker → Edge 的 CDR 时间线状态上报。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置版本号已在
   `rustpbx_platform_settings` 内原子递增。每个 Control 会按
   `config_version_poll_secs` 观察共享版本并向本地 watch stream 广播其他节点写入的
-  `PlatformChanged`；Postgres 会通过 `pg_notify('rustpbx_config_changed', version)`
-  加速通知。Edge/Worker 重连 watch 时如果 `from_version` 落后也会收到 resync 事件。
-  Edge 还会按 `config_poll_secs` 周期重拉配置作为兜底。
+  `PlatformChanged`；同时配置写入会发布 Raft config version，让非 Postgres 部署也能
+  低延迟唤醒各 Control 节点。Postgres 会通过
+  `pg_notify('rustpbx_config_changed', version)` 进一步加速通知。Edge/Worker 重连
+  watch 时如果 `from_version` 落后也会收到 resync 事件。Edge 还会按
+  `config_poll_secs` 周期重拉配置作为兜底。
 
 验证基线：
 

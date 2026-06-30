@@ -519,6 +519,19 @@ impl RaftRegistry {
         self.sm.extension_contact_conflicts().await
     }
 
+    /// Publish a DB config version through Raft as a low-latency local watch
+    /// wakeup for every Control replica. The DB remains the source of truth.
+    pub async fn publish_config_version(&self, version: u64) -> Result<()> {
+        self.propose(RegistryCommand::PublishConfigVersion { version })
+            .await?;
+        Ok(())
+    }
+
+    /// Latest DB config version observed through the Raft event bus.
+    pub async fn config_event_version(&self) -> u64 {
+        self.sm.config_event_version().await
+    }
+
     /// Healthy workers with spare capacity, most-available first.
     #[cfg(test)]
     pub async fn available(&self) -> Vec<WorkerRecord> {
@@ -1306,6 +1319,20 @@ mod tests {
         assert_eq!(conflicts[0].selected_worker_id, "worker-b");
         assert_eq!(conflicts[0].selected_contact, high_priority);
         assert_eq!(conflicts[0].candidates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn config_event_version_is_monotonic() {
+        let reg = start().await;
+
+        reg.publish_config_version(7).await.unwrap();
+        assert_eq!(reg.config_event_version().await, 7);
+
+        reg.publish_config_version(3).await.unwrap();
+        assert_eq!(reg.config_event_version().await, 7);
+
+        reg.publish_config_version(9).await.unwrap();
+        assert_eq!(reg.config_event_version().await, 9);
     }
 
     #[tokio::test]

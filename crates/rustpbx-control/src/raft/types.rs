@@ -295,6 +295,11 @@ pub enum RegistryCommand {
     },
     /// Remove affinity bindings whose expiry is at or before `before_ms`.
     ReapAffinity { before_ms: i64 },
+
+    // ── Control-plane config event bus ───────────────────────────────────────
+    /// Replicate the latest DB config version so every Control replica can
+    /// broadcast a local watch event without waiting for DB polling.
+    PublishConfigVersion { version: u64 },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any

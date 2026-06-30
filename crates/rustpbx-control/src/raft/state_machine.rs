@@ -59,6 +59,9 @@ pub struct StoredSnapshot {
     #[serde(default)]
     pub worker_affinity_contacts:
         BTreeMap<String, BTreeMap<String, BTreeMap<String, ExtensionContactRecord>>>,
+    /// Latest DB config version published through Raft for local watch wakeups.
+    #[serde(default)]
+    pub config_event_version: u64,
 }
 
 /// In-memory state machine data, guarded for shared async access.
@@ -83,6 +86,8 @@ struct StateMachineData {
     /// affinity_key -> worker_id -> contact -> record
     worker_affinity_contacts:
         BTreeMap<String, BTreeMap<String, BTreeMap<String, ExtensionContactRecord>>>,
+    /// Latest DB config version published through Raft for local watch wakeups.
+    config_event_version: u64,
 }
 
 /// The state machine store: shared handle around the data plus the latest
@@ -259,6 +264,11 @@ impl StateMachineStore {
         conflicts
             .sort_by_key(|conflict| (conflict.affinity_key.clone(), conflict.contact_key.clone()));
         conflicts
+    }
+
+    /// Latest DB config version replicated through Raft.
+    pub async fn config_event_version(&self) -> u64 {
+        self.data.lock().await.config_event_version
     }
 }
 
@@ -729,6 +739,10 @@ fn apply_command(data: &mut StateMachineData, cmd: RegistryCommand) -> RegistryR
             }
             RegistryResponse::known(true, removed)
         }
+        RegistryCommand::PublishConfigVersion { version } => {
+            data.config_event_version = data.config_event_version.max(version);
+            RegistryResponse::known(true, 0)
+        }
     }
 }
 
@@ -745,6 +759,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             worker_affinity_expires,
             worker_affinity_members,
             worker_affinity_contacts,
+            config_event_version,
         ) = {
             let data = self.data.lock().await;
             (
@@ -758,6 +773,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
                 data.worker_affinity_expires.clone(),
                 data.worker_affinity_members.clone(),
                 data.worker_affinity_contacts.clone(),
+                data.config_event_version,
             )
         };
 
@@ -781,6 +797,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             worker_affinity_expires,
             worker_affinity_members,
             worker_affinity_contacts,
+            config_event_version,
         };
         let bytes =
             serde_json::to_vec(&stored).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
@@ -874,6 +891,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         data.worker_affinity_expires = stored.worker_affinity_expires;
         data.worker_affinity_members = stored.worker_affinity_members;
         data.worker_affinity_contacts = stored.worker_affinity_contacts;
+        data.config_event_version = stored.config_event_version;
         drop(data);
 
         *self.current_snapshot.lock().await = Some(Snapshot {
