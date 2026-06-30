@@ -19,8 +19,8 @@ use super::log_store::LogStore;
 use super::network::NetworkFactory;
 use super::state_machine::StateMachineStore;
 use super::types::{
-    EdgeRecord, ExtensionContactRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig,
-    WorkerRecord, node_addr,
+    EdgeRecord, ExtensionContactConflict, ExtensionContactRecord, NodeId, RegistryCommand,
+    RegistryResponse, TypeConfig, WorkerRecord, node_addr,
 };
 
 /// Current wall-clock in unix-millis. Used by the leader to stamp commands so
@@ -512,6 +512,11 @@ impl RaftRegistry {
         affinity_key: &str,
     ) -> BTreeMap<String, Vec<ExtensionContactRecord>> {
         self.sm.contacts_for_affinity(affinity_key).await
+    }
+
+    /// Current extension Contact ownership conflicts across all affinity keys.
+    pub async fn extension_contact_conflicts(&self) -> Vec<ExtensionContactConflict> {
+        self.sm.extension_contact_conflicts().await
     }
 
     /// Healthy workers with spare capacity, most-available first.
@@ -1237,6 +1242,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![high_priority.as_str()]
         );
+
+        let conflicts = reg.extension_contact_conflicts().await;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].affinity_key, key);
+        assert_eq!(conflicts[0].selected_worker_id, "worker-b");
+        assert_eq!(conflicts[0].selected_contact, high_priority);
+        assert_eq!(conflicts[0].candidates.len(), 2);
     }
 
     #[tokio::test]

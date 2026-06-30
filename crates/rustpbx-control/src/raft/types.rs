@@ -191,6 +191,25 @@ fn default_contact_q_milli() -> u16 {
     1000
 }
 
+/// One candidate owner for a deduplicated extension Contact.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionContactConflictCandidate {
+    pub worker_id: String,
+    pub contact: String,
+    pub q_milli: u16,
+    pub expires_at_ms: i64,
+}
+
+/// Current conflict where the same Contact URI is reported by multiple Workers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionContactConflict {
+    pub affinity_key: String,
+    pub contact_key: String,
+    pub selected_worker_id: String,
+    pub selected_contact: String,
+    pub candidates: Vec<ExtensionContactConflictCandidate>,
+}
+
 /// Commands applied to the replicated worker registry (the Raft `AppData`).
 ///
 /// Every mutation of the registry goes through `Raft::client_write` with one of

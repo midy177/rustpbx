@@ -399,6 +399,10 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/dids/{id}", post(update_did).delete(delete_did))
         .route("/audit", get(list_audit))
         .route("/workers", get(list_workers))
+        .route(
+            "/workers/contact-conflicts",
+            get(list_worker_contact_conflicts),
+        )
         .route("/workers/{id}/drain", post(drain_worker))
         .route("/workers/{id}", axum::routing::delete(remove_worker))
         .route("/edges", get(list_edges_admin))
@@ -2095,6 +2099,14 @@ async fn list_workers(
         })
         .collect();
     Ok(Json(views))
+}
+
+async fn list_worker_contact_conflicts(
+    State(state): State<HttpState>,
+    Extension(user): Extension<UserInfo>,
+) -> ApiResult<Json<Vec<crate::raft::types::ExtensionContactConflict>>> {
+    require_superadmin(&user)?;
+    Ok(Json(state.workers.extension_contact_conflicts().await))
 }
 
 /// Gracefully drain a worker: it stops being selected for new calls (excluded

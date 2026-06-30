@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::types::{
-    CallSlotRecord, CallStartRecord, EdgeRecord, ExtensionContactRecord, NodeId, RegistryCommand,
+    CallSlotRecord, CallStartRecord, EdgeRecord, ExtensionContactConflict,
+    ExtensionContactConflictCandidate, ExtensionContactRecord, NodeId, RegistryCommand,
     RegistryResponse, TypeConfig, WorkerRecord,
 };
 
@@ -205,6 +206,59 @@ impl StateMachineStore {
                 .sort_by_key(|record| (std::cmp::Reverse(record.q_milli), record.contact.clone()));
         }
         out
+    }
+
+    /// Current Contact ownership conflicts across all extension affinity keys.
+    pub async fn extension_contact_conflicts(&self) -> Vec<ExtensionContactConflict> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let data = self.data.lock().await;
+        let mut conflicts = Vec::new();
+
+        for (affinity_key, worker_contacts) in &data.worker_affinity_contacts {
+            let mut by_contact: BTreeMap<String, Vec<ExtensionContactConflictCandidate>> =
+                BTreeMap::new();
+            for (worker_id, contacts) in worker_contacts {
+                for record in contacts
+                    .values()
+                    .filter(|record| record.expires_at_ms == 0 || record.expires_at_ms > now_ms)
+                {
+                    by_contact
+                        .entry(contact_dedup_key(&record.contact))
+                        .or_default()
+                        .push(ExtensionContactConflictCandidate {
+                            worker_id: worker_id.clone(),
+                            contact: record.contact.clone(),
+                            q_milli: record.q_milli,
+                            expires_at_ms: record.expires_at_ms,
+                        });
+                }
+            }
+
+            for (contact_key, mut candidates) in by_contact {
+                if candidates.len() < 2 {
+                    continue;
+                }
+                candidates.sort_by_key(|candidate| {
+                    (
+                        std::cmp::Reverse(candidate.q_milli),
+                        std::cmp::Reverse(candidate.expires_at_ms),
+                        candidate.worker_id.clone(),
+                    )
+                });
+                let selected = &candidates[0];
+                conflicts.push(ExtensionContactConflict {
+                    affinity_key: affinity_key.clone(),
+                    contact_key,
+                    selected_worker_id: selected.worker_id.clone(),
+                    selected_contact: selected.contact.clone(),
+                    candidates,
+                });
+            }
+        }
+
+        conflicts
+            .sort_by_key(|conflict| (conflict.affinity_key.clone(), conflict.contact_key.clone()));
+        conflicts
     }
 }
 
