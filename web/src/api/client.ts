@@ -39,6 +39,58 @@ export interface SipTrunkSummary {
   register_enabled: boolean;
 }
 
+export interface RouteSummary {
+  id: number;
+  tenant_id?: number | null;
+  name: string;
+  description?: string | null;
+  direction: string;
+  priority: number;
+  is_active: boolean;
+  selection_strategy: string;
+  source_trunk_id?: number | null;
+  default_trunk_id?: number | null;
+  source_pattern?: string | null;
+  destination_pattern?: string | null;
+  owner?: string | null;
+}
+
+export interface CallRecordSummary {
+  id: number;
+  tenant_id?: number | null;
+  call_id: string;
+  display_id?: string | null;
+  direction: string;
+  status: string;
+  started_at: string;
+  ended_at?: string | null;
+  duration_secs: number;
+  from_number?: string | null;
+  to_number?: string | null;
+  caller_name?: string | null;
+  agent_name?: string | null;
+  queue?: string | null;
+  extension_id?: number | null;
+  sip_trunk_id?: number | null;
+  route_id?: number | null;
+  has_transcript: boolean;
+  transcript_status: string;
+  recording_duration_secs?: number | null;
+}
+
+export interface UserSummary {
+  id: number;
+  tenant_id?: number | null;
+  email: string;
+  username: string;
+  last_login_at?: string | null;
+  is_active: boolean;
+  is_staff: boolean;
+  is_superuser: boolean;
+  mfa_enabled: boolean;
+  auth_source: string;
+}
+
 export interface LoginRequest {
   username: string;
   password: string;
@@ -83,5 +135,14 @@ export const api = {
   },
   sipTrunks() {
     return request<SipTrunkSummary[]>("/cloudpbx/sip-trunks");
+  },
+  routes() {
+    return request<RouteSummary[]>("/cloudpbx/routes");
+  },
+  callRecords() {
+    return request<CallRecordSummary[]>("/cloudpbx/call-records");
+  },
+  users() {
+    return request<UserSummary[]>("/cloudpbx/users");
   },
 };

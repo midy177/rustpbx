@@ -150,6 +150,66 @@ struct SipTrunkSummary {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Serialize)]
+struct RouteSummary {
+    id: i64,
+    tenant_id: Option<i64>,
+    name: String,
+    description: Option<String>,
+    direction: crate::models::routing::RoutingDirection,
+    priority: i32,
+    is_active: bool,
+    selection_strategy: crate::models::routing::RoutingSelectionStrategy,
+    source_trunk_id: Option<i64>,
+    default_trunk_id: Option<i64>,
+    source_pattern: Option<String>,
+    destination_pattern: Option<String>,
+    owner: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_deployed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CallRecordSummary {
+    id: i64,
+    tenant_id: Option<i64>,
+    call_id: String,
+    display_id: Option<String>,
+    direction: String,
+    status: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    duration_secs: i32,
+    from_number: Option<String>,
+    to_number: Option<String>,
+    caller_name: Option<String>,
+    agent_name: Option<String>,
+    queue: Option<String>,
+    extension_id: Option<i64>,
+    sip_trunk_id: Option<i64>,
+    route_id: Option<i64>,
+    has_transcript: bool,
+    transcript_status: String,
+    recording_duration_secs: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct UserSummary {
+    id: i64,
+    tenant_id: Option<i64>,
+    email: String,
+    username: String,
+    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    is_active: bool,
+    is_staff: bool,
+    is_superuser: bool,
+    mfa_enabled: bool,
+    auth_source: String,
+}
+
 impl From<crate::models::sip_trunk::Model> for SipTrunkSummary {
     fn from(value: crate::models::sip_trunk::Model) -> Self {
         Self {
@@ -166,6 +226,75 @@ impl From<crate::models::sip_trunk::Model> for SipTrunkSummary {
             register_enabled: value.register_enabled,
             created_at: value.created_at,
             updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<crate::models::routing::Model> for RouteSummary {
+    fn from(value: crate::models::routing::Model) -> Self {
+        Self {
+            id: value.id,
+            tenant_id: value.tenant_id,
+            name: value.name,
+            description: value.description,
+            direction: value.direction,
+            priority: value.priority,
+            is_active: value.is_active,
+            selection_strategy: value.selection_strategy,
+            source_trunk_id: value.source_trunk_id,
+            default_trunk_id: value.default_trunk_id,
+            source_pattern: value.source_pattern,
+            destination_pattern: value.destination_pattern,
+            owner: value.owner,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            last_deployed_at: value.last_deployed_at,
+        }
+    }
+}
+
+impl From<crate::models::call_record::Model> for CallRecordSummary {
+    fn from(value: crate::models::call_record::Model) -> Self {
+        Self {
+            id: value.id,
+            tenant_id: value.tenant_id,
+            call_id: value.call_id,
+            display_id: value.display_id,
+            direction: value.direction,
+            status: value.status,
+            started_at: value.started_at,
+            ended_at: value.ended_at,
+            duration_secs: value.duration_secs,
+            from_number: value.from_number,
+            to_number: value.to_number,
+            caller_name: value.caller_name,
+            agent_name: value.agent_name,
+            queue: value.queue,
+            extension_id: value.extension_id,
+            sip_trunk_id: value.sip_trunk_id,
+            route_id: value.route_id,
+            has_transcript: value.has_transcript,
+            transcript_status: value.transcript_status,
+            recording_duration_secs: value.recording_duration_secs,
+        }
+    }
+}
+
+impl From<crate::models::user::Model> for UserSummary {
+    fn from(value: crate::models::user::Model) -> Self {
+        Self {
+            id: value.id,
+            tenant_id: value.tenant_id,
+            email: value.email,
+            username: value.username,
+            last_login_at: value.last_login_at,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            is_active: value.is_active,
+            is_staff: value.is_staff,
+            is_superuser: value.is_superuser,
+            mfa_enabled: value.mfa_enabled,
+            auth_source: value.auth_source,
         }
     }
 }
@@ -201,6 +330,9 @@ pub fn router(state: crate::app::AppState) -> Router {
         .route("/api/tenants", get(list_tenants))
         .route("/api/cloudpbx/extensions", get(list_extensions))
         .route("/api/cloudpbx/sip-trunks", get(list_sip_trunks))
+        .route("/api/cloudpbx/routes", get(list_routes))
+        .route("/api/cloudpbx/call-records", get(list_call_records))
+        .route("/api/cloudpbx/users", get(list_users))
         .with_state(state)
 }
 
@@ -306,6 +438,85 @@ async fn list_sip_trunks(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
+        Err(_) => tenant_query_failed(),
+    }
+}
+
+async fn list_routes(State(state): State<crate::app::AppState>, ctx: TenantContext) -> Response {
+    use crate::models::routing::{Column, Entity};
+
+    let mut query = Entity::find()
+        .order_by_asc(Column::Priority)
+        .order_by_asc(Column::Name)
+        .limit(500);
+    match resolve_tenant_scope(state.db(), &ctx).await {
+        Ok(TenantDbScope::All) => {}
+        Ok(TenantDbScope::Tenant(tenant_id)) => {
+            query = query.filter(Column::TenantId.eq(tenant_id));
+        }
+        Ok(TenantDbScope::Missing) => return Json(Vec::<RouteSummary>::new()).into_response(),
+        Err(_) => return tenant_query_failed(),
+    }
+
+    match query.all(state.db()).await {
+        Ok(items) => Json(
+            items
+                .into_iter()
+                .map(RouteSummary::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => tenant_query_failed(),
+    }
+}
+
+async fn list_call_records(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+) -> Response {
+    use crate::models::call_record::{Column, Entity};
+
+    let mut query = Entity::find().order_by_desc(Column::StartedAt).limit(500);
+    match resolve_tenant_scope(state.db(), &ctx).await {
+        Ok(TenantDbScope::All) => {}
+        Ok(TenantDbScope::Tenant(tenant_id)) => {
+            query = query.filter(Column::TenantId.eq(tenant_id));
+        }
+        Ok(TenantDbScope::Missing) => {
+            return Json(Vec::<CallRecordSummary>::new()).into_response();
+        }
+        Err(_) => return tenant_query_failed(),
+    }
+
+    match query.all(state.db()).await {
+        Ok(items) => Json(
+            items
+                .into_iter()
+                .map(CallRecordSummary::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => tenant_query_failed(),
+    }
+}
+
+async fn list_users(State(state): State<crate::app::AppState>, ctx: TenantContext) -> Response {
+    use crate::models::user::{Column, Entity};
+
+    let mut query = Entity::find().order_by_asc(Column::Username).limit(500);
+    match resolve_tenant_scope(state.db(), &ctx).await {
+        Ok(TenantDbScope::All) => {}
+        Ok(TenantDbScope::Tenant(tenant_id)) => {
+            query = query.filter(Column::TenantId.eq(tenant_id));
+        }
+        Ok(TenantDbScope::Missing) => return Json(Vec::<UserSummary>::new()).into_response(),
+        Err(_) => return tenant_query_failed(),
+    }
+
+    match query.all(state.db()).await {
+        Ok(items) => {
+            Json(items.into_iter().map(UserSummary::from).collect::<Vec<_>>()).into_response()
+        }
         Err(_) => tenant_query_failed(),
     }
 }

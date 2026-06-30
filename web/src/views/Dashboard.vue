@@ -11,14 +11,17 @@ const auth = useAuthStore();
 const tenants = ref<TenantSummary[]>([]);
 const extensionCount = ref(0);
 const sipTrunkCount = ref(0);
+const routeCount = ref(0);
+const callRecordCount = ref(0);
+const userCount = ref(0);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 
 const resources = computed(() => [
   { label: "Extensions", value: String(extensionCount.value), icon: Phone },
   { label: "SIP trunks", value: String(sipTrunkCount.value), icon: Cable },
-  { label: "Routes", value: "0", icon: GitBranch },
-  { label: "DID numbers", value: "0", icon: RadioTower },
-  { label: "Users", value: "0", icon: Users },
+  { label: "Routes", value: String(routeCount.value), icon: GitBranch },
+  { label: "Call records", value: String(callRecordCount.value), icon: RadioTower },
+  { label: "Users", value: String(userCount.value), icon: Users },
 ]);
 
 onMounted(async () => {
@@ -28,12 +31,24 @@ onMounted(async () => {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
   }
   try {
-    const [extensions, trunks] = await Promise.all([api.extensions(), api.sipTrunks()]);
+    const [extensions, trunks, routes, callRecords, users] = await Promise.all([
+      api.extensions(),
+      api.sipTrunks(),
+      api.routes(),
+      api.callRecords(),
+      api.users(),
+    ]);
     extensionCount.value = extensions.length;
     sipTrunkCount.value = trunks.length;
+    routeCount.value = routes.length;
+    callRecordCount.value = callRecords.length;
+    userCount.value = users.length;
   } catch {
     extensionCount.value = 0;
     sipTrunkCount.value = 0;
+    routeCount.value = 0;
+    callRecordCount.value = 0;
+    userCount.value = 0;
   }
 });
 </script>
@@ -98,11 +113,11 @@ onMounted(async () => {
             </div>
             <div class="flex items-center justify-between">
               <span>Tenant context API</span>
-              <Badge variant="outline">pending</Badge>
+              <Badge>ready</Badge>
             </div>
             <div class="flex items-center justify-between">
-              <span>Tenant-aware data model</span>
-              <Badge variant="outline">pending</Badge>
+              <span>Tenant-aware read APIs</span>
+              <Badge>ready</Badge>
             </div>
           </CardContent>
         </Card>
