@@ -266,7 +266,7 @@ async fn main() -> Result<()> {
         tracing::info!(%ew_addr, "edge-worker gRPC (CallStateUpdate) listening");
         tokio::spawn(async move {
             let svc = rustpbx_proto::edge::edge_worker_server::EdgeWorkerServer::new(
-                edge_worker_server::EdgeWorkerServer,
+                edge_worker_server::EdgeWorkerServer::new(Default::default()),
             );
             let res = tonic::transport::Server::builder()
                 .add_service(svc)

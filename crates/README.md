@@ -269,7 +269,8 @@ rust-lldb target/debug/rustpbx-worker -- rustpbx-worker.toml
 
 已完成：Control → Edge/Worker 的配置事件推送、配置版本递增、Worker 配置事件热加载，
 Worker 无 Edge 时的本地路由 fallback、tenant/trunk 级并发与 CPS 配额，以及
-Worker → Edge 的 CDR 时间线状态上报。
+Worker → Edge 的 CDR 时间线状态上报；Edge 会保留每个 call 的最新 Worker 状态，乱序旧事件
+不会覆盖新状态，并限制内存表大小。
 
 后续按以下顺序推进：
 
