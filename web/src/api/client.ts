@@ -132,6 +132,15 @@ export interface UserSummary {
   auth_source: string;
 }
 
+export interface CreateUserRequest {
+  username: string;
+  email: string;
+  password: string;
+  is_active?: boolean;
+  is_staff?: boolean;
+  is_superuser?: boolean;
+}
+
 export interface LoginRequest {
   username: string;
   password: string;
@@ -203,5 +212,11 @@ export const api = {
   },
   users() {
     return request<UserSummary[]>("/cloudpbx/users");
+  },
+  createUser(payload: CreateUserRequest) {
+    return request<UserSummary>("/cloudpbx/users", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
   },
 };

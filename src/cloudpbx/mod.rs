@@ -1,3 +1,6 @@
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng;
+use argon2::{Argon2, PasswordHasher};
 use axum::{
     Json, Router,
     extract::{FromRequestParts, State},
@@ -362,6 +365,16 @@ struct CreateRouteRequest {
     owner: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    email: String,
+    password: String,
+    is_active: Option<bool>,
+    is_staff: Option<bool>,
+    is_superuser: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -383,7 +396,7 @@ pub fn router(state: crate::app::AppState) -> Router {
         )
         .route("/api/cloudpbx/routes", get(list_routes).post(create_route))
         .route("/api/cloudpbx/call-records", get(list_call_records))
-        .route("/api/cloudpbx/users", get(list_users))
+        .route("/api/cloudpbx/users", get(list_users).post(create_user))
         .with_state(state)
 }
 
@@ -853,6 +866,127 @@ async fn list_users(State(state): State<crate::app::AppState>, ctx: TenantContex
     }
 }
 
+async fn create_user(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<CreateUserRequest>,
+) -> Response {
+    match create_user_for_tenant(state.db(), &ctx, payload).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn create_user_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    payload: CreateUserRequest,
+) -> Result<UserSummary, Response> {
+    use crate::models::user::{ActiveModel, Column, Entity};
+
+    let username = payload.username.trim();
+    let email = payload.email.trim().to_lowercase();
+    if username.is_empty() {
+        return Err(bad_request("invalid_username", "Username is required."));
+    }
+    if username.len() > 100 {
+        return Err(bad_request(
+            "invalid_username",
+            "Username must be 100 characters or fewer.",
+        ));
+    }
+    if email.is_empty() || !email.contains('@') {
+        return Err(bad_request("invalid_email", "Valid email is required."));
+    }
+    if email.len() > 255 {
+        return Err(bad_request(
+            "invalid_email",
+            "Email must be 255 characters or fewer.",
+        ));
+    }
+    if payload.password.is_empty() {
+        return Err(bad_request("invalid_password", "Password is required."));
+    }
+
+    let tenant_id = match resolve_write_tenant_id(db, ctx).await {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return Err(response),
+    };
+
+    let mut duplicate = Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::Username.eq(username))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?;
+    if duplicate.is_none() {
+        duplicate = Entity::find()
+            .filter(Column::TenantId.eq(tenant_id))
+            .filter(Column::Email.eq(email.clone()))
+            .one(db)
+            .await
+            .map_err(|_| tenant_query_failed())?;
+    }
+    if duplicate.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "user_exists",
+                message: "User already exists in this tenant.",
+            }),
+        )
+            .into_response());
+    }
+
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(payload.password.as_bytes(), &salt)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "password_hash_failed",
+                    message: "Failed to hash password.",
+                }),
+            )
+                .into_response()
+        })?
+        .to_string();
+
+    let now = chrono::Utc::now();
+    let model = ActiveModel {
+        tenant_id: Set(Some(tenant_id)),
+        email: Set(email),
+        username: Set(username.to_string()),
+        password_hash: Set(password_hash),
+        reset_token: Set(None),
+        reset_token_expires: Set(None),
+        last_login_at: Set(None),
+        last_login_ip: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        is_staff: Set(payload.is_staff.unwrap_or(false)),
+        is_superuser: Set(payload.is_superuser.unwrap_or(false)),
+        mfa_enabled: Set(false),
+        mfa_secret: Set(None),
+        auth_source: Set("local".to_string()),
+        ..Default::default()
+    };
+
+    match model.insert(db).await {
+        Ok(model) => Ok(UserSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "user_create_failed",
+                message: "Failed to create user.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
 enum TenantDbScope {
     All,
     Tenant(i64),
@@ -1137,5 +1271,52 @@ mod tests {
 
         assert_eq!(summary.tenant_id, Some(tenant.id));
         assert_eq!(route.tenant_id, Some(tenant.id));
+    }
+
+    #[tokio::test]
+    async fn create_user_sets_current_tenant_id_and_hashes_password() {
+        use crate::models::{
+            tenant::{Column as TenantColumn, Entity as TenantEntity},
+            user::{Column as UserColumn, Entity as UserEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "alice".to_string(),
+                email: "alice@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: Some(true),
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let tenant = TenantEntity::find()
+            .filter(TenantColumn::Slug.eq(DEFAULT_TENANT_ID))
+            .one(&db)
+            .await
+            .expect("query tenant")
+            .expect("default tenant");
+        let user = UserEntity::find()
+            .filter(UserColumn::Username.eq("alice"))
+            .one(&db)
+            .await
+            .expect("query user")
+            .expect("user");
+
+        assert_eq!(summary.tenant_id, Some(tenant.id));
+        assert_eq!(user.tenant_id, Some(tenant.id));
+        assert_ne!(user.password_hash, "secret-password");
+        assert!(user.password_hash.starts_with("$argon2"));
     }
 }
