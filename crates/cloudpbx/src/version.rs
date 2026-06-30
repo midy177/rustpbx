@@ -1,0 +1,157 @@
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
+use tracing::debug;
+
+#[allow(unused_imports)]
+use tracing::info;
+
+const VERSION_INFO: &str = concat!(
+    "rustpbx ",
+    env!("CARGO_PKG_VERSION"),
+    "\nBuild Time: ",
+    env!("BUILD_TIME_FMT"),
+    "\nGit Commit: ",
+    env!("GIT_COMMIT_HASH"),
+    "\nGit Branch: ",
+    env!("GIT_BRANCH"),
+    "\nGit Status: ",
+    env!("GIT_DIRTY")
+);
+
+const SHORT_VERSION: &str = env!("SHORT_VERSION");
+
+pub fn get_version_info() -> &'static str {
+    VERSION_INFO
+}
+
+pub fn get_short_version() -> &'static str {
+    SHORT_VERSION
+}
+
+pub fn get_useragent() -> String {
+    format!(
+        "rustpbx/{} (built {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_DATE")
+    )
+}
+
+// ─── Update check ────────────────────────────────────────────────────────────
+
+/// Response from the miuda.ai update-check endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub has_update: bool,
+    pub latest_version: String,
+    pub release_notes: Option<String>,
+    pub download_url: Option<String>,
+}
+
+/// Query `https://miuda.ai/api/check_update` with current version + edition.
+/// Returns `UpdateInfo` on success.
+pub async fn check_update(start_time: Instant) -> anyhow::Result<UpdateInfo> {
+    let version = env!("CARGO_PKG_VERSION");
+    let edition = if cfg!(feature = "commerce") {
+        "commerce"
+    } else {
+        "community"
+    };
+    let uptime_secs = start_time.elapsed().as_secs();
+    let build_time = env!("BUILD_TIME_FMT");
+
+    let opts = crate::http_util::HttpFetchOptions::new()
+        .with_timeout(std::time::Duration::from_secs(5))
+        .with_header("User-Agent", &get_useragent());
+
+    let req = reqwest::Client::new()
+        .get("https://miuda.ai/api/check_update")
+        .query(&[
+            ("version", version),
+            ("edition", edition),
+            ("uptime", &uptime_secs.to_string()),
+            ("build_time", build_time),
+        ]);
+    let resp = match crate::http_util::execute_request(req, &opts.headers, opts.timeout).await {
+        Ok(r) => r,
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("timed out") || s.contains("connect") {
+                anyhow::bail!("version check unreachable (network/timeout): {}", s);
+            }
+            anyhow::bail!("version check request error: {}", s);
+        }
+    };
+    let status = resp.status();
+    let body = resp.text().await?;
+    debug!("version check response: status={} body={}", status, body);
+    let info: UpdateInfo = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!("version check parse error: {e}, status={status}, body={body}")
+    })?;
+    Ok(info)
+}
+
+/// Spawn a background task that periodically checks for updates (at startup and
+/// every 24 hours).  When a new version is found a `system_notification` row is
+/// inserted into the database (deduped by title so the same version only appears
+/// once).
+pub fn spawn_update_checker(
+    db: sea_orm::DatabaseConnection,
+    token: tokio_util::sync::CancellationToken,
+) {
+    // Skip update check in debug/development mode
+    #[cfg(debug_assertions)]
+    {
+        debug!("Skipping update check in debug mode");
+        let _ = db;
+        let _ = token;
+    }
+
+    #[cfg(not(debug_assertions))]
+    crate::utils::spawn(async move {
+        let start_time = Instant::now();
+        loop {
+            match check_update(start_time).await {
+                Ok(info) if info.has_update => {
+                    use crate::models::system_notification::{ActiveModel, Column, Entity};
+                    use sea_orm::{
+                        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
+                    };
+
+                    let title = format!("New version available: {}", info.latest_version);
+                    let exists = Entity::find()
+                        .filter(Column::Title.eq(&title))
+                        .one(&db)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+
+                    if !exists {
+                        let body = info.release_notes.clone().unwrap_or_default();
+                        let am = ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            kind: Set("update".to_string()),
+                            title: Set(title.clone()),
+                            body: Set(body),
+                            read: Set(false),
+                            created_at: Set(chrono::Utc::now()),
+                        };
+                        match am.insert(&db).await {
+                            Ok(_) => {
+                                info!(latest = %info.latest_version, "update notification created")
+                            }
+                            Err(e) => debug!("failed to insert update notification: {e}"),
+                        }
+                    }
+                }
+                Ok(_) => debug!("version check: already up-to-date"),
+                Err(e) => debug!("version check failed: {e}"),
+            }
+
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)) => {}
+            }
+        }
+    });
+}

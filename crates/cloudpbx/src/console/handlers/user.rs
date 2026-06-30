@@ -1,0 +1,681 @@
+use crate::{
+    console::{
+        ConsoleState,
+        auth::RegistrationPolicy,
+        handlers::forms::{ForgotForm, LoginForm, LoginQuery, RegisterForm, ResetForm},
+    },
+    handler::middleware::clientaddr::ClientAddr,
+};
+use axum::{
+    Router,
+    extract::{Form, Path as AxumPath, Query, State},
+    http::{HeaderMap, StatusCode, header::SET_COOKIE},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+};
+use sea_orm::EntityTrait;
+use serde_json::json;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+async fn load_mfa_user_or_redirect(
+    state: &Arc<ConsoleState>,
+    user_id: i64,
+) -> Result<crate::models::user::Model, Response> {
+    match crate::models::user::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+    {
+        Ok(Some(user)) => Ok(user),
+        _ => Err(Redirect::to(&state.url_for("/login")).into_response()),
+    }
+}
+
+fn is_secure_request(headers: &HeaderMap) -> bool {
+    if let Some(proto) = headers.get("x-forwarded-proto")
+        && let Ok(proto_str) = proto.to_str()
+    {
+        return proto_str.eq_ignore_ascii_case("https");
+    }
+    false
+}
+
+pub fn urls() -> Router<Arc<ConsoleState>> {
+    Router::new()
+        .route("/login", get(login_page).post(login_post))
+        .route("/login/mfa", get(login_mfa_page).post(login_mfa_post))
+        .route("/logout", get(logout))
+        .route("/register", get(register_page).post(register_post))
+        .route("/forgot", get(forgot_page).post(forgot_post))
+        .route("/reset/{token}", get(reset_page).post(reset_post))
+}
+
+const SUPERUSER_NOTICE: &str =
+    "You are creating the first administrator account. Please store this password securely.";
+
+pub async fn login_page(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let policy = match state.registration_policy().await {
+        Ok(policy) => policy,
+        Err(err) => {
+            warn!("failed to load registration policy: {}", err);
+            RegistrationPolicy::default()
+        }
+    };
+
+    let login_action = state.login_url(query.next.clone());
+    let register_url = if policy.allowed {
+        Some(state.register_url(query.next.clone()))
+    } else {
+        None
+    };
+
+    let demo_mode = state.config().demo_mode;
+
+    state.render_with_headers(
+        "console/login.html",
+        json!({
+            "login_action": login_action,
+            "register_url": register_url,
+            "registration_allowed": policy.allowed,
+            "demo_mode": demo_mode,
+            "error_message": null,
+            "identifier": "",
+            "next": query.next.clone(),
+        }),
+        &headers,
+    )
+}
+
+pub async fn login_post(
+    client_addr: ClientAddr,
+    headers: HeaderMap,
+    State(state): State<Arc<ConsoleState>>,
+    Query(query): Query<LoginQuery>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let identifier = form.identifier.trim();
+    let password = form.password.trim();
+    let next = match form
+        .next
+        .clone()
+        .and_then(|n| if n.trim().is_empty() { None } else { Some(n) })
+        .or(query.next.clone())
+    {
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    };
+    let policy = match state.registration_policy().await {
+        Ok(policy) => policy,
+        Err(err) => {
+            warn!("failed to load registration policy: {}", err);
+            RegistrationPolicy::default()
+        }
+    };
+    let register_url = if policy.allowed {
+        Some(state.register_url(next.clone()))
+    } else {
+        None
+    };
+    let demo_mode = state.config().demo_mode;
+    if identifier.is_empty() || password.is_empty() {
+        return state.render_with_headers(
+            "console/login.html",
+            json!({
+                "login_action": state.login_url(next.clone()),
+                "register_url": register_url.clone(),
+                "registration_allowed": policy.allowed,
+                "demo_mode": demo_mode,
+                "error_message": "Please provide both username/email and password",
+                "identifier": identifier,
+                "next": next.clone(),
+            }),
+            &headers,
+        );
+    }
+
+    match state.authenticate(identifier, password).await {
+        Ok(Some(user)) => {
+            // Check if MFA is required for this user
+            if user.mfa_enabled {
+                // Create MFA session and redirect to verification
+                let redirect_target = state.url_for("/login/mfa");
+                let mut response = Redirect::to(&redirect_target).into_response();
+                if let Some(header) =
+                    state.mfa_session_cookie_header(user.id, is_secure_request(&headers))
+                {
+                    response.headers_mut().append(SET_COOKIE, header);
+                }
+                return response;
+            }
+
+            // No MFA required, complete login
+            if let Err(err) = state.mark_login(&user, client_addr.ip().to_string()).await {
+                warn!("failed to update last_login: {}", err);
+            }
+            let redirect_target = resolve_next_redirect(state.as_ref(), next.clone());
+            let mut response = Redirect::to(&redirect_target).into_response();
+            if let Some(header) = state.session_cookie_header(user.id, is_secure_request(&headers))
+            {
+                response.headers_mut().append(SET_COOKIE, header);
+            }
+            response
+        }
+        Ok(None) => state.render_with_headers(
+            "console/login.html",
+            json!({
+                "login_action": state.login_url(next.clone()),
+                "register_url": register_url,
+                "registration_allowed": policy.allowed,
+                "demo_mode": demo_mode,
+                "error_message": "Invalid credentials",
+                "identifier": identifier,
+                "next": next,
+            }),
+            &headers,
+        ),
+        Err(err) => {
+            warn!("login error: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Sign-in failed: {}", err),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn resolve_next_redirect(state: &ConsoleState, next: Option<String>) -> String {
+    if let Some(raw) = next {
+        let candidate = raw.trim();
+        if candidate.starts_with('/') && !candidate.starts_with("//") && !candidate.contains("://")
+        {
+            if candidate == "/" {
+                return state.url_for("/");
+            }
+            if state.base_path() != "/" && candidate.starts_with(state.base_path()) {
+                return candidate.to_string();
+            }
+            return state.url_for(candidate);
+        }
+    }
+
+    state.url_for("/")
+}
+
+pub async fn logout(
+    headers: HeaderMap,
+    State(state): State<Arc<ConsoleState>>,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let next = query.next.unwrap_or_else(|| state.url_for("/"));
+    let mut response = Redirect::to(&next).into_response();
+    if let Some(header) = state.clear_session_cookie(is_secure_request(&headers)) {
+        response.headers_mut().append(SET_COOKIE, header);
+    }
+    response
+}
+
+pub async fn register_page(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
+    let policy = match state.registration_policy().await {
+        Ok(policy) => policy,
+        Err(err) => {
+            warn!("failed to load registration policy: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unable to load registration page: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let superuser_notice = if policy.first_user {
+        Some(SUPERUSER_NOTICE.to_string())
+    } else {
+        None
+    };
+
+    let mut response = state.render_with_headers(
+        "console/register.html",
+        json!({
+            "register_action": state.url_for("/register"),
+            "login_url": state.url_for("/login"),
+            "error_message": null,
+            "email": "",
+            "username": "",
+            "registration_closed": !policy.allowed,
+            "superuser_notice": superuser_notice,
+        }),
+        &headers,
+    );
+
+    if !policy.allowed {
+        *response.status_mut() = StatusCode::FORBIDDEN;
+    }
+
+    response
+}
+
+pub async fn register_post(
+    headers: HeaderMap,
+    State(state): State<Arc<ConsoleState>>,
+    Form(form): Form<RegisterForm>,
+) -> Response {
+    let policy = match state.registration_policy().await {
+        Ok(policy) => policy,
+        Err(err) => {
+            warn!("failed to load registration policy: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Registration failed: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    if !policy.allowed {
+        let mut response = state.render_with_headers(
+            "console/register.html",
+            json!({
+                "register_action": state.url_for("/register"),
+                "login_url": state.url_for("/login"),
+                "error_message": "User self-registration is disabled",
+                "email": form.email.trim().to_lowercase(),
+                "username": form.username.trim().to_string(),
+                "registration_closed": true,
+                "superuser_notice": None::<String>,
+            }),
+            &headers,
+        );
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+
+    let email = form.email.trim().to_lowercase();
+    let username = form.username.trim().to_string();
+    let password = form.password.trim().to_string();
+    let confirm = form.confirm_password.trim().to_string();
+    let mut error_message = None;
+
+    if !email.contains('@') {
+        error_message = Some("Please enter a valid email address".to_string());
+    } else if username.len() < 3 {
+        error_message = Some("Username must be at least 3 characters".to_string());
+    } else if password.len() < 8 {
+        error_message = Some("Password must be at least 8 characters".to_string());
+    } else if password != confirm {
+        error_message = Some("Passwords do not match".to_string());
+    }
+
+    if error_message.is_none() {
+        match state.email_exists(&email).await {
+            Ok(true) => error_message = Some("Email is already registered".to_string()),
+            Ok(false) => {}
+            Err(err) => {
+                warn!("failed to check email uniqueness: {}", err);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Registration failed: {}", err),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if error_message.is_none() {
+        match state.username_exists(&username).await {
+            Ok(true) => error_message = Some("Username is already taken".to_string()),
+            Ok(false) => {}
+            Err(err) => {
+                warn!("failed to check username uniqueness: {}", err);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Registration failed: {}", err),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(error) = error_message {
+        return state.render_with_headers(
+            "console/register.html",
+            json!({
+                "register_action": state.url_for("/register"),
+                "login_url": state.url_for("/login"),
+                "error_message": error,
+                "email": email,
+                "username": username,
+                "registration_closed": false,
+                "superuser_notice": if policy.first_user {
+                    Some(SUPERUSER_NOTICE.to_string())
+                } else {
+                    None
+                },
+            }),
+            &headers,
+        );
+    }
+
+    match state.create_user(&email, &username, &password).await {
+        Ok(user) => {
+            if policy.first_user {
+                info!("created initial superuser account: {}", user.username);
+            }
+            let mut response = Redirect::to(&state.url_for("/")).into_response();
+            if let Some(header) = state.session_cookie_header(user.id, is_secure_request(&headers))
+            {
+                response.headers_mut().append(SET_COOKIE, header);
+            }
+            response
+        }
+        Err(err) => {
+            warn!("failed to create user: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Registration failed: {}", err),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn forgot_page(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
+    state.render_with_headers(
+        "console/forgot.html",
+        json!({
+            "info_message": null,
+            "error_message": null,
+            "reset_link": null,
+        }),
+        &headers,
+    )
+}
+
+pub async fn forgot_post(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    Form(form): Form<ForgotForm>,
+) -> Response {
+    let email = form.email.trim().to_lowercase();
+
+    if email.is_empty() {
+        return state.render_with_headers(
+            "console/forgot.html",
+            json!({
+                "info_message": null,
+                "error_message": "Please enter your registered email address",
+                "reset_link": null,
+            }),
+            &headers,
+        );
+    }
+
+    let mut reset_link = None;
+    match state.find_user_by_email(&email).await {
+        Ok(Some(user)) => match state.upsert_reset_token(&user).await {
+            Ok((token, _)) => {
+                let link = state.url_for(&format!("/reset/{}", token));
+                info!("password reset link generated for {}: {}", email, link);
+                reset_link = Some(link);
+            }
+            Err(err) => {
+                warn!("failed to save reset token: {}", err);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Unable to process request: {}", err),
+                )
+                    .into_response();
+            }
+        },
+        Ok(None) => {}
+        Err(err) => {
+            warn!("failed to handle forgot password: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unable to process request: {}", err),
+            )
+                .into_response();
+        }
+    }
+
+    state.render_with_headers(
+        "console/forgot.html",
+        json!({
+            "forgot_action": state.url_for("/forgot"),
+            "info_message": "If the account exists, we've sent a reset link",
+            "error_message": null,
+            "reset_link": reset_link,
+        }),
+        &headers,
+    )
+}
+
+pub async fn reset_page(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
+    match state.find_by_reset_token(&token).await {
+        Ok(Some(user)) => {
+            if user.token_expired() {
+                state.render_with_headers(
+                    "console/forgot.html",
+                    json!({
+                        "forgot_action": state.url_for("/forgot"),
+                        "info_message": null,
+                        "error_message": "Reset link has expired. Please request a new one.",
+                        "reset_link": null,
+                    }),
+                    &headers,
+                )
+            } else {
+                state.render_with_headers(
+                    "console/reset.html",
+                    json!({
+                        "reset_action": state.url_for(&format!("/reset/{}", token)),
+                        "token": token,
+                        "error_message": null,
+                    }),
+                    &headers,
+                )
+            }
+        }
+        Ok(None) => state.render_with_headers(
+            "console/forgot.html",
+            json!({
+                "forgot_action": state.url_for("/forgot"),
+                "info_message": null,
+                "error_message": "Reset link is invalid",
+                "reset_link": null,
+            }),
+            &headers,
+        ),
+        Err(err) => {
+            warn!("failed to verify reset token: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unable to process reset request: {}", err),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn reset_post(
+    headers: HeaderMap,
+    State(state): State<Arc<ConsoleState>>,
+    AxumPath(token): AxumPath<String>,
+    Form(form): Form<ResetForm>,
+) -> Response {
+    match state.find_by_reset_token(&token).await {
+        Ok(Some(user)) => {
+            if user.token_expired() {
+                return state.render_with_headers(
+                    "console/forgot.html",
+                    json!({
+                        "forgot_action": state.url_for("/forgot"),
+                        "info_message": null,
+                        "error_message": "Reset link has expired. Please request a new one.",
+                        "reset_link": null,
+                    }),
+                    &headers,
+                );
+            }
+            let password = form.password.trim();
+            let confirm = form.confirm_password.trim();
+            if password.len() < 8 {
+                return state.render_with_headers(
+                    "console/reset.html",
+                    json!({
+                        "reset_action": state.url_for(&format!("/reset/{}", token)),
+                        "token": token,
+                        "error_message": "Password must be at least 8 characters",
+                    }),
+                    &headers,
+                );
+            }
+            if password != confirm {
+                return state.render_with_headers(
+                    "console/reset.html",
+                    json!({
+                        "reset_action": state.url_for(&format!("/reset/{}", token)),
+                        "token": token,
+                        "error_message": "Passwords do not match",
+                    }),
+                    &headers,
+                );
+            }
+
+            match state.update_password(&user, password).await {
+                Ok(updated_user) => {
+                    let mut response = Redirect::to(&state.url_for("/")).into_response();
+                    if let Some(header) =
+                        state.session_cookie_header(updated_user.id, is_secure_request(&headers))
+                    {
+                        response.headers_mut().append(SET_COOKIE, header);
+                    }
+                    response
+                }
+                Err(err) => {
+                    warn!("failed to update password: {}", err);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to reset password: {}", err),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Ok(None) => state.render_with_headers(
+            "console/forgot.html",
+            json!({
+                "forgot_action": state.url_for("/forgot"),
+                "info_message": null,
+                "error_message": "Reset link is invalid",
+                "reset_link": null,
+            }),
+            &headers,
+        ),
+        Err(err) => {
+            warn!("failed to reset password: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to reset password: {}", err),
+            )
+                .into_response()
+        }
+    }
+}
+
+// MFA Login Handlers
+
+pub async fn login_mfa_page(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+) -> Response {
+    // Check for MFA session cookie
+    let mfa_cookie = headers
+        .get(crate::console::auth::MFA_SESSION_COOKIE_NAME)
+        .and_then(|v| v.to_str().ok());
+
+    let user_id = match state.verify_mfa_session_token(mfa_cookie) {
+        Some(id) => id,
+        None => {
+            // No valid MFA session, redirect to login
+            return Redirect::to(&state.url_for("/login")).into_response();
+        }
+    };
+
+    match load_mfa_user_or_redirect(&state, user_id).await {
+        Ok(_user) => state.render_with_headers(
+            "console/login_mfa.html",
+            json!({
+                "login_action": state.url_for("/login/mfa"),
+                "error_message": null,
+            }),
+            &headers,
+        ),
+        Err(resp) => resp,
+    }
+}
+
+pub async fn login_mfa_post(
+    client_addr: ClientAddr,
+    headers: HeaderMap,
+    State(state): State<Arc<ConsoleState>>,
+    Form(form): Form<crate::console::handlers::forms::MfaForm>,
+) -> Response {
+    // Check for MFA session cookie
+    let mfa_cookie = headers
+        .get(crate::console::auth::MFA_SESSION_COOKIE_NAME)
+        .and_then(|v| v.to_str().ok());
+
+    let user_id = match state.verify_mfa_session_token(mfa_cookie) {
+        Some(id) => id,
+        None => {
+            return Redirect::to(&state.url_for("/login")).into_response();
+        }
+    };
+
+    let user = match load_mfa_user_or_redirect(&state, user_id).await {
+        Ok(user) => user,
+        Err(resp) => return resp,
+    };
+
+    // Verify MFA code
+    if !ConsoleState::verify_mfa_code(&user, &form.code) {
+        return state.render_with_headers(
+            "console/login_mfa.html",
+            json!({
+                "login_action": state.url_for("/login/mfa"),
+                "error_message": "Invalid verification code",
+            }),
+            &headers,
+        );
+    }
+
+    // MFA verified, complete login
+    if let Err(err) = state.mark_login(&user, client_addr.ip().to_string()).await {
+        warn!("failed to update last_login: {}", err);
+    }
+
+    // Clear MFA session and create full session
+    let redirect_target = state.url_for("/");
+    let mut response = Redirect::to(&redirect_target).into_response();
+
+    // Add session cookie
+    if let Some(header) = state.session_cookie_header(user.id, is_secure_request(&headers)) {
+        response.headers_mut().append(SET_COOKIE, header);
+    }
+
+    // Clear MFA session cookie
+    if let Some(header) = state.clear_mfa_session_cookie(is_secure_request(&headers)) {
+        response.headers_mut().append(SET_COOKIE, header);
+    }
+
+    response
+}

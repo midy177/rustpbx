@@ -1,0 +1,247 @@
+use sea_orm::entity::prelude::*;
+use sea_orm_migration::prelude::*;
+use sea_orm_migration::schema::{
+    boolean, double_null, integer_null, json_null, string_len, string_len_null, text_null,
+    timestamp_with_time_zone as timestamp, timestamp_with_time_zone_null as timestamp_null,
+};
+use sea_orm_migration::sea_query::ColumnDef;
+use sea_query::Expr;
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[derive(Default)]
+pub enum SipTrunkStatus {
+    #[sea_orm(string_value = "healthy")]
+    #[default]
+    Healthy,
+    #[sea_orm(string_value = "warning")]
+    Warning,
+    #[sea_orm(string_value = "standby")]
+    Standby,
+    #[sea_orm(string_value = "offline")]
+    Offline,
+}
+
+impl SipTrunkStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Warning => "warning",
+            Self::Standby => "standby",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[derive(Default)]
+pub enum SipTrunkDirection {
+    #[sea_orm(string_value = "inbound")]
+    Inbound,
+    #[sea_orm(string_value = "outbound")]
+    Outbound,
+    #[sea_orm(string_value = "bidirectional")]
+    #[default]
+    Bidirectional,
+}
+
+impl SipTrunkDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+            Self::Bidirectional => "bidirectional",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[derive(Default)]
+pub enum SipTransport {
+    #[sea_orm(string_value = "udp")]
+    #[default]
+    Udp,
+    #[sea_orm(string_value = "tcp")]
+    Tcp,
+    #[sea_orm(string_value = "tls")]
+    Tls,
+}
+
+impl SipTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, Default)]
+#[sea_orm(table_name = "rustpbx_sip_trunks")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = true)]
+    pub id: i64,
+    #[sea_orm(unique)]
+    pub name: String,
+    pub display_name: Option<String>,
+    pub carrier: Option<String>,
+    pub description: Option<String>,
+    pub status: SipTrunkStatus,
+    pub direction: SipTrunkDirection,
+    pub sip_server: Option<String>,
+    pub sip_transport: SipTransport,
+    pub outbound_proxy: Option<String>,
+    pub auth_username: Option<String>,
+    pub auth_password: Option<String>,
+    pub default_route_label: Option<String>,
+    pub max_cps: Option<i32>,
+    pub max_concurrent: Option<i32>,
+    pub max_call_duration: Option<i32>,
+    pub utilisation_percent: Option<f64>,
+    pub warning_threshold_percent: Option<f64>,
+    pub allowed_ips: Option<Json>,
+    pub did_numbers: Option<Json>,
+    pub billing_snapshot: Option<Json>,
+    pub analytics: Option<Json>,
+    pub tags: Option<Json>,
+    pub incoming_from_user_prefix: Option<String>,
+    pub incoming_to_user_prefix: Option<String>,
+    pub is_active: bool,
+    pub register_enabled: bool,
+    pub register_expires: Option<i32>,
+    pub register_extra_headers: Option<Json>,
+    pub metadata: Option<Json>,
+    pub rewrite_hostport: bool,
+    pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
+    pub last_health_check_at: Option<DateTimeUtc>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Column::Id)
+                            .big_integer()
+                            .primary_key()
+                            .auto_increment(),
+                    )
+                    .col(string_len(Column::Name, 120))
+                    .col(string_len_null(Column::DisplayName, 160))
+                    .col(string_len_null(Column::Carrier, 160))
+                    .col(text_null(Column::Description))
+                    .col(string_len(Column::Status, 32).default(SipTrunkStatus::default().as_str()))
+                    .col(
+                        string_len(Column::Direction, 32)
+                            .default(SipTrunkDirection::default().as_str()),
+                    )
+                    .col(string_len_null(Column::SipServer, 160))
+                    .col(
+                        string_len(Column::SipTransport, 16)
+                            .default(SipTransport::default().as_str()),
+                    )
+                    .col(string_len_null(Column::OutboundProxy, 160))
+                    .col(string_len_null(Column::AuthUsername, 160))
+                    .col(string_len_null(Column::AuthPassword, 160))
+                    .col(string_len_null(Column::DefaultRouteLabel, 160))
+                    .col(integer_null(Column::MaxCps))
+                    .col(integer_null(Column::MaxConcurrent))
+                    .col(integer_null(Column::MaxCallDuration))
+                    .col(double_null(Column::UtilisationPercent))
+                    .col(double_null(Column::WarningThresholdPercent))
+                    .col(json_null(Column::AllowedIps))
+                    .col(json_null(Column::DidNumbers))
+                    .col(json_null(Column::BillingSnapshot))
+                    .col(json_null(Column::Analytics))
+                    .col(json_null(Column::Tags))
+                    .col(string_len_null(Column::IncomingFromUserPrefix, 160))
+                    .col(string_len_null(Column::IncomingToUserPrefix, 160))
+                    .col(boolean(Column::IsActive).default(true))
+                    .col(boolean(Column::RegisterEnabled).default(false))
+                    .col(integer_null(Column::RegisterExpires))
+                    .col(json_null(Column::RegisterExtraHeaders))
+                    .col(json_null(Column::Metadata))
+                    .col(boolean(Column::RewriteHostport).default(true))
+                    .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))
+                    .col(timestamp(Column::UpdatedAt).default(Expr::current_timestamp()))
+                    .col(timestamp_null(Column::LastHealthCheckAt))
+                    .to_owned(),
+            )
+            .await?;
+
+        if !manager
+            .has_index("rustpbx_sip_trunks", "idx_rustpbx_sip_trunks_name")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_rustpbx_sip_trunks_name")
+                        .table(Entity)
+                        .col(Column::Name)
+                        .unique()
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        if !manager
+            .has_index("rustpbx_sip_trunks", "idx_rustpbx_sip_trunks_status")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_rustpbx_sip_trunks_status")
+                        .table(Entity)
+                        .col(Column::Status)
+                        .col(Column::IsActive)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        if !manager
+            .has_index("rustpbx_sip_trunks", "idx_rustpbx_sip_trunks_direction")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_rustpbx_sip_trunks_direction")
+                        .table(Entity)
+                        .col(Column::Direction)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Entity).to_owned())
+            .await
+    }
+}

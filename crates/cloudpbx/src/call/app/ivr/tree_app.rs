@@ -1,0 +1,1409 @@
+//! IVR application — built-in, config-driven interactive voice response.
+//!
+//! Reads TOML configuration from `config/ivr/{name}.toml` and drives a
+//! menu-based state machine through the [`CallApp`] trait.
+//!
+//! # State Machine
+//!
+//! ```text
+//! Init → PlayingGreeting → WaitingDtmf ──→ (action)
+//!                              ↑   │
+//!                              │   ├─ timeout → PlayingInvalid/retry
+//!                              │   └─ invalid → PlayingInvalid/retry
+//!                              │       │
+//!                              └───────┘
+//!       PlayingAnnouncement → (return to menu)
+//!       CollectingExtension → Transfer
+//!       Webhook → (response determines next action)
+//! ```
+
+use super::config::{EntryAction, IvrDefinition, WebhookResponse};
+use crate::call::app::{
+    AppAction, ApplicationContext, CallApp, CallAppType, CallController, DtmfCollectConfig,
+};
+use crate::callrecord::CallRecordHangupReason;
+use crate::models::call_record::extract_sip_username;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+
+/// Internal state of the IVR state machine.
+#[derive(Debug, Clone, PartialEq)]
+enum IvrState {
+    /// Initial state before `on_enter`.
+    Init,
+    /// Playing the greeting audio for a menu.
+    PlayingGreeting { menu_key: String },
+    /// Waiting for a DTMF key press.
+    WaitingDtmf { menu_key: String, retry_count: u32 },
+    /// Playing the "invalid input" prompt, will retry afterwards.
+    PlayingInvalid { menu_key: String, retry_count: u32 },
+    /// Playing an announcement (from `play` action), returns to `return_menu`.
+    PlayingAnnouncement { return_menu: String },
+    /// Playing a hangup/goodbye prompt before disconnecting.
+    PlayingHangup,
+    /// Playing a prompt before hanging up with a specific SIP code.
+    PlayingAndHangup { code: Option<u16> },
+    /// Collecting multi-digit extension input.
+    CollectingExtension,
+    /// Terminal state.
+    Done,
+}
+
+/// Payload sent to the webhook endpoint with call context information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    /// Unique call session identifier.
+    pub session_id: String,
+    /// Caller number/URI.
+    pub caller: String,
+    /// Callee number/URI.
+    pub callee: String,
+    /// Call direction ("inbound" / "outbound").
+    pub direction: String,
+    /// IVR definition name.
+    pub ivr_name: String,
+    /// Current menu key.
+    pub menu: String,
+    /// Collected variables from Collect actions.
+    #[serde(default)]
+    pub variables: std::collections::HashMap<String, String>,
+}
+
+/// A built-in IVR application driven by TOML configuration.
+///
+/// Supports nested menus, DTMF routing, timeouts, retries, transfer,
+/// queue, voicemail, play-and-return, extension collection, and more.
+pub struct IvrApp {
+    /// Parsed IVR definition (menus, entries, actions).
+    definition: IvrDefinition,
+    /// Current state machine state.
+    state: IvrState,
+    /// Menu navigation stack (e.g. `["root", "sales"]`).
+    menu_stack: Vec<String>,
+    /// Retry count carried across greeting replay (since `PlayingGreeting`
+    /// state itself doesn't track retries).
+    pending_retry_count: u32,
+    /// Variables collected via Collect actions.
+    collected_variables: std::collections::HashMap<String, String>,
+    /// First digit collected for unknown_key_action (direct dial scenario).
+    pending_unknown_digit: Option<String>,
+    /// Optional TTS service synthesized from the IVR's own TTS config.
+    tts_service: Option<Arc<crate::tts::TtsService>>,
+    /// Number of nodes traversed (for IvrFlowCompleted).
+    nodes_traversed: u32,
+    /// Timestamp when IVR flow started (for total_duration_ms).
+    flow_started_at: Option<std::time::Instant>,
+    /// Timestamp when the current node was entered (for IvrNodeExited.duration_ms).
+    node_entered_at: Option<std::time::Instant>,
+}
+
+impl IvrApp {
+    /// Create a new `IvrApp` from a parsed [`IvrDefinition`].
+    pub fn new(definition: IvrDefinition) -> Self {
+        let tts_service = definition
+            .tts
+            .as_ref()
+            .map(|cfg| Arc::new(crate::tts::TtsService::new(cfg.clone())));
+        Self {
+            definition,
+            state: IvrState::Init,
+            menu_stack: vec!["root".to_string()],
+            pending_retry_count: 0,
+            collected_variables: std::collections::HashMap::new(),
+            pending_unknown_digit: None,
+            tts_service,
+            nodes_traversed: 0,
+            flow_started_at: None,
+            node_entered_at: None,
+        }
+    }
+
+    /// Create a new `IvrApp` with an explicit TTS config override.
+    pub fn with_tts(mut self, tts: Option<crate::tts::TtsConfig>) -> Self {
+        self.tts_service = tts.map(|cfg| Arc::new(crate::tts::TtsService::new(cfg)));
+        self
+    }
+
+    /// Load an `IvrApp` from a TOML file path.
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read IVR config '{}': {}", path, e))?;
+        let file_config: super::config::IvrFileConfig = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse IVR config '{}': {}", path, e))?;
+        file_config
+            .ivr
+            .validate()
+            .map_err(|e| anyhow::anyhow!("IVR config validation failed '{}': {}", path, e))?;
+        Ok(Self::new(file_config.ivr))
+    }
+
+    /// Emit an RWI event via the gateway in the application context, if configured.
+    fn emit_rwi_event_typed(
+        &self,
+        ctx: &ApplicationContext,
+        event: &impl crate::rwi::RwiEventSpec,
+    ) {
+        if let Some(ref gw) = ctx.rwi_gateway {
+            let gw = gw.read();
+            gw.fan_out(&ctx.call_info.session_id, event);
+        }
+    }
+
+    /// Emit IvrFlowCompleted when the IVR flow ends via a terminal action.
+    async fn ivr_flow_completed(
+        &self,
+        ctx: &ApplicationContext,
+        final_result: &str,
+        target: Option<&str>,
+    ) {
+        let total_duration_ms = self
+            .flow_started_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        self.emit_rwi_event_typed(
+            ctx,
+            &crate::rwi::IvrFlowCompleted {
+                call_id: ctx.call_info.session_id.clone(),
+                app_id: self.definition.name.clone(),
+                total_nodes_traversed: self.nodes_traversed,
+                total_duration_ms: total_duration_ms as u32,
+                final_result: final_result.to_string(),
+                completion_time: chrono::Utc::now().to_rfc3339(),
+                final_routing_target: target.map(|s| s.to_string()),
+                extra: None,
+            },
+        );
+    }
+
+    /// Check if the current time falls within business hours.
+    fn is_within_business_hours(&self, bh: &super::config::BusinessHours) -> bool {
+        use chrono::{Datelike, Utc};
+
+        let tz: chrono_tz::Tz = match bh.timezone.parse() {
+            Ok(tz) => tz,
+            Err(_) => {
+                warn!(
+                    ivr = %self.definition.name,
+                    timezone = %bh.timezone,
+                    "Invalid timezone, defaulting to UTC"
+                );
+                chrono_tz::UTC
+            }
+        };
+
+        let now = Utc::now().with_timezone(&tz);
+        let weekday = match now.weekday() {
+            chrono::Weekday::Mon => "mon",
+            chrono::Weekday::Tue => "tue",
+            chrono::Weekday::Wed => "wed",
+            chrono::Weekday::Thu => "thu",
+            chrono::Weekday::Fri => "fri",
+            chrono::Weekday::Sat => "sat",
+            chrono::Weekday::Sun => "sun",
+        };
+
+        for schedule in &bh.schedules {
+            if !schedule
+                .days
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(weekday))
+            {
+                continue;
+            }
+
+            let start = match chrono::NaiveTime::parse_from_str(&schedule.start, "%H:%M") {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let end = match chrono::NaiveTime::parse_from_str(&schedule.end, "%H:%M") {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let current_time = now.time();
+            if current_time >= start && current_time <= end {
+                return true;
+            }
+        }
+
+        // If no schedules defined, always open
+        bh.schedules.is_empty()
+    }
+
+    /// Get the current menu key (top of stack).
+    fn current_menu_key(&self) -> &str {
+        self.menu_stack.last().map(|s| s.as_str()).unwrap_or("root")
+    }
+
+    /// Navigate to a menu. If `"root"`, reset the stack. Otherwise push only
+    /// if the menu is not already the current top (avoids unbounded growth on Repeat).
+    fn navigate_to_menu(&mut self, menu_key: &str) {
+        let old_stack = self.menu_stack.clone();
+        if menu_key == "root" {
+            self.menu_stack.clear();
+            self.menu_stack.push("root".to_string());
+        } else if self.current_menu_key() != menu_key {
+            self.menu_stack.push(menu_key.to_string());
+        }
+        if old_stack != self.menu_stack {
+            info!(
+                ivr = %self.definition.name,
+                old_stack = ?old_stack,
+                new_stack = ?self.menu_stack,
+                "IVR menu stack changed"
+            );
+        }
+        // If already on this menu (e.g. Repeat), keep the stack as-is.
+    }
+
+    fn navigate_back(&mut self) -> String {
+        if self.menu_stack.len() > 1 {
+            let popped = self.menu_stack.pop();
+            info!(
+                ivr = %self.definition.name,
+                popped = ?popped,
+                new_top = ?self.menu_stack.last(),
+                "IVR navigating back"
+            );
+        } else {
+            info!(ivr = %self.definition.name, "IVR Back called at root, staying on root");
+        }
+        self.menu_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "root".to_string())
+    }
+
+    async fn resolve_audio(
+        &self,
+        file: Option<&str>,
+        text: Option<&str>,
+        voice: Option<&str>,
+    ) -> Option<String> {
+        if let Some(path) = file
+            && !path.is_empty()
+        {
+            // tts:// URI: parse text and optional voice from the URI, then synthesize
+            if let Some(rest) = path.strip_prefix("tts://") {
+                let (encoded_text, tts_voice) = if let Some((t, q)) = rest.split_once('?') {
+                    let v = q.strip_prefix("voice=").filter(|v| !v.is_empty());
+                    (t, v)
+                } else {
+                    (rest, None)
+                };
+                let tts_text = urlencoding::decode(encoded_text)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| encoded_text.to_string());
+                if let Some(service) = self.tts_service.as_ref() {
+                    match service.synthesize(&tts_text, tts_voice).await {
+                        Ok(audio_path) => return Some(audio_path),
+                        Err(e) => {
+                            warn!(ivr = %self.definition.name, text = %tts_text, error = %e, "TTS synthesis failed for tts:// URI");
+                        }
+                    }
+                } else {
+                    // Fallback: try edge-cli if available
+                    let voice_str = tts_voice.unwrap_or("zh-CN-XiaoxiaoNeural").to_string();
+                    let fallback_cfg = crate::tts::TtsConfig {
+                        cache_dir: std::env::temp_dir()
+                            .join("rustpbx_tts_cache")
+                            .to_string_lossy()
+                            .to_string(),
+                        cache_ttl_seconds: 86400,
+                        driver: crate::tts::TtsDriverConfig::Cli(crate::tts::CliTtsConfig {
+                            command: "edge-cli".to_string(),
+                            args: vec![
+                                "speak".to_string(),
+                                "--text".to_string(),
+                                "{text}".to_string(),
+                                "--voice".to_string(),
+                                "{voice}".to_string(),
+                                "--output".to_string(),
+                                "{output}".to_string(),
+                            ],
+                            output_format: "mp3".to_string(),
+                        }),
+                    };
+                    let fallback_service = crate::tts::TtsService::new(fallback_cfg);
+                    match fallback_service
+                        .synthesize(&tts_text, Some(&voice_str))
+                        .await
+                    {
+                        Ok(audio_path) => return Some(audio_path),
+                        Err(e) => {
+                            warn!(ivr = %self.definition.name, text = %tts_text, error = %e, "edge-cli fallback TTS failed");
+                        }
+                    }
+                }
+                return None;
+            }
+            return Some(path.to_string());
+        }
+        if let (Some(t), Some(service)) = (text, self.tts_service.as_ref()) {
+            match service.synthesize(t, voice).await {
+                Ok(path) => return Some(path),
+                Err(e) => {
+                    warn!(ivr = %self.definition.name, text = %t, error = %e, "TTS synthesis failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// Start playing the greeting for the specified menu.
+    async fn enter_menu(
+        &mut self,
+        menu_key: &str,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        self.navigate_to_menu(menu_key);
+        if self.flow_started_at.is_none() {
+            self.flow_started_at = Some(std::time::Instant::now());
+        }
+        self.node_entered_at = Some(std::time::Instant::now());
+        self.nodes_traversed += 1;
+        info!(
+            ivr = %self.definition.name,
+            menu = menu_key,
+            menu_stack = ?self.menu_stack,
+            "IVR entering menu"
+        );
+
+        // Emit IvrNodeEntered event
+        let previous_node = self.menu_stack.iter().rev().nth(1).cloned();
+        self.emit_rwi_event_typed(
+            ctx,
+            &crate::rwi::IvrNodeEntered {
+                call_id: ctx.call_info.session_id.clone(),
+                node_id: menu_key.to_string(),
+                node_name: menu_key.to_string(),
+                node_type: "menu".to_string(),
+                app_id: self.definition.name.clone(),
+                entry_time: chrono::Utc::now().to_rfc3339(),
+                caller_name: extract_sip_username(&ctx.call_info.caller),
+                callee_name: extract_sip_username(&ctx.call_info.callee),
+                routing_target: Some(menu_key.to_string()),
+                previous_node_id: previous_node,
+                extra: None,
+            },
+        );
+        let menu = self
+            .definition
+            .get_menu(menu_key)
+            .ok_or_else(|| anyhow::anyhow!("IVR menu '{}' not found", menu_key))?;
+        let greeting = self
+            .resolve_audio(
+                Some(&menu.greeting),
+                menu.greeting_text.as_deref(),
+                menu.greeting_voice.as_deref(),
+            )
+            .await;
+        self.state = IvrState::PlayingGreeting {
+            menu_key: menu_key.to_string(),
+        };
+        if let Some(path) = greeting {
+            info!(ivr = %self.definition.name, menu = menu_key, "Playing greeting: {}", path);
+            ctrl.play_audio(&path, false).await?;
+        } else {
+            info!(
+                ivr = %self.definition.name,
+                menu = menu_key,
+                "No greeting audio, waiting DTMF immediately"
+            );
+            self.start_waiting_dtmf(menu_key, self.pending_retry_count, ctrl);
+        }
+        Ok(AppAction::Continue)
+    }
+
+    /// Start waiting for DTMF input with a timeout.
+    fn start_waiting_dtmf(&mut self, menu_key: &str, retry_count: u32, ctrl: &CallController) {
+        let menu = self.definition.get_menu(menu_key);
+        let timeout_ms = menu.map(|m| m.timeout_ms).unwrap_or(5000);
+        self.state = IvrState::WaitingDtmf {
+            menu_key: menu_key.to_string(),
+            retry_count,
+        };
+        ctrl.set_timeout("ivr_dtmf_timeout", Duration::from_millis(timeout_ms));
+        info!(
+            ivr = %self.definition.name,
+            menu = menu_key,
+            retry_count,
+            timeout_ms,
+            "IVR waiting for DTMF input"
+        );
+    }
+
+    /// Execute an action from a DTMF press or timeout/max-retries fallback.
+    async fn execute_action(
+        &mut self,
+        action: &EntryAction,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        ctrl.cancel_timeout("ivr_dtmf_timeout");
+
+        // Emit IvrNodeExited event when leaving a menu node.
+        if let IvrState::WaitingDtmf { ref menu_key, .. }
+        | IvrState::PlayingGreeting { ref menu_key } = self.state
+        {
+            let node_name = menu_key.clone();
+            let duration_ms = self
+                .node_entered_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let action_type = match action {
+                EntryAction::Transfer { .. } => "transfer",
+                EntryAction::Queue { .. } => "queue",
+                EntryAction::Menu { .. } => "menu",
+                EntryAction::JumpIvr { .. } => "jump_ivr",
+                EntryAction::RouteToAgent { .. } => "route_to_agent",
+                _ => "other",
+            };
+            self.emit_rwi_event_typed(
+                ctx,
+                &crate::rwi::IvrNodeExited {
+                    call_id: ctx.call_info.session_id.clone(),
+                    node_id: menu_key.clone(),
+                    node_name,
+                    result_value: Some(action_type.to_string()),
+                    duration_ms: duration_ms as u32,
+                    exit_time: chrono::Utc::now().to_rfc3339(),
+                    next_node_id: None,
+                    hangup_reason: None,
+                    call_result: None,
+                    extra: None,
+                },
+            );
+        }
+        match action {
+            EntryAction::Transfer { target } => {
+                info!(ivr = %self.definition.name, target, "IVR transferring call");
+                self.ivr_flow_completed(ctx, "transferred", Some(target))
+                    .await;
+                self.state = IvrState::Done;
+                Ok(AppAction::Transfer(target.clone()))
+            }
+            EntryAction::Queue {
+                target,
+                return_to_ivr,
+            } => {
+                info!(
+                    ivr = %self.definition.name,
+                    queue = target,
+                    return_to_ivr = ?return_to_ivr,
+                    "IVR sending to queue"
+                );
+                self.ivr_flow_completed(ctx, "queue", Some(target)).await;
+                self.state = IvrState::Done;
+                if return_to_ivr.unwrap_or(false) {
+                    // Encode return IVR name so the queue can come back on failure
+                    Ok(AppAction::Transfer(format!(
+                        "queue:{}?return_ivr={}",
+                        target, self.definition.name
+                    )))
+                } else {
+                    Ok(AppAction::Transfer(format!("queue:{}", target)))
+                }
+            }
+            EntryAction::Menu { menu } => {
+                info!(ivr = %self.definition.name, from = %self.current_menu_key(), to = %menu, "IVR navigating to menu");
+                self.enter_menu(menu, ctrl, ctx).await
+            }
+            EntryAction::Back => {
+                let target = self.navigate_back();
+                info!(ivr = %self.definition.name, menu = %target, "IVR entering parent menu after Back");
+                self.enter_menu(&target, ctrl, ctx).await
+            }
+            EntryAction::Voicemail { target } => {
+                info!(ivr = %self.definition.name, target, "IVR transferring to voicemail");
+                self.ivr_flow_completed(ctx, "voicemail", Some(target))
+                    .await;
+                self.state = IvrState::Done;
+                Ok(AppAction::Transfer(format!("voicemail:{}", target)))
+            }
+            EntryAction::Play {
+                prompt,
+                prompt_text,
+                prompt_voice,
+            } => {
+                let return_menu = self.current_menu_key().to_string();
+                self.state = IvrState::PlayingAnnouncement {
+                    return_menu: return_menu.clone(),
+                };
+                if let Some(path) = self
+                    .resolve_audio(
+                        Some(prompt),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
+                    .await
+                {
+                    info!(ivr = %self.definition.name, prompt = %path, return_menu, "IVR playing announcement");
+                    ctrl.play_audio(&path, false).await?;
+                    Ok(AppAction::Continue)
+                } else {
+                    info!(ivr = %self.definition.name, return_menu, "IVR announcement has no audio, returning to menu");
+                    return self.enter_menu(&return_menu, ctrl, ctx).await;
+                }
+            }
+            EntryAction::Repeat => {
+                let current = self.current_menu_key().to_string();
+                info!(ivr = %self.definition.name, menu = %current, "IVR repeating menu");
+                self.enter_menu(&current, ctrl, ctx).await
+            }
+            EntryAction::Hangup {
+                prompt,
+                prompt_text,
+                prompt_voice,
+                ..
+            } => {
+                if let Some(path) = self
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
+                    .await
+                {
+                    self.state = IvrState::PlayingAndHangup { code: None };
+                    debug!(ivr = %self.definition.name, prompt = %path, "Playing prompt before hangup");
+                    ctrl.play_audio(&path, false).await?;
+                    Ok(AppAction::Continue)
+                } else {
+                    info!(ivr = %self.definition.name, "IVR hanging up");
+                    self.ivr_flow_completed(ctx, "hangup", None).await;
+                    self.state = IvrState::Done;
+                    Ok(AppAction::Hangup {
+                        reason: None,
+                        code: None,
+                    })
+                }
+            }
+            EntryAction::PlayAndHangup {
+                prompt,
+                prompt_text,
+                prompt_voice,
+                code,
+            } => {
+                self.state = IvrState::PlayingAndHangup { code: *code };
+                if let Some(path) = self
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
+                    .await
+                {
+                    debug!(ivr = %self.definition.name, prompt = %path, code = ?code, "Playing prompt before hangup with code");
+                    ctrl.play_audio(&path, false).await?;
+                    Ok(AppAction::Continue)
+                } else {
+                    // No prompt — hang up immediately with the given code
+                    info!(ivr = %self.definition.name, code = ?code, "IVR hanging up immediately with code (no prompt)");
+                    self.state = IvrState::Done;
+                    Ok(AppAction::Hangup {
+                        reason: None,
+                        code: *code,
+                    })
+                }
+            }
+            EntryAction::CollectExtension {
+                prompt,
+                prompt_text,
+                prompt_voice,
+                min_digits,
+                max_digits,
+                inter_digit_timeout_ms,
+            } => {
+                self.state = IvrState::CollectingExtension;
+                let resolved_prompt = self
+                    .resolve_audio(
+                        Some(prompt),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
+                    .await;
+                debug!(
+                    ivr = %self.definition.name,
+                    prompt = ?resolved_prompt, min_digits, max_digits, inter_digit_timeout_ms,
+                    "Collecting extension digits"
+                );
+
+                // Check if we have a pending digit from unknown_key_action
+                let initial_digit = self.pending_unknown_digit.take();
+                let digits = if let Some(first) = initial_digit {
+                    // Already have first digit, collect more if needed
+                    if first.len() >= *min_digits {
+                        first.clone()
+                    } else {
+                        let mut combined = first;
+                        let more = ctrl
+                            .collect_dtmf(DtmfCollectConfig {
+                                min_digits: 1,
+                                max_digits: max_digits.saturating_sub(combined.len()),
+                                timeout: Duration::from_millis(
+                                    *inter_digit_timeout_ms * (*max_digits as u64 + 1),
+                                ),
+                                terminator: Some('#'),
+                                play_prompt: resolved_prompt.clone(),
+                                inter_digit_timeout: Some(Duration::from_millis(
+                                    *inter_digit_timeout_ms,
+                                )),
+                            })
+                            .await?;
+                        combined.push_str(&more);
+                        combined
+                    }
+                } else {
+                    ctrl.collect_dtmf(DtmfCollectConfig {
+                        min_digits: *min_digits,
+                        max_digits: *max_digits,
+                        timeout: Duration::from_millis(
+                            *inter_digit_timeout_ms * (*max_digits as u64 + 1),
+                        ),
+                        terminator: Some('#'),
+                        play_prompt: resolved_prompt.clone(),
+                        inter_digit_timeout: Some(Duration::from_millis(*inter_digit_timeout_ms)),
+                    })
+                    .await?
+                };
+
+                if digits.is_empty() {
+                    // No digits collected, go back to current menu
+                    let current = self.current_menu_key().to_string();
+                    self.enter_menu(&current, ctrl, ctx).await
+                } else {
+                    info!(ivr = %self.definition.name, extension = %digits, "Transferring to collected extension");
+                    self.state = IvrState::Done;
+                    Ok(AppAction::Transfer(digits))
+                }
+            }
+            EntryAction::Collect {
+                variable,
+                prompt,
+                prompt_text,
+                prompt_voice,
+                min_digits,
+                max_digits,
+                end_key,
+                inter_digit_timeout_ms,
+            } => {
+                debug!(
+                    ivr = %self.definition.name,
+                    variable, min_digits, max_digits, inter_digit_timeout_ms,
+                    "Collecting digits into variable"
+                );
+                let terminator = end_key.as_ref().and_then(|k| k.chars().next());
+                let resolved_prompt = self
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
+                    .await;
+
+                // Check if we have a pending digit from unknown_key_action
+                let initial_digit = self.pending_unknown_digit.take();
+                let digits = if let Some(first) = initial_digit {
+                    // Already have first digit, collect more if needed
+                    if first.len() >= *min_digits {
+                        // Already have enough digits
+                        first.clone()
+                    } else {
+                        // Collect more digits, starting with what we have
+                        let mut combined = first;
+                        let more = ctrl
+                            .collect_dtmf(DtmfCollectConfig {
+                                min_digits: 1,
+                                max_digits: max_digits.saturating_sub(combined.len()),
+                                timeout: Duration::from_millis(
+                                    *inter_digit_timeout_ms * (*max_digits as u64 + 1),
+                                ),
+                                terminator,
+                                play_prompt: resolved_prompt.clone(),
+                                inter_digit_timeout: Some(Duration::from_millis(
+                                    *inter_digit_timeout_ms,
+                                )),
+                            })
+                            .await?;
+                        combined.push_str(&more);
+                        combined
+                    }
+                } else {
+                    ctrl.collect_dtmf(DtmfCollectConfig {
+                        min_digits: *min_digits,
+                        max_digits: *max_digits,
+                        timeout: Duration::from_millis(
+                            *inter_digit_timeout_ms * (*max_digits as u64 + 1),
+                        ),
+                        terminator,
+                        play_prompt: resolved_prompt.clone(),
+                        inter_digit_timeout: Some(Duration::from_millis(*inter_digit_timeout_ms)),
+                    })
+                    .await?
+                };
+
+                if digits.is_empty() {
+                    debug!(ivr = %self.definition.name, variable, "No digits collected for variable");
+                } else {
+                    info!(ivr = %self.definition.name, variable, digits, "Collected digits into variable");
+                    self.collected_variables.insert(variable.clone(), digits);
+                }
+
+                // Return to current menu after collecting
+                let current = self.current_menu_key().to_string();
+                self.enter_menu(&current, ctrl, ctx).await
+            }
+            EntryAction::Webhook {
+                url,
+                method,
+                headers,
+                variables,
+                timeout,
+            } => {
+                let method_str = method.as_deref().unwrap_or("POST");
+                info!(
+                    ivr = %self.definition.name,
+                    url, method = method_str,
+                    "IVR calling webhook"
+                );
+
+                let webhook_response = self
+                    .call_webhook(
+                        url,
+                        method_str,
+                        headers,
+                        variables.as_deref(),
+                        *timeout,
+                        ctx,
+                    )
+                    .await;
+
+                match webhook_response {
+                    Ok(response) => {
+                        debug!(
+                            ivr = %self.definition.name,
+                            url,
+                            "Webhook responded successfully, executing returned command"
+                        );
+                        // Convert WebhookResponse into an EntryAction and execute it
+                        let derived_action = response.into_entry_action();
+                        // Use Box::pin to avoid recursion issues with async fn
+                        Box::pin(self.execute_action(&derived_action, ctrl, ctx)).await
+                    }
+                    Err(e) => {
+                        error!(
+                            ivr = %self.definition.name,
+                            url,
+                            error = %e,
+                            "Webhook call failed, continuing IVR"
+                        );
+                        // On error, stay in current menu (re-play greeting)
+                        let current = self.current_menu_key().to_string();
+                        self.enter_menu(&current, ctrl, ctx).await
+                    }
+                }
+            }
+
+            EntryAction::Prompt { .. }
+            | EntryAction::DtmfMenu { .. }
+            | EntryAction::CollectDtmf { .. }
+            | EntryAction::InputPhone { .. }
+            | EntryAction::InputVoice { .. }
+            | EntryAction::Api { .. }
+            | EntryAction::Torecord { .. }
+            | EntryAction::JumpIvr { .. }
+            | EntryAction::RouteToAgent { .. }
+            | EntryAction::VoipBridge { .. } => {
+                error!(ivr = %self.definition.name, action = ?std::mem::discriminant(action),
+                    "Tree mode IVR received unsupported step-mode action");
+                Err(anyhow::anyhow!("unsupported action type for tree mode"))
+            }
+        }
+    }
+
+    /// Call an external webhook and return the parsed [`WebhookResponse`].
+    ///
+    /// The request body (for POST) or query params (for GET) include the
+    /// current call context so that the webhook can make routing decisions.
+    async fn call_webhook(
+        &self,
+        url: &str,
+        method: &str,
+        headers: &std::collections::HashMap<String, String>,
+        variables_filter: Option<&str>,
+        timeout_secs: u64,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<WebhookResponse> {
+        // Filter variables if a filter is specified
+        let filtered_vars = if let Some(filter) = variables_filter {
+            let filter_set: std::collections::HashSet<&str> = filter
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.collected_variables
+                .iter()
+                .filter(|(k, _)| filter_set.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            self.collected_variables.clone()
+        };
+
+        // Build the request with custom headers.
+        // For GET: send context as query params to avoid a JSON body.
+        // For POST (and everything else): serialize the full payload as JSON.
+        let req_builder = if method.eq_ignore_ascii_case("GET") {
+            let mut params = vec![
+                ("session_id", ctx.call_info.session_id.as_str()),
+                ("caller", ctx.call_info.caller.as_str()),
+                ("callee", ctx.call_info.callee.as_str()),
+                ("direction", ctx.call_info.direction.as_str()),
+                ("ivr_name", self.definition.name.as_str()),
+                ("menu", self.current_menu_key()),
+            ];
+            // Add collected variables as query params
+            for (k, v) in &filtered_vars {
+                params.push((k, v));
+            }
+            ctx.http_client.get(url).query(&params)
+        } else {
+            let payload = WebhookPayload {
+                session_id: ctx.call_info.session_id.clone(),
+                caller: ctx.call_info.caller.clone(),
+                callee: ctx.call_info.callee.clone(),
+                direction: ctx.call_info.direction.clone(),
+                ivr_name: self.definition.name.clone(),
+                menu: self.current_menu_key().to_string(),
+                variables: filtered_vars,
+            };
+            ctx.http_client.post(url).json(&payload)
+        };
+
+        let response = crate::http_util::execute_request(
+            req_builder,
+            headers,
+            Some(Duration::from_secs(timeout_secs)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Webhook request failed: {}", e))?;
+
+        let webhook_response: WebhookResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse webhook response: {}", e))?;
+
+        Ok(webhook_response)
+    }
+
+    /// Handle timeout: either retry or execute timeout_action.
+    async fn handle_timeout(
+        &mut self,
+        menu_key: String,
+        retry_count: u32,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        // Extract only what we need before any mutable borrow of self.
+        let (max_retries, timeout_action, max_retries_action, menu) = {
+            let menu = self
+                .definition
+                .get_menu(&menu_key)
+                .ok_or_else(|| anyhow::anyhow!("menu '{}' not found", menu_key))?;
+            (
+                menu.max_retries,
+                menu.timeout_action.clone(),
+                menu.max_retries_action.clone(),
+                menu.clone(),
+            )
+        };
+
+        let new_retry = retry_count + 1;
+        if new_retry > max_retries {
+            if let Some(action) = max_retries_action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded (timeout), executing fallback action"
+                );
+                return self.execute_action(&action, ctrl, ctx).await;
+            } else {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded (timeout), no fallback — hanging up"
+                );
+                self.state = IvrState::Done;
+                return Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                });
+            }
+        }
+
+        // Retry: check timeout_action
+        if let Some(action) = timeout_action {
+            match action {
+                EntryAction::Repeat => {
+                    info!(
+                        ivr = %self.definition.name,
+                        menu = %menu_key,
+                        retry = new_retry,
+                        "IVR timeout: repeating menu"
+                    );
+                    self.state = IvrState::PlayingGreeting {
+                        menu_key: menu_key.clone(),
+                    };
+                    self.pending_retry_count = new_retry;
+                    if let Some(path) = self
+                        .resolve_audio(
+                            Some(&menu.greeting),
+                            menu.greeting_text.as_deref(),
+                            menu.greeting_voice.as_deref(),
+                        )
+                        .await
+                    {
+                        ctrl.play_audio(&path, false).await?;
+                    } else {
+                        self.start_waiting_dtmf(&menu_key, new_retry, ctrl);
+                    }
+                    Ok(AppAction::Continue)
+                }
+                other => self.execute_action(&other, ctrl, ctx).await,
+            }
+        } else {
+            // No timeout_action defined; replay the greeting
+            info!(
+                ivr = %self.definition.name,
+                menu = %menu_key,
+                retry = new_retry,
+                "IVR timeout: replaying greeting (default)"
+            );
+            self.state = IvrState::PlayingGreeting {
+                menu_key: menu_key.clone(),
+            };
+            self.pending_retry_count = new_retry;
+            if let Some(path) = self
+                .resolve_audio(
+                    Some(&menu.greeting),
+                    menu.greeting_text.as_deref(),
+                    menu.greeting_voice.as_deref(),
+                )
+                .await
+            {
+                ctrl.play_audio(&path, false).await?;
+            } else {
+                self.start_waiting_dtmf(&menu_key, new_retry, ctrl);
+            }
+            Ok(AppAction::Continue)
+        }
+    }
+
+    /// Handle an invalid DTMF key press.
+    async fn handle_invalid_key(
+        &mut self,
+        menu_key: &str,
+        retry_count: u32,
+        digit: &str,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        ctrl.cancel_timeout("ivr_dtmf_timeout");
+
+        // Extract only what we need before any mutable borrow of self.
+        let (max_retries, max_retries_action, invalid_prompt, invalid_text, invalid_voice) = {
+            let menu = self
+                .definition
+                .get_menu(menu_key)
+                .ok_or_else(|| anyhow::anyhow!("menu '{}' not found", menu_key))?;
+            (
+                menu.max_retries,
+                menu.max_retries_action.clone(),
+                menu.invalid_prompt.clone(),
+                menu.invalid_text.clone(),
+                menu.invalid_voice.clone(),
+            )
+        };
+
+        let new_retry = retry_count + 1;
+        info!(
+            ivr = %self.definition.name,
+            menu = menu_key,
+            digit = %digit,
+            retry = new_retry,
+            max_retries,
+            "IVR invalid DTMF key"
+        );
+
+        if new_retry > max_retries {
+            if let Some(action) = max_retries_action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded after invalid key, executing fallback"
+                );
+                return self.execute_action(&action, ctrl, ctx).await;
+            } else {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded after invalid key, hanging up"
+                );
+                self.state = IvrState::Done;
+                return Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                });
+            }
+        }
+
+        if let Some(path) = self
+            .resolve_audio(
+                invalid_prompt.as_deref(),
+                invalid_text.as_deref(),
+                invalid_voice.as_deref(),
+            )
+            .await
+        {
+            info!(
+                ivr = %self.definition.name,
+                menu = menu_key,
+                "IVR playing invalid prompt"
+            );
+            self.state = IvrState::PlayingInvalid {
+                menu_key: menu_key.to_string(),
+                retry_count: new_retry,
+            };
+            ctrl.play_audio(&path, false).await?;
+            Ok(AppAction::Continue)
+        } else {
+            // No invalid prompt — just go back to waiting
+            info!(
+                ivr = %self.definition.name,
+                menu = menu_key,
+                retry = new_retry,
+                "IVR no invalid prompt, returning to wait DTMF"
+            );
+            self.start_waiting_dtmf(menu_key, new_retry, ctrl);
+            Ok(AppAction::Continue)
+        }
+    }
+}
+
+#[async_trait]
+impl CallApp for IvrApp {
+    fn app_type(&self) -> CallAppType {
+        CallAppType::Ivr
+    }
+
+    fn name(&self) -> &str {
+        &self.definition.name
+    }
+
+    async fn on_enter(
+        &mut self,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        info!(ivr = %self.definition.name, "IVR application started");
+        ctrl.answer().await?;
+
+        // Check business hours
+        let closed_action = if let Some(bh) = &self.definition.business_hours {
+            if bh.enabled && !self.is_within_business_hours(bh) {
+                info!(ivr = %self.definition.name, "Outside business hours");
+                if let Some(path) = self
+                    .resolve_audio(
+                        bh.closed_greeting.as_deref(),
+                        bh.closed_text.as_deref(),
+                        None,
+                    )
+                    .await
+                {
+                    self.state = IvrState::PlayingHangup;
+                    ctrl.play_audio(&path, false).await?;
+                    // After playing, the on_audio_complete will handle closed_action
+                    return Ok(AppAction::Continue);
+                }
+                Some(bh.closed_action.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(action) = closed_action {
+            if let Some(action) = action {
+                return self.execute_action(&action, ctrl, ctx).await;
+            }
+            // Default: hang up
+            self.state = IvrState::Done;
+            return Ok(AppAction::Hangup {
+                reason: Some(CallRecordHangupReason::Other("closed".to_string())),
+                code: None,
+            });
+        }
+
+        self.enter_menu("root", ctrl, ctx).await
+    }
+
+    async fn on_dtmf(
+        &mut self,
+        digit: String,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        // Extract state data we need before the mutable calls below.
+        // We only clone the String fields, not the full IvrState enum.
+        let state_snapshot = match &self.state {
+            IvrState::WaitingDtmf {
+                menu_key,
+                retry_count,
+            } => Some((*retry_count, menu_key.clone(), false)),
+            IvrState::PlayingGreeting { menu_key } => Some((0, menu_key.clone(), true)),
+            _ => None,
+        };
+
+        let Some((retry_count, menu_key, is_greeting)) = state_snapshot else {
+            // DTMF in other states is ignored
+            info!(
+                ivr = %self.definition.name,
+                digit,
+                state = ?self.state,
+                "IVR DTMF ignored in current state"
+            );
+            return Ok(AppAction::Continue);
+        };
+
+        if is_greeting {
+            // DTMF during greeting — barge-in if key is mapped
+            let action = self
+                .definition
+                .get_menu(&menu_key)
+                .and_then(|m| m.entries.iter().find(|e| e.key == digit))
+                .map(|e| e.action.clone());
+
+            if let Some(action) = action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    digit = %digit,
+                    "IVR DTMF barge-in during greeting"
+                );
+                ctrl.cancel_timeout("ivr_dtmf_timeout");
+                let _ = ctrl.stop_audio().await;
+                self.execute_action(&action, ctrl, ctx).await
+            } else {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    digit = %digit,
+                    "IVR DTMF ignored during greeting (no matching entry)"
+                );
+                Ok(AppAction::Continue)
+            }
+        } else {
+            // WaitingDtmf — look up the entry for this digit
+            let entry_action = self
+                .definition
+                .get_menu(&menu_key)
+                .and_then(|m| m.entries.iter().find(|e| e.key == digit))
+                .map(|e| {
+                    debug!(
+                        ivr = %self.definition.name,
+                        menu = %menu_key,
+                        digit = %digit,
+                        label = e.label.as_deref().unwrap_or(""),
+                        "DTMF matched"
+                    );
+                    e.action.clone()
+                });
+
+            if let Some(action) = entry_action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    digit = %digit,
+                    "IVR DTMF matched entry, executing action"
+                );
+                self.execute_action(&action, ctrl, ctx).await
+            } else if let Some(menu) = self.definition.get_menu(&menu_key) {
+                // Check for unknown_key_action (e.g., direct extension dial)
+                let unknown_action = menu.unknown_key_action.clone();
+                if let Some(unknown_action) = unknown_action {
+                    info!(
+                        ivr = %self.definition.name,
+                        menu = %menu_key,
+                        digit = %digit,
+                        "IVR DTMF not matched, executing unknown_key_action"
+                    );
+                    // Store the first digit for Collect actions
+                    self.pending_unknown_digit = Some(digit.to_string());
+                    self.execute_action(&unknown_action, ctrl, ctx).await
+                } else {
+                    info!(
+                        ivr = %self.definition.name,
+                        menu = %menu_key,
+                        digit = %digit,
+                        "IVR DTMF invalid key"
+                    );
+                    self.handle_invalid_key(&menu_key, retry_count, &digit, ctrl, ctx)
+                        .await
+                }
+            } else {
+                warn!(ivr = %self.definition.name, menu = %menu_key, "Menu not found during DTMF handling");
+                self.state = IvrState::Done;
+                Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                })
+            }
+        }
+    }
+
+    async fn on_audio_complete(
+        &mut self,
+        _track_id: String,
+        ctrl: &mut CallController,
+        _ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        // Extract string fields we need before the mutable borrows below.
+        enum AudioDone {
+            Greeting { menu_key: String },
+            Invalid { menu_key: String, retry_count: u32 },
+            Announcement { return_menu: String },
+            Hangup,
+            AndHangup { code: Option<u16> },
+            Other,
+        }
+
+        let done = match &self.state {
+            IvrState::PlayingGreeting { menu_key } => AudioDone::Greeting {
+                menu_key: menu_key.clone(),
+            },
+            IvrState::PlayingInvalid {
+                menu_key,
+                retry_count,
+            } => AudioDone::Invalid {
+                menu_key: menu_key.clone(),
+                retry_count: *retry_count,
+            },
+            IvrState::PlayingAnnouncement { return_menu } => AudioDone::Announcement {
+                return_menu: return_menu.clone(),
+            },
+            IvrState::PlayingHangup => AudioDone::Hangup,
+            IvrState::PlayingAndHangup { code } => AudioDone::AndHangup { code: *code },
+            _ => AudioDone::Other,
+        };
+
+        match done {
+            AudioDone::Greeting { menu_key } => {
+                let retry_count = self.pending_retry_count;
+                self.pending_retry_count = 0;
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retry_count,
+                    "IVR greeting complete, waiting DTMF"
+                );
+                self.start_waiting_dtmf(&menu_key, retry_count, ctrl);
+                Ok(AppAction::Continue)
+            }
+            AudioDone::Invalid {
+                menu_key,
+                retry_count,
+            } => {
+                // Invalid prompt finished → re-play greeting
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retry_count,
+                    "IVR invalid prompt complete, replaying greeting"
+                );
+                let menu = self.definition.get_menu(&menu_key).cloned();
+                if let Some(menu) = menu {
+                    self.state = IvrState::PlayingGreeting {
+                        menu_key: menu_key.clone(),
+                    };
+                    self.pending_retry_count = retry_count;
+                    if let Some(path) = self
+                        .resolve_audio(
+                            Some(&menu.greeting),
+                            menu.greeting_text.as_deref(),
+                            menu.greeting_voice.as_deref(),
+                        )
+                        .await
+                    {
+                        ctrl.play_audio(&path, false).await?;
+                    } else {
+                        self.start_waiting_dtmf(&menu_key, retry_count, ctrl);
+                    }
+                }
+                Ok(AppAction::Continue)
+            }
+            AudioDone::Announcement { return_menu } => {
+                info!(
+                    ivr = %self.definition.name,
+                    return_menu = %return_menu,
+                    "IVR announcement complete, returning to menu"
+                );
+                self.enter_menu(&return_menu, ctrl, _ctx).await
+            }
+            AudioDone::Hangup => {
+                info!(ivr = %self.definition.name, "IVR hangup prompt complete, hanging up");
+                self.state = IvrState::Done;
+                Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                })
+            }
+            AudioDone::AndHangup { code } => {
+                info!(ivr = %self.definition.name, code = ?code, "IVR prompt complete, hanging up with code");
+                self.state = IvrState::Done;
+                Ok(AppAction::Hangup { reason: None, code })
+            }
+            AudioDone::Other => Ok(AppAction::Continue),
+        }
+    }
+
+    async fn on_timeout(
+        &mut self,
+        timeout_id: String,
+        ctrl: &mut CallController,
+        ctx: &ApplicationContext,
+    ) -> anyhow::Result<AppAction> {
+        if timeout_id != "ivr_dtmf_timeout" {
+            return Ok(AppAction::Continue);
+        }
+
+        let waiting = match &self.state {
+            IvrState::WaitingDtmf {
+                menu_key,
+                retry_count,
+            } => Some((menu_key.clone(), *retry_count)),
+            _ => None,
+        };
+
+        if let Some((menu_key, retry_count)) = waiting {
+            info!(
+                ivr = %self.definition.name,
+                menu = %menu_key,
+                retry_count,
+                "IVR DTMF timeout fired"
+            );
+            self.handle_timeout(menu_key, retry_count, ctrl, ctx).await
+        } else {
+            Ok(AppAction::Continue)
+        }
+    }
+}

@@ -1,0 +1,850 @@
+use crate::app::AppStateInner;
+use crate::config::ConsoleConfig;
+use crate::console::i18n::{I18n, LocaleConfig, detect_locale};
+use crate::console::middleware::RenderTemplate;
+use crate::models::rbac::{role_permission, user_role};
+use crate::proxy::server::SipServerRef;
+use anyhow::Result;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use lru::LruCache;
+use minijinja::Environment;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Instant;
+
+pub mod auth;
+pub mod catalog;
+pub mod config_helpers;
+pub mod handlers;
+pub mod i18n;
+pub mod middleware;
+pub use handlers::router;
+
+/// Permission cache: `user_id -> (cached_at, permission set)`.
+///
+/// Implemented as an `LruCache` so inactive users are evicted automatically
+/// instead of accumulating for the lifetime of the process. The TTL check
+/// happens on read in [`ConsoleState::user_permissions`]; the LRU cap only
+/// bounds memory and does not change the effective TTL.
+pub type PermCache = LruCache<i64, (Instant, HashSet<String>)>;
+
+/// Maximum number of cached permission entries. Each entry is small (a few
+/// permissions strings), so 1024 covers realistic admin-console usage while
+/// keeping memory bounded if many distinct users log in briefly.
+pub const PERM_CACHE_CAP: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReloadTarget {
+    Routes,
+    Trunks,
+    SbcRoutes,
+    SbcTrunks,
+    Queues,
+    App,
+    Acl,
+}
+
+#[derive(Clone)]
+pub struct ConsoleState {
+    db: DatabaseConnection,
+    config: ConsoleConfig,
+    session_key: Vec<u8>,
+    sip_server: Arc<RwLock<Option<SipServerRef>>>,
+    app_state: Arc<RwLock<Option<Weak<AppStateInner>>>>,
+    i18n: Arc<I18n>,
+    perm_cache: Arc<Mutex<PermCache>>,
+    pub pending_reload: Arc<RwLock<BTreeSet<ReloadTarget>>>,
+    /// Addon-specific state storage using http::Extensions for type-safe access
+    addon_extensions: Arc<std::sync::RwLock<http::Extensions>>,
+}
+
+/// Trait for addon state types that can be stored in ConsoleState.
+pub trait AddonState: std::any::Any + Send + Sync + Clone + 'static {}
+
+impl<T: std::any::Any + Send + Sync + Clone + 'static> AddonState for T {}
+
+impl ConsoleState {
+    pub async fn initialize(db: DatabaseConnection, config: ConsoleConfig) -> Result<Arc<Self>> {
+        let key_material: [u8; 32] = Sha256::digest(config.session_secret.as_bytes()).into();
+        let session_key = key_material.to_vec();
+        let mut config = config;
+        config.base_path = normalize_base_path(&config.base_path);
+        config.api_prefix = normalize_api_prefix(&config.api_prefix);
+
+        let locale_config = LocaleConfig::from(&config);
+        let i18n = Arc::new(I18n::new(locale_config));
+
+        Ok(Arc::new(Self {
+            db,
+            config,
+            session_key,
+            sip_server: Arc::new(RwLock::new(None)),
+            app_state: Arc::new(RwLock::new(None)),
+            i18n,
+            perm_cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(PERM_CACHE_CAP).expect("non-zero cap"),
+            ))),
+            pending_reload: Arc::new(RwLock::new(BTreeSet::new())),
+            addon_extensions: Arc::new(std::sync::RwLock::new(http::Extensions::new())),
+        }))
+    }
+
+    // ------------------------------------------------------------------
+    // Rendering
+    // ------------------------------------------------------------------
+
+    /// Render a template using the default locale.
+    ///
+    /// Existing call-sites that don't need i18n can keep using this signature
+    /// unchanged.  For locale-aware rendering use `render_with_headers` or
+    /// `render_with_locale`.
+    pub fn render(&self, template: &str, ctx: serde_json::Value) -> Response {
+        let locale = self.i18n.default_locale().to_string();
+        self.render_with_locale(template, ctx, &locale)
+    }
+
+    /// Detect the request locale from cookie / Accept-Language and render.
+    pub fn render_with_headers(
+        &self,
+        template: &str,
+        ctx: serde_json::Value,
+        headers: &HeaderMap,
+    ) -> Response {
+        let locale = detect_locale(
+            headers,
+            self.i18n.available_locales(),
+            self.i18n.default_locale(),
+        );
+        self.render_with_locale(template, ctx, &locale)
+    }
+
+    /// Render a template with a specific locale.
+    pub fn render_with_locale(
+        &self,
+        template: &str,
+        ctx: serde_json::Value,
+        locale: &str,
+    ) -> Response {
+        let mut ctx = ctx;
+        if ctx.is_object()
+            && let Some(map) = ctx.as_object_mut()
+        {
+            map.entry("base_path")
+                .or_insert_with(|| serde_json::Value::String(self.base_path().to_string()));
+            map.entry("api_prefix")
+                .or_insert_with(|| serde_json::Value::String(self.api_prefix().to_string()));
+            map.entry("ws_handler")
+                .or_insert_with(|| serde_json::Value::String(self.ws_handler()));
+            map.entry("ice_servers_path")
+                .or_insert_with(|| serde_json::Value::String(self.ice_servers_path()));
+            // Inject addon sidebar items
+            if let Some(app_state) = self.app_state() {
+                let addon_items = app_state
+                    .addon_registry
+                    .get_sidebar_items(app_state.clone());
+                map.entry("addon_sidebar_items").or_insert_with(|| {
+                    serde_json::to_value(addon_items).unwrap_or(serde_json::Value::Null)
+                });
+            }
+            map.entry("logout_url")
+                .or_insert_with(|| serde_json::Value::String(self.url_for("/logout")));
+            map.entry("forgot_url")
+                .or_insert_with(|| serde_json::Value::String(self.forgot_url()));
+            map.entry("login_url")
+                .or_insert_with(|| serde_json::Value::String(self.url_for("/login")));
+            map.entry("register_url")
+                .or_insert_with(|| serde_json::Value::String(self.register_url(None)));
+            map.entry("username").or_insert(serde_json::Value::Null);
+            map.entry("email").or_insert(serde_json::Value::Null);
+            map.entry("site_version").or_insert_with(|| {
+                serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string())
+            });
+            map.entry("edition").or_insert_with(|| {
+                if cfg!(feature = "commerce") {
+                    serde_json::Value::String("commerce".to_string())
+                } else {
+                    serde_json::Value::String("community".to_string())
+                }
+            });
+            map.entry("site_name")
+                .or_insert_with(|| serde_json::Value::String("RustPBX".to_string()));
+            map.entry("page_title")
+                .or_insert_with(|| serde_json::Value::String("RustPBX admin".to_string()));
+            map.entry("site_description").or_insert_with(|| {
+                serde_json::Value::String("RustPBX - A Rust-based PBX system".to_string())
+            });
+            map.entry("site_url")
+                .or_insert_with(|| serde_json::Value::String("https://rustpbx.com".to_string()));
+            map.entry("site_footer").or_insert_with(|| {
+                serde_json::Value::String("© 2025 RustPBX. All rights reserved.".to_string())
+            });
+            let static_path = self.config().static_path();
+            map.entry("static_path")
+                .or_insert_with(|| serde_json::Value::String(static_path.clone()));
+            map.entry("site_logo").or_insert_with(|| {
+                serde_json::Value::String(format!("{}/images/logo.png", static_path))
+            });
+            map.entry("site_logo_mini").or_insert_with(|| {
+                serde_json::Value::String(format!("{}/images/logo-mini.png", static_path))
+            });
+            map.entry("favicon_url").or_insert_with(|| {
+                serde_json::Value::String(format!("{}/images/favicon.png", static_path))
+            });
+            map.entry("demo_mode")
+                .or_insert_with(|| serde_json::Value::Bool(self.config().demo_mode));
+            if let Some(ref alpine_js) = self.config.alpine_js {
+                map.entry("alpine_js")
+                    .or_insert_with(|| serde_json::Value::String(alpine_js.clone()));
+            }
+            if let Some(ref tailwind_js) = self.config.tailwind_js {
+                map.entry("tailwind_js")
+                    .or_insert_with(|| serde_json::Value::String(tailwind_js.clone()));
+            }
+            if let Some(ref chart_js) = self.config.chart_js {
+                map.entry("chart_js")
+                    .or_insert_with(|| serde_json::Value::String(chart_js.clone()));
+            }
+            if let Some(ref jssip_js) = self.config.jssip_js {
+                map.entry("jssip_js")
+                    .or_insert_with(|| serde_json::Value::String(jssip_js.clone()));
+            }
+
+            // ── i18n context injection ──────────────────────────────
+            map.entry("locale")
+                .or_insert_with(|| serde_json::Value::String(locale.to_string()));
+            map.entry("t")
+                .or_insert_with(|| self.i18n.get_translations_json(locale));
+            map.entry("available_locales")
+                .or_insert_with(|| self.i18n.available_locales_json());
+        }
+
+        let mut tmpl_env = Environment::new();
+
+        tmpl_env.add_filter(
+            "format",
+            |format_str: &str, value: minijinja::Value| -> Result<String, minijinja::Error> {
+                if let Ok(num) = f64::try_from(value.clone()) {
+                    if num == 0.0 {
+                        return Ok("0".to_string());
+                    }
+                    match format_str {
+                        "%.1f" => Ok(format!("{:.1}", num)),
+                        "%.2f" => Ok(format!("{:.2}", num)),
+                        "%.3f" => Ok(format!("{:.3}", num)),
+                        "%.4f" => Ok(format!("{:.4}", num)),
+                        "%.5f" => Ok(format!("{:.5}", num)),
+                        _ => Ok(format!("{}", num)),
+                    }
+                } else {
+                    Ok(value.to_string())
+                }
+            },
+        );
+
+        tmpl_env.add_filter(
+            "json",
+            |value: minijinja::Value| -> Result<String, minijinja::Error> {
+                serde_json::to_string(&value).map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("failed to serialize to json: {}", e),
+                    )
+                })
+            },
+        );
+
+        // ── t filter: {{ "nav.dashboard" | t }} ──────────────────────────
+        let i18n_t = self.i18n.clone();
+        let locale_t = locale.to_string();
+        tmpl_env.add_filter("t", move |key: &str| -> String { i18n_t.t(&locale_t, key) });
+
+        // ── tvars filter: {{ "messages.saved" | tvars({"name": ext.name}) }} ─
+        let i18n_tv = self.i18n.clone();
+        let locale_tv = locale.to_string();
+        tmpl_env.add_filter(
+            "tvars",
+            move |key: &str, vars: minijinja::Value| -> Result<String, minijinja::Error> {
+                let vars_map: std::collections::HashMap<String, String> =
+                    if let Ok(serde_json::Value::Object(m)) =
+                        serde_json::from_str::<serde_json::Value>(
+                            &serde_json::to_string(&vars).unwrap_or_default(),
+                        )
+                    {
+                        m.into_iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                            .collect()
+                    } else {
+                        Default::default()
+                    };
+                Ok(i18n_tv.t_with_vars(&locale_tv, key, &vars_map))
+            },
+        );
+
+        let base_path_for_fn = self.base_path().to_string();
+        tmpl_env.add_function(
+            "url_for",
+            move |suffix: &str| -> Result<String, minijinja::Error> {
+                let trimmed = suffix.trim();
+                if trimmed.is_empty() || trimmed == "/" {
+                    return Ok(format!("{}/", base_path_for_fn));
+                }
+                if trimmed.starts_with('/') {
+                    if base_path_for_fn == "/" {
+                        Ok(trimmed.to_string())
+                    } else {
+                        Ok(format!("{}{}", base_path_for_fn, trimmed))
+                    }
+                } else if base_path_for_fn == "/" {
+                    Ok(format!("/{}", trimmed))
+                } else {
+                    Ok(format!("{}/{}", base_path_for_fn, trimmed))
+                }
+            },
+        );
+
+        let mut paths = vec!["templates".to_string()];
+        if let Some(app_state) = self.app_state() {
+            paths.extend(
+                app_state
+                    .addon_registry
+                    .get_template_dirs(app_state.clone()),
+            );
+        }
+
+        tmpl_env.set_loader(move |name| {
+            for base in &paths {
+                let path = std::path::Path::new(base).join(name);
+                if path.exists() {
+                    return std::fs::read_to_string(path).map(Some).map_err(|_| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::TemplateNotFound,
+                            "failed to load template",
+                        )
+                    });
+                }
+            }
+            Ok(None)
+        });
+
+        RenderTemplate {
+            tmpl_env: &tmpl_env,
+            template_name: template,
+            context: &ctx,
+        }
+        .into_response()
+    }
+
+    pub async fn user_permissions(&self, user: &crate::models::user::Model) -> HashSet<String> {
+        if user.is_superuser {
+            let mut s = HashSet::new();
+            s.insert("*".to_string());
+            return s;
+        }
+
+        const TTL_SECS: u64 = 300;
+        if let Ok(mut cache) = self.perm_cache.lock()
+            && let Some((ts, perms)) = cache.get(&user.id)
+            && ts.elapsed().as_secs() < TTL_SECS
+        {
+            return perms.clone();
+        }
+
+        let perms = self.load_permissions_from_db(user.id).await;
+
+        if let Ok(mut cache) = self.perm_cache.lock() {
+            cache.put(user.id, (Instant::now(), perms.clone()));
+        }
+
+        perms
+    }
+
+    async fn load_permissions_from_db(&self, user_id: i64) -> HashSet<String> {
+        let role_ids = match user_role::Entity::find()
+            .filter(user_role::Column::UserId.eq(user_id))
+            .all(&self.db)
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|r| r.role_id).collect::<Vec<_>>(),
+            Err(_) => return HashSet::new(),
+        };
+
+        if role_ids.is_empty() {
+            return HashSet::new();
+        }
+
+        match role_permission::Entity::find()
+            .filter(role_permission::Column::RoleId.is_in(role_ids))
+            .all(&self.db)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|p| format!("{}:{}", p.resource, p.action))
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    pub async fn has_permission(
+        &self,
+        user: &crate::models::user::Model,
+        resource: &str,
+        action: &str,
+    ) -> bool {
+        if user.is_superuser {
+            return true;
+        }
+        let perms = self.user_permissions(user).await;
+        perms.contains(&format!("{}:{}", resource, action))
+    }
+
+    pub async fn require_permission(
+        &self,
+        user: &crate::models::user::Model,
+        resource: &str,
+        action: &str,
+    ) -> Result<(), Response> {
+        if self.has_permission(user, resource, action).await {
+            Ok(())
+        } else {
+            Err(crate::console::config_helpers::permission_denied())
+        }
+    }
+
+    pub async fn build_current_user_ctx(
+        &self,
+        user: &crate::models::user::Model,
+    ) -> serde_json::Value {
+        let perms = self.user_permissions(user).await;
+        let perm_list: Vec<String> = if user.is_superuser {
+            vec!["*".to_string()]
+        } else {
+            perms.iter().cloned().collect()
+        };
+        serde_json::json!({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "is_superuser": user.is_superuser,
+            "is_staff": user.is_staff,
+            "is_active": user.is_active,
+            "permissions": perm_list,
+            "can_manage_users": user.is_superuser || perms.contains("users:manage"),
+            "can_write_system": user.is_superuser || perms.contains("system:write"),
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Accessors
+    // ------------------------------------------------------------------
+
+    pub fn i18n(&self) -> &Arc<I18n> {
+        &self.i18n
+    }
+
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
+    pub fn mark_pending_reload(&self, target: ReloadTarget) {
+        self.pending_reload.write().unwrap().insert(target);
+    }
+
+    pub fn clear_pending_reload(&self, target: ReloadTarget) {
+        self.pending_reload.write().unwrap().remove(&target);
+    }
+
+    pub fn clear_all_pending_reload(&self) {
+        self.pending_reload.write().unwrap().clear();
+    }
+
+    pub fn pending_reload_targets(&self) -> BTreeSet<ReloadTarget> {
+        self.pending_reload.read().unwrap().clone()
+    }
+
+    pub fn set_sip_server(&self, server: Option<SipServerRef>) {
+        if let Ok(mut slot) = self.sip_server.write() {
+            *slot = server;
+        }
+    }
+
+    pub fn sip_server(&self) -> Option<SipServerRef> {
+        self.sip_server.read().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn set_app_state(&self, app_state: Option<Weak<AppStateInner>>) {
+        if let Ok(mut slot) = self.app_state.write() {
+            *slot = app_state;
+        }
+    }
+
+    pub fn app_state(&self) -> Option<Arc<AppStateInner>> {
+        self.app_state
+            .read()
+            .ok()
+            .and_then(|opt| opt.as_ref().and_then(|weak| weak.upgrade()))
+    }
+
+    pub fn config(&self) -> Arc<crate::config::Config> {
+        self.app_state()
+            .map(|s| s.config().clone())
+            .unwrap_or_else(|| Arc::new(crate::config::Config::default()))
+    }
+
+    pub fn get_injected_scripts(&self, path: &str) -> Option<Vec<String>> {
+        self.app_state().map(|app_state| {
+            app_state
+                .addon_registry
+                .get_injected_scripts(path, app_state.config())
+        })
+    }
+
+    /// Register an addon state by type.
+    /// The type itself serves as the key, providing compile-time safety.
+    pub fn insert_addon_state<T: AddonState>(&self, state: T) {
+        let mut ext = self.addon_extensions.write().unwrap();
+        ext.insert(state);
+    }
+
+    /// Get an addon state by type.
+    /// Returns None if the state of this type has not been registered.
+    pub fn get_addon_state<T: AddonState>(&self) -> Option<T> {
+        let ext = self.addon_extensions.read().unwrap();
+        ext.get::<T>().cloned()
+    }
+
+    pub fn url_for(&self, suffix: &str) -> String {
+        let trimmed = suffix.trim();
+        if trimmed.is_empty() || trimmed == "/" {
+            return format!("{}/", self.base_path());
+        }
+        if trimmed.starts_with('/') {
+            if self.base_path() == "/" {
+                trimmed.to_string()
+            } else {
+                format!("{}{}", self.base_path(), trimmed)
+            }
+        } else if self.base_path() == "/" {
+            format!("/{}", trimmed)
+        } else {
+            format!("{}/{}", self.base_path(), trimmed)
+        }
+    }
+
+    pub fn base_path(&self) -> &str {
+        &self.config.base_path
+    }
+
+    pub fn api_prefix(&self) -> &str {
+        &self.config.api_prefix
+    }
+
+    /// SIP WebSocket handler path (e.g. "/ws" or "/rustpbx/ws").
+    pub fn ws_handler(&self) -> String {
+        if let Some(app) = self.app_state() {
+            if let Some(v) = &app.config().proxy.ws_handler {
+                return v.clone();
+            }
+        }
+        if let Some(server) = self.sip_server() {
+            if let Some(v) = &server.proxy_config.ws_handler {
+                return v.clone();
+            }
+        }
+        "/ws".to_string()
+    }
+
+    /// ICE servers endpoint path (e.g. "/iceservers" or "/rustpbx/iceservers").
+    pub fn ice_servers_path(&self) -> String {
+        if let Some(app) = self.app_state() {
+            if let Some(v) = &app.config().proxy.ice_servers_path {
+                return v.clone();
+            }
+        }
+        if let Some(server) = self.sip_server() {
+            if let Some(v) = &server.proxy_config.ice_servers_path {
+                return v.clone();
+            }
+        }
+        "/iceservers".to_string()
+    }
+
+    /// Build API URL with the configured api_prefix
+    pub fn api_url_for(&self, suffix: &str) -> String {
+        let prefix = self.api_prefix();
+        let trimmed = suffix.trim();
+        if trimmed.is_empty() {
+            return prefix.to_string();
+        }
+        if trimmed.starts_with('/') {
+            format!("{}{}", prefix, trimmed)
+        } else {
+            format!("{}/{}", prefix, trimmed)
+        }
+    }
+
+    pub fn registration_allowed_by_config(&self) -> bool {
+        self.config.allow_registration
+    }
+
+    pub fn login_url(&self, next: Option<String>) -> String {
+        let mut url = self.url_for("/login");
+        if let Some(next) = next {
+            url.push_str(&format!("?next={}", next));
+        }
+        url
+    }
+
+    pub fn register_url(&self, next: Option<String>) -> String {
+        let mut url = self.url_for("/register");
+        if let Some(next) = next {
+            url.push_str(&format!("?next={}", next));
+        }
+        url
+    }
+
+    pub fn forgot_url(&self) -> String {
+        self.url_for("/forgot")
+    }
+
+    pub fn get_sip_server(&self) -> Option<SipServerRef> {
+        self.sip_server.read().unwrap().clone()
+    }
+}
+
+fn normalize_base_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "/console".to_string();
+    }
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    };
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "/console".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_api_prefix(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "/api".to_string();
+    }
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    };
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "/api".to_string()
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::console::handlers::test_helpers::setup_state;
+
+    use super::*;
+    use crate::config::ConsoleConfig;
+    use crate::models::migration::Migrator;
+    use crate::models::rbac::{self, user_role};
+    use chrono::Utc;
+    use sea_orm::{ActiveValue::Set, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    fn make_user(id: i64, is_superuser: bool) -> crate::models::user::Model {
+        let now = Utc::now();
+        crate::models::user::Model {
+            id,
+            email: format!("user{}@test.com", id),
+            username: format!("user{}", id),
+            password_hash: "x".into(),
+            reset_token: None,
+            reset_token_expires: None,
+            last_login_at: None,
+            last_login_ip: None,
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+            is_staff: false,
+            is_superuser,
+            mfa_enabled: false,
+            mfa_secret: None,
+            auth_source: "local".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn superuser_has_wildcard_permission() {
+        let state = setup_state().await;
+        let user = make_user(1, true);
+        let perms = state.user_permissions(&user).await;
+        assert!(perms.contains("*"));
+        assert!(state.has_permission(&user, "extensions", "delete").await);
+        assert!(state.has_permission(&user, "ami", "access").await);
+    }
+
+    #[tokio::test]
+    async fn user_without_roles_has_no_permissions() {
+        let state = setup_state().await;
+        let user = make_user(99, false);
+        let perms = state.user_permissions(&user).await;
+        assert!(perms.is_empty());
+        assert!(!state.has_permission(&user, "extensions", "read").await);
+    }
+
+    #[tokio::test]
+    async fn user_with_viewer_role_has_read_permissions() {
+        let state = setup_state().await;
+        let db = state.db();
+
+        let roles = rbac::Entity::find().all(db).await.expect("query roles");
+        let viewer = roles.iter().find(|r| r.name == "viewer").expect("viewer");
+
+        let user = make_user(200, false);
+        user_role::Entity::insert(user_role::ActiveModel {
+            user_id: Set(user.id),
+            role_id: Set(viewer.id),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        })
+        .exec(db)
+        .await
+        .expect("assign viewer role");
+
+        let perms = state.user_permissions(&user).await;
+        assert!(perms.contains("extensions:read"));
+        assert!(perms.contains("cdr:read"));
+        assert!(!perms.contains("extensions:write"));
+        assert!(!perms.contains("extensions:delete"));
+    }
+
+    #[tokio::test]
+    async fn build_current_user_ctx_contains_expected_fields() {
+        let state = setup_state().await;
+        let user = make_user(1, true);
+        let ctx = state.build_current_user_ctx(&user).await;
+        assert_eq!(ctx["id"], 1);
+        assert_eq!(ctx["is_superuser"], true);
+        assert_eq!(ctx["can_manage_users"], true);
+        assert_eq!(ctx["can_write_system"], true);
+        let perms = ctx["permissions"].as_array().expect("permissions array");
+        assert!(perms.iter().any(|p| p == "*"));
+    }
+
+    #[tokio::test]
+    async fn permission_cache_is_populated() {
+        let state = setup_state().await;
+        let user = make_user(300, false);
+        state.user_permissions(&user).await;
+        let cache = state.perm_cache.lock().expect("lock cache");
+        assert!(cache.contains(&300));
+    }
+
+    /// Regression: `PermCache` used to be an unbounded `HashMap` that kept
+    /// inactive users forever. The LRU cap must evict least-recently-used
+    /// entries so memory stays bounded regardless of how many distinct users
+    /// briefly query their permissions.
+    #[tokio::test]
+    async fn permission_cache_evicts_lru_entries_beyond_cap() {
+        let state = setup_state().await;
+        // PERM_CACHE_CAP+1 distinct users must fit into a PERM_CACHE_CAP cache.
+        for id in 0..(PERM_CACHE_CAP as i64 + 1) {
+            let user = make_user(id, false);
+            state.user_permissions(&user).await;
+        }
+        let cache = state.perm_cache.lock().expect("lock cache");
+        assert_eq!(cache.len(), PERM_CACHE_CAP, "cache should be at capacity");
+        // The very first user we inserted (id=0) must have been evicted.
+        assert!(
+            !cache.contains(&0),
+            "least-recently-used user should have been evicted"
+        );
+        // The most recent user must still be present.
+        assert!(cache.contains(&(PERM_CACHE_CAP as i64)));
+    }
+
+    #[tokio::test]
+    async fn pending_reload_mark_and_clear() {
+        let state = setup_state().await;
+
+        assert!(state.pending_reload_targets().is_empty());
+        state.mark_pending_reload(ReloadTarget::Routes);
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Routes)
+        );
+        state.clear_pending_reload(ReloadTarget::Routes);
+        assert!(state.pending_reload_targets().is_empty());
+
+        // Multiple targets can be pending independently
+        state.mark_pending_reload(ReloadTarget::Trunks);
+        state.mark_pending_reload(ReloadTarget::Queues);
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Trunks)
+        );
+        assert!(
+            state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Queues)
+        );
+        assert!(
+            !state
+                .pending_reload_targets()
+                .contains(&ReloadTarget::Routes)
+        );
+        state.clear_all_pending_reload();
+        assert!(state.pending_reload_targets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn base_path_and_api_prefix_work_correctly() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        // Test with custom paths
+        let mut config = ConsoleConfig::default();
+        config.base_path = "/admin".to_string();
+        config.api_prefix = "/v1/api".to_string();
+
+        let state = ConsoleState::initialize(db, config)
+            .await
+            .expect("initialize console state");
+
+        // Test base_path
+        assert_eq!(state.base_path(), "/admin");
+        assert_eq!(state.url_for("/login"), "/admin/login");
+        assert_eq!(state.url_for("/extensions"), "/admin/extensions");
+        assert_eq!(state.url_for(""), "/admin/");
+
+        // Test api_prefix
+        assert_eq!(state.api_prefix(), "/v1/api");
+        assert_eq!(state.api_url_for("/notifications"), "/v1/api/notifications");
+        assert_eq!(
+            state.api_url_for("/pending-reloads"),
+            "/v1/api/pending-reloads"
+        );
+        assert_eq!(state.api_url_for(""), "/v1/api");
+    }
+}

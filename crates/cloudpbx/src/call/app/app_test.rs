@@ -1,0 +1,748 @@
+//! Regression tests for the CallApp framework.
+//!
+//! All tests run against [`MockCallStack`] — no SIP socket, DB, or real media.
+
+#[cfg(test)]
+mod tests {
+    use crate::call::app::testing::MockCallStack;
+    use crate::call::app::{
+        AppAction, ApplicationContext, CallApp, CallAppType, CallController, DtmfCollectConfig,
+    };
+    use crate::call::domain::CallCommand;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    // ── shared helpers ────────────────────────────────────────────────────────
+
+    /// Log of events seen by an app, used to assert execution order.
+    type EventLog = Arc<Mutex<Vec<String>>>;
+
+    fn new_log() -> EventLog {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn logged(log: &EventLog) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    // ── 1. Basic lifecycle ────────────────────────────────────────────────────
+
+    /// App that answers, plays one audio clip, then hangs up when playback ends.
+    struct GreetAndHangupApp;
+
+    #[async_trait]
+    impl CallApp for GreetAndHangupApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Custom
+        }
+        fn name(&self) -> &str {
+            "greet-and-hangup"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            ctrl.play_audio("sounds/hello.wav", false).await?;
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_audio_complete(
+            &mut self,
+            _track_id: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            Ok(AppAction::Hangup {
+                reason: None,
+                code: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_lifecycle() {
+        let mut stack = MockCallStack::run(Box::new(GreetAndHangupApp), "1001", "1002");
+
+        // App should immediately answer on enter
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // App should play a prompt
+        stack
+            .assert_cmd(100, "PlayPrompt", |c| matches!(c, CallCommand::Play { .. }))
+            .await;
+
+        // Simulate audio finishing — app should hang up
+        stack.audio_complete("default");
+        stack
+            .assert_cmd(100, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+    }
+
+    // ── 2. DTMF routing ───────────────────────────────────────────────────────
+
+    struct DtmfMenuApp;
+
+    #[async_trait]
+    impl CallApp for DtmfMenuApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "dtmf-menu"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_dtmf(
+            &mut self,
+            digit: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            match digit.as_str() {
+                "1" => Ok(AppAction::Transfer("sip:sales@pbx".to_string())),
+                "9" => Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                }),
+                _ => Ok(AppAction::Continue),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dtmf_ignored_digit() {
+        let mut stack = MockCallStack::run(Box::new(DtmfMenuApp), "1001", "8000");
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Press an unmapped digit → no new command
+        stack.dtmf("5");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            stack.drain_cmds().is_empty(),
+            "expected no command for unmapped digit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dtmf_hangup_digit() {
+        let mut stack = MockCallStack::run(Box::new(DtmfMenuApp), "1001", "8000");
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        stack.dtmf("9");
+        stack
+            .assert_cmd(100, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+    }
+
+    // ── 3. Remote hangup handled gracefully ───────────────────────────────────
+
+    struct WaitForeverApp;
+
+    #[async_trait]
+    impl CallApp for WaitForeverApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Custom
+        }
+        fn name(&self) -> &str {
+            "wait-forever"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            Ok(AppAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_hangup_exits_loop() {
+        let mut stack = MockCallStack::run(Box::new(WaitForeverApp), "1001", "9000");
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Remote party hangs up — loop should exit cleanly
+        stack.remote_hangup();
+        stack
+            .join()
+            .await
+            .expect("loop should exit without error after remote hangup");
+    }
+
+    // ── 4. AppAction::Chain ───────────────────────────────────────────────────
+
+    /// First app in chain — plays a greeting then chains to SecondApp.
+    struct FirstApp;
+
+    #[async_trait]
+    impl CallApp for FirstApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "first"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_audio_complete(
+            &mut self,
+            _id: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            Ok(AppAction::Chain(Box::new(SecondApp)))
+        }
+    }
+
+    /// Second app — just hangs up immediately on enter.
+    struct SecondApp;
+
+    #[async_trait]
+    impl CallApp for SecondApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Voicemail
+        }
+        fn name(&self) -> &str {
+            "second"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.hangup(None, None).await?;
+            Ok(AppAction::Exit)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain() {
+        let mut stack = MockCallStack::run(Box::new(FirstApp), "1001", "1002");
+
+        // First app answers
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Trigger chain
+        stack.audio_complete("default");
+
+        // Second app hangs up
+        stack
+            .assert_cmd(100, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+    }
+
+    // ── 5. Named timers: set_timeout + on_timeout ─────────────────────────────
+
+    struct TimerApp {
+        log: EventLog,
+        fired_count: usize,
+    }
+
+    #[async_trait]
+    impl CallApp for TimerApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Queue
+        }
+        fn name(&self) -> &str {
+            "timer"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            ctrl.set_timeout("tick", Duration::from_millis(20));
+            self.log.lock().unwrap().push("enter".into());
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_timeout(
+            &mut self,
+            id: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            self.log.lock().unwrap().push(format!("timeout:{id}"));
+            self.fired_count += 1;
+            if self.fired_count >= 1 {
+                Ok(AppAction::Hangup {
+                    reason: None,
+                    code: None,
+                })
+            } else {
+                Ok(AppAction::Continue)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_timeout_fires_on_timeout() {
+        let log = new_log();
+        let app = TimerApp {
+            log: log.clone(),
+            fired_count: 0,
+        };
+        let mut stack = MockCallStack::run(Box::new(app), "1001", "2001");
+
+        // App answers on enter
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Timer fires after 20ms → on_timeout → Hangup
+        stack
+            .assert_cmd(200, "Hangup from timer", |c| {
+                matches!(c, CallCommand::Hangup(_))
+            })
+            .await;
+
+        assert_eq!(logged(&log), vec!["enter", "timeout:tick"]);
+    }
+
+    // ── 6. cancel_timeout suppresses fire ────────────────────────────────────
+
+    struct CancelTimerApp {
+        log: EventLog,
+    }
+
+    #[async_trait]
+    impl CallApp for CancelTimerApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Custom
+        }
+        fn name(&self) -> &str {
+            "cancel-timer"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            ctrl.set_timeout("never", Duration::from_millis(20));
+            ctrl.cancel_timeout("never"); // immediately suppress
+            self.log.lock().unwrap().push("enter".into());
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_timeout(
+            &mut self,
+            id: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            self.log.lock().unwrap().push(format!("timeout:{id}"));
+            Ok(AppAction::Hangup {
+                reason: None,
+                code: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_timeout_suppresses_fire() {
+        let log = new_log();
+        let app = CancelTimerApp { log: log.clone() };
+        let mut stack = MockCallStack::run(Box::new(app), "1001", "2002");
+
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Wait 60ms — cancelled timer must NOT fire
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            stack.drain_cmds().is_empty(),
+            "cancelled timer must not produce a command"
+        );
+        assert!(
+            !logged(&log).iter().any(|e| e.starts_with("timeout:")),
+            "on_timeout must not be called"
+        );
+
+        stack.cancel();
+        let _ = stack.join().await;
+    }
+
+    // ── 7. inter_digit_timeout in collect_dtmf ────────────────────────────────
+
+    /// App that uses collect_dtmf with a 30ms inter-digit gap.
+    struct CollectApp {
+        log: EventLog,
+    }
+
+    #[async_trait]
+    impl CallApp for CollectApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "collect"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            let digits = ctrl
+                .collect_dtmf(DtmfCollectConfig {
+                    min_digits: 1,
+                    max_digits: 4,
+                    timeout: Duration::from_millis(500),
+                    terminator: None,
+                    play_prompt: None,
+                    inter_digit_timeout: Some(Duration::from_millis(40)),
+                })
+                .await?;
+            self.log.lock().unwrap().push(format!("collected:{digits}"));
+            Ok(AppAction::Hangup {
+                reason: None,
+                code: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_dtmf_inter_digit_timeout() {
+        let log = new_log();
+        let app = CollectApp { log: log.clone() };
+        let mut stack = MockCallStack::run(Box::new(app), "1001", "3001");
+
+        // AcceptCall first
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        // Send two digits quickly
+        stack.dtmf("4");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stack.dtmf("2");
+
+        // Pause longer than inter_digit_timeout (40ms) → collection completes
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // App should now hang up
+        stack
+            .assert_cmd(200, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+
+        assert!(logged(&log).contains(&"collected:42".to_string()));
+    }
+
+    // ── 8. System cancellation ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cancel_exits_cleanly() {
+        let mut stack = MockCallStack::run(Box::new(WaitForeverApp), "1001", "9999");
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        stack.cancel();
+        stack
+            .join()
+            .await
+            .expect("cancelled loop should exit without error");
+    }
+
+    // ── 9. Transfer sends TransferTarget ─────────────────────────────────────
+
+    struct TransferApp;
+
+    #[async_trait]
+    impl CallApp for TransferApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "transfer"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            Ok(AppAction::Continue)
+        }
+
+        async fn on_dtmf(
+            &mut self,
+            digit: String,
+            _ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            if digit == "1" {
+                Ok(AppAction::Transfer("sip:2001@pbx".to_string()))
+            } else {
+                Ok(AppAction::Continue)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transfer_sends_transfer_target() {
+        let mut stack = MockCallStack::run(Box::new(TransferApp), "1001", "8000");
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        stack.dtmf("1");
+
+        stack
+            .assert_cmd(
+                200,
+                "TransferTarget",
+                |c| matches!(c, CallCommand::Transfer { target, .. } if target == "sip:2001@pbx"),
+            )
+            .await;
+
+        stack.join().await.expect("loop exits after transfer");
+    }
+
+    // ── 10. collect_dtmf with terminator ──────────────────────────────────────
+
+    struct CollectTerminatorApp {
+        log: EventLog,
+    }
+
+    #[async_trait]
+    impl CallApp for CollectTerminatorApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "collect-term"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            let digits = ctrl
+                .collect_dtmf(DtmfCollectConfig {
+                    min_digits: 1,
+                    max_digits: 8,
+                    timeout: Duration::from_millis(500),
+                    terminator: Some('#'),
+                    play_prompt: None,
+                    inter_digit_timeout: None,
+                })
+                .await?;
+            self.log.lock().unwrap().push(format!("collected:{digits}"));
+            Ok(AppAction::Hangup {
+                reason: None,
+                code: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_dtmf_terminator_stops_collection() {
+        let log = new_log();
+        let app = CollectTerminatorApp { log: log.clone() };
+        let mut stack = MockCallStack::run(Box::new(app), "1001", "4001");
+
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        stack.dtmf("4").dtmf("2").dtmf("#");
+
+        stack
+            .assert_cmd(300, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+
+        assert!(
+            logged(&log).contains(&"collected:42".to_string()),
+            "terminator should stop collection and exclude '#': {:?}",
+            logged(&log)
+        );
+    }
+
+    // ── 11. collect_dtmf hangup during collection ──────────────────────────────
+
+    struct CollectHangupApp;
+
+    #[async_trait]
+    impl CallApp for CollectHangupApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "collect-hangup"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            let _digits = ctrl
+                .collect_dtmf(DtmfCollectConfig {
+                    min_digits: 1,
+                    max_digits: 4,
+                    timeout: Duration::from_secs(10),
+                    terminator: None,
+                    play_prompt: None,
+                    inter_digit_timeout: None,
+                })
+                .await?;
+            Ok(AppAction::Exit)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_dtmf_exits_on_remote_hangup() {
+        let mut stack = MockCallStack::run(Box::new(CollectHangupApp), "1001", "5001");
+
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stack.remote_hangup();
+
+        let result = stack.join().await;
+        assert!(
+            result.is_err(),
+            "hangup during collection should propagate as error"
+        );
+    }
+
+    // ── 12. play_audio prompt before collect_dtmf ────────────────────────────
+
+    struct CollectWithPromptApp {
+        log: EventLog,
+    }
+
+    #[async_trait]
+    impl CallApp for CollectWithPromptApp {
+        fn app_type(&self) -> CallAppType {
+            CallAppType::Ivr
+        }
+        fn name(&self) -> &str {
+            "collect-prompt"
+        }
+
+        async fn on_enter(
+            &mut self,
+            ctrl: &mut CallController,
+            _ctx: &ApplicationContext,
+        ) -> Result<AppAction> {
+            ctrl.answer().await?;
+            let digits = ctrl
+                .collect_dtmf(DtmfCollectConfig {
+                    min_digits: 1,
+                    max_digits: 3,
+                    timeout: Duration::from_millis(500),
+                    terminator: Some('#'),
+                    play_prompt: Some("sounds/enter_pin.wav".to_string()),
+                    inter_digit_timeout: Some(Duration::from_millis(50)),
+                })
+                .await?;
+            self.log.lock().unwrap().push(format!("pin:{digits}"));
+            Ok(AppAction::Hangup {
+                reason: None,
+                code: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_dtmf_plays_prompt_then_collects() {
+        let log = new_log();
+        let app = CollectWithPromptApp { log: log.clone() };
+        let mut stack = MockCallStack::run(Box::new(app), "1001", "6001");
+
+        stack
+            .assert_cmd(100, "AcceptCall", |c| {
+                matches!(c, CallCommand::Answer { .. })
+            })
+            .await;
+
+        stack
+            .assert_cmd(200, "PlayPrompt-pin", |c| {
+                matches!(c, CallCommand::Play { .. })
+            })
+            .await;
+
+        stack.dtmf("7").dtmf("8").dtmf("9");
+
+        stack
+            .assert_cmd(300, "Hangup", |c| matches!(c, CallCommand::Hangup(_)))
+            .await;
+
+        assert!(
+            logged(&log).contains(&"pin:789".to_string()),
+            "expected digits 789: {:?}",
+            logged(&log)
+        );
+    }
+}

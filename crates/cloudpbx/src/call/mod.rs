@@ -1,0 +1,1508 @@
+use crate::{
+    config::{MediaProxyMode, RecordingPolicy, RouteResult},
+    media::recorder::RecorderOption,
+    proxy::routing::VideoPolicy,
+};
+use anyhow::Result;
+use audio_codec::CodecType;
+use rsipstack::sip::{StatusCode, Transport};
+use rsipstack::{
+    dialog::{authenticate::Credential, invitation::InviteOption},
+    transport::SipAddr,
+};
+use rustrtc::IceServer;
+use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+pub mod adapters;
+pub mod app;
+pub mod cookie;
+pub mod domain;
+pub mod policy;
+pub mod queue_config;
+pub mod runtime;
+pub mod sip;
+pub mod user;
+pub use cookie::{
+    CalleeDisplayName, CalleeOfflineMarker, SourceAddress, TenantId, TransactionCookie,
+    TrunkContext,
+};
+pub use user::SipUser;
+
+pub struct RouteContext<'a> {
+    pub caller: rsipstack::sip::Uri,
+    pub callee: rsipstack::sip::Uri,
+    pub original_request: &'a rsipstack::sip::Request,
+    pub captures: &'a std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallFailureType {
+    NoAnswer,
+    Busy,
+    Declined,
+    Offline,
+    Timeout,
+}
+
+#[async_trait::async_trait]
+pub trait CallAppFactory: Send + Sync {
+    async fn create_app(
+        &self,
+        app_name: &str,
+        context: &RouteContext<'_>,
+        params: &serde_json::Value,
+    ) -> Option<Box<dyn app::CallApp>>;
+}
+
+#[async_trait::async_trait]
+pub trait CallFailureHandler: Send + Sync {
+    async fn on_call_failure(
+        &self,
+        context: &RouteContext<'_>,
+        failure_type: CallFailureType,
+    ) -> Option<Box<dyn app::CallApp>>;
+}
+
+/// Default hold audio that ships with config/sounds, relocated in Dockerfile to /app/sounds.
+pub const DEFAULT_QUEUE_HOLD_AUDIO: &str = "config/sounds/phone-calling.wav";
+/// Default prompt played when a queue cannot find an available agent.
+pub const DEFAULT_QUEUE_FAILURE_AUDIO: &str = "config/sounds/unavailable-phone.wav";
+
+// --- Built-in voice prompts for queue events ---
+
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_ZH: &str = "config/sounds/queue-transfer-zh.wav";
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_EN: &str = "config/sounds/queue-transfer-en.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_ZH: &str = "config/sounds/queue-busy-zh.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_EN: &str = "config/sounds/queue-busy-en.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH: &str = "config/sounds/queue-off-hours-zh.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN: &str = "config/sounds/queue-off-hours-en.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH: &str = "config/sounds/queue-no-answer-zh.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN: &str = "config/sounds/queue-no-answer-en.wav";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoicePrompts {
+    #[serde(default)]
+    pub transfer_prompt: Option<String>,
+    #[serde(default)]
+    pub busy_prompt: Option<String>,
+    #[serde(default)]
+    pub off_hours_prompt: Option<String>,
+    #[serde(default)]
+    pub no_answer_prompt: Option<String>,
+    /// Audio file to play for queue-position announcement.
+    /// The file should contain a pre-recorded message such as
+    /// "You are number N in the queue" that the operator supplies.
+    #[serde(default)]
+    pub position_prompt: Option<String>,
+    /// Audio file to play for estimated-wait-time announcement.
+    #[serde(default)]
+    pub wait_time_prompt: Option<String>,
+    /// Audio file played before the final destination (voicemail/external number)
+    /// when all escalation timeouts are exhausted.
+    #[serde(default)]
+    pub final_destination_prompt: Option<String>,
+    /// Audio file played to offer the callback option (e.g. "Press 2 for a callback").
+    #[serde(default)]
+    pub callback_offer_prompt: Option<String>,
+    /// Audio file played after the caller confirms callback request.
+    #[serde(default)]
+    pub callback_confirm_prompt: Option<String>,
+    /// Multi-stage comfort/reassurance prompts played during wait.
+    #[serde(default)]
+    pub comfort_prompts: Vec<ComfortPrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComfortPrompt {
+    pub audio_file: String,
+    /// Interval in seconds between consecutive plays of this prompt.
+    #[serde(default = "default_comfort_interval")]
+    pub interval_secs: u32,
+    /// Sort order for drag-and-drop reordering.
+    pub order: u32,
+}
+
+fn default_comfort_interval() -> u32 {
+    30
+}
+
+impl VoicePrompts {
+    pub fn zh() -> Self {
+        Self {
+            transfer_prompt: Some(DEFAULT_QUEUE_TRANSFER_PROMPT_ZH.to_string()),
+            busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_ZH.to_string()),
+            off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH.to_string()),
+            no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH.to_string()),
+            position_prompt: None,
+            wait_time_prompt: None,
+            final_destination_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+            comfort_prompts: Vec::new(),
+        }
+    }
+
+    pub fn en() -> Self {
+        Self {
+            transfer_prompt: Some(DEFAULT_QUEUE_TRANSFER_PROMPT_EN.to_string()),
+            busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_EN.to_string()),
+            off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN.to_string()),
+            no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN.to_string()),
+            position_prompt: None,
+            wait_time_prompt: None,
+            final_destination_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+            comfort_prompts: Vec::new(),
+        }
+    }
+}
+
+impl Default for VoicePrompts {
+    fn default() -> Self {
+        Self::zh()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Location {
+    pub aor: rsipstack::sip::Uri,
+    pub expires: u32,
+    pub destination: Option<SipAddr>,
+    pub last_modified: Option<Instant>,
+    pub supports_webrtc: bool,
+    pub credential: Option<Credential>,
+    pub headers: Option<Vec<rsipstack::sip::Header>>,
+    pub registered_aor: Option<rsipstack::sip::Uri>,
+    pub contact_raw: Option<String>,
+    pub contact_params: Option<HashMap<String, String>>,
+    pub path: Option<Vec<rsipstack::sip::Uri>>,
+    pub service_route: Option<Vec<rsipstack::sip::Uri>>,
+    pub instance_id: Option<String>,
+    pub gruu: Option<String>,
+    pub temp_gruu: Option<String>,
+    pub reg_id: Option<String>,
+    pub transport: Option<Transport>,
+    pub user_agent: Option<String>,
+    pub home_proxy: Option<SipAddr>,
+}
+
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let is_webrtc = if self.supports_webrtc { ",webrtc" } else { "" };
+        let fallback = self.aor.to_string();
+        let contact = self.contact_raw.as_deref().unwrap_or(fallback.as_str());
+        let home = self
+            .home_proxy
+            .as_ref()
+            .map(|h| format!("[home={}]", h))
+            .unwrap_or_default();
+        match &self.destination {
+            Some(d) => write!(f, "({} -> {} {}{})", contact, d, is_webrtc, home),
+            None => write!(f, "({} -> ? {}{})", contact, is_webrtc, home),
+        }
+    }
+}
+
+impl std::fmt::Debug for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Location")
+            .field("aor", &self.aor)
+            .field("expires", &self.expires)
+            .field("destination", &self.destination)
+            .field("last_modified", &self.last_modified)
+            .field("supports_webrtc", &self.supports_webrtc)
+            .field("headers", &self.headers)
+            .field("registered_aor", &self.registered_aor)
+            .field("contact_raw", &self.contact_raw)
+            .field("contact_params", &self.contact_params)
+            .field("path", &self.path)
+            .field("service_route", &self.service_route)
+            .field("instance_id", &self.instance_id)
+            .field("gruu", &self.gruu)
+            .field("temp_gruu", &self.temp_gruu)
+            .field("reg_id", &self.reg_id)
+            .field("transport", &self.transport)
+            .field("user_agent", &self.user_agent)
+            .field("home_proxy", &self.home_proxy)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Location {
+    pub fn binding_key(&self) -> String {
+        if let Some(instance) = &self.instance_id {
+            return format!("{}|instance={}", self.aor, instance);
+        }
+        if let Some(gruu) = &self.gruu {
+            return format!("{}|gruu={}", self.aor, gruu);
+        }
+        self.aor.to_string()
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        if self.expires == 0 {
+            return true;
+        }
+        if let Some(last_modified) = self.last_modified {
+            let ttl = std::time::Duration::from_secs(self.expires as u64);
+            return now.duration_since(last_modified) >= ttl;
+        }
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum DialStrategy {
+    Sequential(Vec<Location>),
+    Parallel(Vec<Location>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferEndpoint {
+    /// Raw SIP URI or plain extension number.
+    Uri(String),
+    Queue(String),
+    /// Forward to an IVR project by name (config/ivr/<name>.toml).
+    Ivr(String),
+    /// Forward to a voicemail mailbox identified by extension.
+    Voicemail(String),
+    /// Conference room identified by ID.
+    Conference(String),
+}
+
+impl TransferEndpoint {
+    /// Parse a prefix‑based destination string.
+    ///
+    /// Handles `queue:`, `ivr:`, `voicemail:`, `conference:`.
+    /// Plain strings (no recognised prefix) are returned as `Uri(String)`.
+    /// Does **not** add a `sip:` scheme – callers that need it should use
+    /// [`build_sip_uri`] afterwards.
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let prefixes: &[(&str, fn(String) -> TransferEndpoint)] = &[
+            ("queue:", |v| TransferEndpoint::Queue(v)),
+            ("ivr:", |v| TransferEndpoint::Ivr(v)),
+            ("voicemail:", |v| TransferEndpoint::Voicemail(v)),
+            ("conference:", |v| TransferEndpoint::Conference(v)),
+        ];
+
+        for (prefix, ctor) in prefixes {
+            if trimmed.len() >= prefix.len()
+                && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            {
+                let name = trimmed[prefix.len()..].trim();
+                if name.is_empty() {
+                    return None;
+                }
+                return Some(ctor(name.to_string()));
+            }
+        }
+
+        Some(TransferEndpoint::Uri(trimmed.to_string()))
+    }
+}
+
+impl std::fmt::Display for TransferEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferEndpoint::Uri(uri) => write!(f, "{}", uri),
+            TransferEndpoint::Queue(name) => write!(f, "queue:{}", name),
+            TransferEndpoint::Ivr(name) => write!(f, "ivr:{}", name),
+            TransferEndpoint::Voicemail(ext) => write!(f, "voicemail:{}", ext),
+            TransferEndpoint::Conference(id) => write!(f, "conference:{}", id),
+        }
+    }
+}
+
+/// Normalize a SIP URI target string by adding the `sip:` scheme and default
+/// realm when the host part is missing.
+///
+/// Rules:
+/// - `"sip:user@host"` → unchanged
+/// - `"sip:user"`      → `"sip:user@<realm>"`
+/// - `"user@host"`     → `"sip:user@host"`
+/// - `"user"`          → `"sip:user@<realm>"`
+/// - `"tel:+"`         → unchanged
+pub fn build_sip_uri(target: &str, realm: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return format!("sip:anonymous@{}", realm);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("sip:") {
+        if rest.contains('@') {
+            // "sip:user@host" → pass through
+            trimmed.to_string()
+        } else {
+            // "sip:user" → "sip:user@realm"
+            format!("sip:{}@{}", rest, realm)
+        }
+    } else if let Some(_rest) = trimmed.strip_prefix("tel:") {
+        // tel: URIs are passed as-is
+        trimmed.to_string()
+    } else if trimmed.contains('@') {
+        // "user@host" → "sip:user@host"
+        format!("sip:{}", trimmed)
+    } else {
+        // "user" → "sip:user@realm"
+        format!("sip:{}@{}", trimmed, realm)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallForwardingMode {
+    Always,
+    WhenBusy,
+    WhenNoAnswer,
+}
+
+pub const CALL_FORWARDING_TIMEOUT_MIN_SECS: u64 = 5;
+pub const CALL_FORWARDING_TIMEOUT_MAX_SECS: u64 = 120;
+pub const CALL_FORWARDING_TIMEOUT_DEFAULT_SECS: u64 = 30;
+
+#[derive(Debug, Clone)]
+pub struct CallForwardingConfig {
+    pub mode: CallForwardingMode,
+    pub endpoint: TransferEndpoint,
+    pub timeout: Duration,
+}
+
+impl CallForwardingConfig {
+    pub fn new(mode: CallForwardingMode, endpoint: TransferEndpoint, timeout_secs: u64) -> Self {
+        let clamped = timeout_secs.clamp(
+            CALL_FORWARDING_TIMEOUT_MIN_SECS,
+            CALL_FORWARDING_TIMEOUT_MAX_SECS,
+        );
+        let timeout = Duration::from_secs(clamped);
+        Self {
+            mode,
+            endpoint,
+            timeout,
+        }
+    }
+
+    pub fn clamp_timeout(value: i64) -> u64 {
+        if value <= 0 {
+            return CALL_FORWARDING_TIMEOUT_DEFAULT_SECS;
+        }
+        value.clamp(
+            CALL_FORWARDING_TIMEOUT_MIN_SECS as i64,
+            CALL_FORWARDING_TIMEOUT_MAX_SECS as i64,
+        ) as u64
+    }
+}
+
+impl std::fmt::Display for DialStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialStrategy::Sequential(locations) => {
+                write!(
+                    f,
+                    "Sequential: [{}]",
+                    locations
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            DialStrategy::Parallel(locations) => {
+                write!(
+                    f,
+                    "Parallel: [{}]",
+                    locations
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum RingbackMode {
+    Local,
+    Passthrough,
+    #[default]
+    Auto,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingbackConfig {
+    #[serde(default)]
+    pub mode: RingbackMode,
+    pub audio_file: Option<String>,
+    #[serde(default = "default_ringback_loop")]
+    pub loop_playback: bool,
+    #[serde(default)]
+    pub wait_for_completion: bool,
+}
+
+fn default_ringback_loop() -> bool {
+    true
+}
+
+impl Default for RingbackConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RingbackConfig {
+    pub fn new() -> Self {
+        Self {
+            mode: RingbackMode::Auto,
+            audio_file: None,
+            loop_playback: true,
+            wait_for_completion: false,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: RingbackMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_audio_file(mut self, file: String) -> Self {
+        self.audio_file = Some(file);
+        self
+    }
+
+    pub fn with_loop(mut self, loop_playback: bool) -> Self {
+        self.loop_playback = loop_playback;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueHoldConfig {
+    pub audio_file: Option<String>,
+    pub loop_playback: bool,
+}
+
+impl Default for QueueHoldConfig {
+    fn default() -> Self {
+        Self {
+            audio_file: None,
+            loop_playback: true,
+        }
+    }
+}
+
+impl QueueHoldConfig {
+    pub fn with_audio_file(mut self, file: String) -> Self {
+        self.audio_file = Some(file);
+        self
+    }
+
+    pub fn with_loop_playback(mut self, loop_playback: bool) -> Self {
+        self.loop_playback = loop_playback;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum QueueFallbackAction {
+    /// Reuse existing failure behaviors
+    Failure(FailureAction),
+    /// Redirect to a specific SIP URI (e.g., external voicemail)
+    Redirect { target: rsipstack::sip::Uri },
+    /// Transfer caller to another named queue or skill group.
+    /// Skill groups are identified by the "skill-group:" prefix in the name.
+    Queue { name: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuePlan {
+    pub accept_immediately: bool,
+    pub passthrough_ringback: bool,
+    pub hold: Option<QueueHoldConfig>,
+    pub fallback: Option<QueueFallbackAction>,
+    pub dial_strategy: Option<DialStrategy>,
+    pub ring_timeout: Option<Duration>,
+    pub label: Option<String>,
+    pub retry_codes: Option<Vec<u16>>,
+    pub no_trying_timeout: Option<Duration>,
+    pub voice_prompts: Option<VoicePrompts>,
+    pub queue_name: String,
+    /// Optional audio file to play when the queue fails, before executing the
+    /// fallback action (hangup, return to IVR, redirect, etc.).
+    /// This separates the "notification audio" from the "final action" so that
+    /// any fallback type can still play a prompt before acting.
+    pub failure_audio: Option<String>,
+}
+
+impl Default for QueuePlan {
+    fn default() -> Self {
+        Self {
+            accept_immediately: false,
+            passthrough_ringback: false,
+            hold: Some(
+                QueueHoldConfig::default().with_audio_file(DEFAULT_QUEUE_HOLD_AUDIO.to_string()),
+            ),
+            fallback: Some(QueueFallbackAction::Failure(
+                FailureAction::PlayThenHangup {
+                    audio_file: DEFAULT_QUEUE_FAILURE_AUDIO.to_string(),
+                    use_early_media: false,
+                    status_code: StatusCode::TemporarilyUnavailable,
+                    reason: Some("All agents are currently unavailable".to_string()),
+                },
+            )),
+            dial_strategy: None,
+            ring_timeout: None,
+            label: None,
+            retry_codes: None,
+            no_trying_timeout: None,
+            voice_prompts: None,
+            queue_name: String::new(),
+            failure_audio: None,
+        }
+    }
+}
+
+impl QueuePlan {
+    pub fn dial_strategy(&self) -> Option<&DialStrategy> {
+        self.dial_strategy.as_ref()
+    }
+
+    pub fn passthrough_ringback(&self) -> bool {
+        self.passthrough_ringback
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum DialplanFlow {
+    Targets(DialStrategy),
+    Queue {
+        plan: QueuePlan,
+        next: Box<DialplanFlow>,
+    },
+    /// Route directly to a call application (voicemail, IVR, etc.)
+    Application {
+        app_name: String,
+        app_params: Option<serde_json::Value>,
+        auto_answer: bool,
+    },
+}
+
+impl DialplanFlow {
+    fn replace_terminal(current: DialplanFlow, new_terminal: DialplanFlow) -> DialplanFlow {
+        match current {
+            DialplanFlow::Queue { plan, next } => DialplanFlow::Queue {
+                plan,
+                next: Box::new(Self::replace_terminal(*next, new_terminal)),
+            },
+            _ => new_terminal,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            DialplanFlow::Targets(strategy) => match strategy {
+                DialStrategy::Sequential(targets) | DialStrategy::Parallel(targets) => {
+                    targets.is_empty()
+                }
+            },
+            DialplanFlow::Queue { .. } => false,
+            DialplanFlow::Application { .. } => false,
+        }
+    }
+
+    pub fn get_queue_plan_recursive(&self) -> Option<QueuePlan> {
+        match self {
+            DialplanFlow::Queue { plan, .. } => Some(plan.clone()),
+            _ => None,
+        }
+    }
+
+    fn all_webrtc_target(&self) -> bool {
+        match self {
+            DialplanFlow::Targets(strategy) => match strategy {
+                DialStrategy::Sequential(targets) | DialStrategy::Parallel(targets) => {
+                    !targets.is_empty() && targets.iter().all(|loc| loc.supports_webrtc)
+                }
+            },
+            DialplanFlow::Queue { plan, next } => {
+                if let Some(strategy) = &plan.dial_strategy {
+                    let targets = match strategy {
+                        DialStrategy::Sequential(t) | DialStrategy::Parallel(t) => t,
+                    };
+                    if !targets.is_empty() {
+                        return targets.iter().all(|loc| loc.supports_webrtc);
+                    }
+                }
+                next.all_webrtc_target()
+            }
+            DialplanFlow::Application { .. } => false,
+        }
+    }
+
+    fn find_targets(&self) -> Option<&Vec<Location>> {
+        match self {
+            DialplanFlow::Targets(strategy) => match strategy {
+                DialStrategy::Sequential(targets) | DialStrategy::Parallel(targets) => {
+                    Some(targets)
+                }
+            },
+            DialplanFlow::Queue { next, .. } => next.find_targets(),
+            DialplanFlow::Application { .. } => None,
+        }
+    }
+
+    fn is_parallel(&self) -> bool {
+        match self {
+            DialplanFlow::Targets(DialStrategy::Parallel(_)) => true,
+            DialplanFlow::Queue { next, .. } => next.is_parallel(),
+            _ => false,
+        }
+    }
+
+    fn has_queue(&self) -> bool {
+        matches!(self, DialplanFlow::Queue { .. })
+    }
+
+    fn has_queue_hold_audio(&self) -> bool {
+        match self {
+            DialplanFlow::Queue { plan, next } => {
+                let hold_audio = plan
+                    .hold
+                    .as_ref()
+                    .and_then(|hold| hold.audio_file.as_ref())
+                    .is_some();
+                hold_audio || next.has_queue_hold_audio()
+            }
+            _ => false,
+        }
+    }
+}
+/// Recording configuration for call control
+#[derive(Debug, Clone, Default)]
+pub struct CallRecordingConfig {
+    /// Enable call recording
+    pub enabled: bool,
+    /// Recording configuration
+    pub option: Option<RecorderOption>,
+    /// Auto start recording when call is answered
+    pub auto_start: bool,
+    /// When true, use the legacy WAV file recorder instead of SipFlow for
+    /// media capture. SipFlow captures SIP signalling only.
+    pub force_file: bool,
+}
+
+impl CallRecordingConfig {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            option: None,
+            auto_start: true,
+            force_file: false,
+        }
+    }
+
+    pub fn enabled(mut self) -> Self {
+        self.enabled = true;
+        self
+    }
+
+    pub fn with_config(mut self, config: RecorderOption) -> Self {
+        self.option = Some(config);
+        self
+    }
+}
+
+/// Failure handling strategy for call control
+#[derive(Debug, Clone)]
+pub enum FailureAction {
+    /// Hangup with specific status code
+    Hangup {
+        code: Option<StatusCode>,
+        reason: Option<String>,
+    },
+
+    /// Play audio file and then hangup
+    PlayThenHangup {
+        /// Audio file to play
+        audio_file: String,
+
+        /// Whether to use 183 early media (true) or 200 OK (false) for playback
+        use_early_media: bool,
+
+        /// Final status code to send after playback
+        status_code: StatusCode,
+
+        /// Optional reason phrase
+        reason: Option<String>,
+    },
+
+    /// Transfer to another destination
+    Transfer(TransferEndpoint),
+}
+
+impl Default for FailureAction {
+    fn default() -> Self {
+        Self::Hangup {
+            code: None,
+            reason: None,
+        }
+    }
+}
+
+/// Media configuration for call control
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaConfig {
+    /// Media proxy mode
+    pub proxy_mode: MediaProxyMode,
+    pub external_ip: Option<String>,
+    pub rtp_start_port: Option<u16>,
+    pub rtp_end_port: Option<u16>,
+    pub webrtc_port_start: Option<u16>,
+    pub webrtc_port_end: Option<u16>,
+    pub ice_servers: Option<Vec<IceServer>>,
+    pub enable_latching: bool,
+    /// Video policy: pass-through or strip video from SDP
+    pub video_policy: Option<VideoPolicy>,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MediaConfig {
+    pub fn new() -> Self {
+        Self {
+            proxy_mode: MediaProxyMode::Auto,
+            external_ip: None,
+            rtp_start_port: None,
+            rtp_end_port: None,
+            webrtc_port_start: None,
+            webrtc_port_end: None,
+            ice_servers: None,
+            enable_latching: true,
+            video_policy: None,
+        }
+    }
+
+    pub fn with_video_policy(mut self, policy: Option<VideoPolicy>) -> Self {
+        self.video_policy = policy;
+        self
+    }
+
+    pub fn with_proxy_mode(mut self, mode: MediaProxyMode) -> Self {
+        self.proxy_mode = mode;
+        self
+    }
+
+    pub fn with_external_ip(mut self, ip: Option<String>) -> Self {
+        self.external_ip = ip;
+        self
+    }
+
+    pub fn with_ice_servers(mut self, servers: Option<Vec<IceServer>>) -> Self {
+        self.ice_servers = servers;
+        self
+    }
+
+    pub fn with_rtp_start_port(mut self, start: Option<u16>) -> Self {
+        self.rtp_start_port = start;
+        self
+    }
+    pub fn with_rtp_end_port(mut self, end: Option<u16>) -> Self {
+        self.rtp_end_port = end;
+        self
+    }
+    pub fn with_webrtc_start_port(mut self, start: Option<u16>) -> Self {
+        self.webrtc_port_start = start;
+        self
+    }
+    pub fn with_webrtc_end_port(mut self, end: Option<u16>) -> Self {
+        self.webrtc_port_end = end;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DialDirection {
+    Outbound, // 1. Outbound call initiated by us, usually to a PSTN gateway or another relay server
+    Inbound,  // 2. Inbound call received by us, usually from a PSTN gateway
+    Internal, // 3. User to user call, both sides are internal
+}
+
+impl std::fmt::Display for DialDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialDirection::Outbound => write!(f, "outbound"),
+            DialDirection::Inbound => write!(f, "inbound"),
+            DialDirection::Internal => write!(f, "internal"),
+        }
+    }
+}
+
+pub struct Dialplan {
+    pub direction: DialDirection,
+    pub call_id: Option<String>,
+    pub session_id: Option<String>,
+    pub caller_contact: Option<rsipstack::sip::typed::Contact>,
+    pub caller_display_name: Option<String>,
+    pub caller: Option<rsipstack::sip::Uri>,
+    pub flow: DialplanFlow,
+    /// Max ring time for call setup/ringback phase
+    pub max_ring_time: Duration,
+    pub original: Arc<rsipstack::sip::Request>,
+    // Enhanced call control options
+    /// Recording configuration
+    pub recording: CallRecordingConfig,
+    /// Optional route/trunk-specific recording policy override.
+    pub recording_policy: Option<RecordingPolicy>,
+    /// Ringback configuration
+    pub ringback: RingbackConfig,
+    /// Media configuration
+    pub media: MediaConfig,
+    /// Maximum call duration
+    pub max_call_duration: Option<Duration>,
+    /// RTP timeout per direction (None = use proxy default)
+    pub rtp_timeout: Option<Duration>,
+    /// What to do when a call fails
+    pub failure_action: FailureAction,
+    /// Enable SIP flow recording (SIP message logging)
+    pub enable_sipflow: bool,
+
+    pub call_forwarding: Option<CallForwardingConfig>,
+    /// Whether voicemail is enabled for the callee extension.
+    /// `true` means the callee has voicemail active (i.e. `voicemail_disabled == false`).
+    /// Populated by the proxy layer after resolving the callee user; defaults to `false`.
+    pub voicemail_enabled: bool,
+
+    pub route_invite: Option<Box<dyn RouteInvite>>,
+    pub with_original_headers: bool,
+    pub extensions: http::Extensions,
+    pub allow_codecs: Vec<CodecType>,
+    pub passthrough_failure: bool,
+
+    /// Optional per-trunk ringback/early-media audio configuration
+    pub audio_profile: Option<crate::proxy::routing::RingbackAudio>,
+
+    /// Headers modified/added by routing (rewrite rules, trunk config, HTTP router).
+    /// When present, these take priority over the original SIP request headers
+    /// when building CallInfo for application flows (IVR, voicemail, etc.).
+    pub routed_headers: Option<Vec<rsipstack::sip::Header>>,
+}
+
+impl std::fmt::Debug for Dialplan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dialplan")
+            .field("direction", &self.direction)
+            .field("session_id", &self.session_id)
+            .field("caller", &self.caller)
+            .field("flow", &self.flow)
+            .field("max_ring_time", &self.max_ring_time)
+            .field("recording", &self.recording)
+            .field("media", &self.media)
+            .field("max_call_duration", &self.max_call_duration)
+            .field("rtp_timeout", &self.rtp_timeout)
+            .field("enable_sipflow", &self.enable_sipflow)
+            .finish()
+    }
+}
+
+impl Dialplan {
+    pub fn is_empty(&self) -> bool {
+        self.flow.is_empty()
+    }
+
+    pub fn all_webrtc_target(&self) -> bool {
+        self.flow.all_webrtc_target()
+    }
+    /// Create a new dialplan with basic configuration
+    pub fn new(
+        session_id: String,
+        original: rsipstack::sip::Request,
+        direction: DialDirection,
+    ) -> Self {
+        Self {
+            direction,
+            session_id: Some(session_id),
+            call_id: None,
+            original: Arc::new(original),
+            caller_display_name: None,
+            caller: None,
+            caller_contact: None,
+            flow: DialplanFlow::Targets(DialStrategy::Sequential(vec![])),
+            max_ring_time: Duration::from_secs(60), // 60 seconds for ringback
+            recording: CallRecordingConfig::default(),
+            recording_policy: None,
+            ringback: RingbackConfig::default(),
+            media: MediaConfig::default(),
+            max_call_duration: Some(Duration::from_secs(3600)), // 1 hour
+            rtp_timeout: None,
+            failure_action: FailureAction::default(),
+            enable_sipflow: true, // Enable SIP flow recording by default
+            call_forwarding: None,
+            voicemail_enabled: false,
+            route_invite: None,
+            with_original_headers: true,
+            extensions: http::Extensions::new(),
+            allow_codecs: vec![],
+            passthrough_failure: false,
+            audio_profile: None,
+            routed_headers: None,
+        }
+    }
+
+    /// Set the caller URI
+    pub fn with_caller(mut self, caller: rsipstack::sip::Uri) -> Self {
+        self.caller = Some(caller);
+        self
+    }
+    pub fn with_targets(mut self, targets: DialStrategy) -> Self {
+        self.set_terminal_flow(DialplanFlow::Targets(targets));
+        self
+    }
+
+    pub fn with_application(
+        mut self,
+        app_name: String,
+        app_params: Option<serde_json::Value>,
+        auto_answer: bool,
+    ) -> Self {
+        self.flow = DialplanFlow::Application {
+            app_name,
+            app_params,
+            auto_answer,
+        };
+        self
+    }
+
+    pub fn with_recording(mut self, recording: CallRecordingConfig) -> Self {
+        self.recording = recording;
+        self
+    }
+
+    pub fn with_ringback(mut self, ringback: RingbackConfig) -> Self {
+        self.ringback = ringback;
+        self
+    }
+
+    pub fn with_media(mut self, media: MediaConfig) -> Self {
+        self.media = media;
+        self
+    }
+
+    pub fn with_failure_action(mut self, action: FailureAction) -> Self {
+        self.failure_action = action;
+        self
+    }
+
+    /// Set max call duration
+    pub fn with_max_call_duration(mut self, duration: Duration) -> Self {
+        self.max_call_duration = Some(duration);
+        self
+    }
+
+    /// Set RTP timeout per direction
+    pub fn with_rtp_timeout(mut self, timeout: Duration) -> Self {
+        self.rtp_timeout = Some(timeout);
+        self
+    }
+
+    /// Set max ring time
+    pub fn with_max_ring_time(mut self, duration: Duration) -> Self {
+        self.max_ring_time = duration;
+        self
+    }
+    pub fn with_route_invite(mut self, route: Box<dyn RouteInvite>) -> Self {
+        self.route_invite = Some(route);
+        self
+    }
+
+    pub fn with_call_forwarding(mut self, config: Option<CallForwardingConfig>) -> Self {
+        self.call_forwarding = config;
+        self
+    }
+
+    pub fn with_passthrough_failure(mut self, enabled: bool) -> Self {
+        self.passthrough_failure = enabled;
+        self
+    }
+
+    pub fn with_audio_profile(mut self, profile: crate::proxy::routing::RingbackAudio) -> Self {
+        self.audio_profile = Some(profile);
+        self
+    }
+
+    pub fn with_queue(mut self, queue: QueuePlan) -> Self {
+        let current = std::mem::replace(
+            &mut self.flow,
+            DialplanFlow::Targets(DialStrategy::Sequential(vec![])),
+        );
+        self.flow = DialplanFlow::Queue {
+            plan: queue,
+            next: Box::new(current),
+        };
+        self
+    }
+
+    pub fn with_caller_contact(mut self, contact: rsipstack::sip::typed::Contact) -> Self {
+        self.caller_contact = Some(contact);
+        self
+    }
+
+    pub fn with_extension<T: Clone + Send + Sync + 'static>(mut self, val: T) -> Self {
+        self.extensions.insert(val);
+        self
+    }
+
+    /// Get all target locations regardless of strategy
+    pub fn get_all_targets(&self) -> Option<&Vec<Location>> {
+        self.flow.find_targets()
+    }
+
+    pub fn first_target(&self) -> Option<&Location> {
+        self.get_all_targets().and_then(|targets| targets.first())
+    }
+
+    /// Check if using parallel dialing strategy
+    pub fn is_parallel_strategy(&self) -> bool {
+        self.flow.is_parallel()
+    }
+
+    pub fn has_queue(&self) -> bool {
+        self.flow.has_queue()
+    }
+
+    pub fn has_queue_hold_audio(&self) -> bool {
+        self.flow.has_queue_hold_audio()
+    }
+
+    /// Check if recording is enabled
+    pub fn is_recording_enabled(&self) -> bool {
+        self.recording.enabled
+    }
+
+    fn set_terminal_flow(&mut self, new_terminal: DialplanFlow) {
+        let current = std::mem::replace(
+            &mut self.flow,
+            DialplanFlow::Targets(DialStrategy::Sequential(vec![])),
+        );
+        self.flow = DialplanFlow::replace_terminal(current, new_terminal);
+    }
+
+    pub fn should_forward_header(header: &rsipstack::sip::Header) -> bool {
+        use rsipstack::sip::Header;
+
+        match header {
+            Header::Via(_)
+            | Header::Contact(_)
+            | Header::From(_)
+            | Header::To(_)
+            | Header::CallId(_)
+            | Header::CSeq(_)
+            | Header::MaxForwards(_)
+            | Header::ContentLength(_)
+            | Header::ContentType(_)
+            | Header::Authorization(_)
+            | Header::ProxyAuthorization(_)
+            | Header::ProxyAuthenticate(_)
+            | Header::WwwAuthenticate(_)
+            | Header::Route(_)
+            | Header::UserAgent(_)
+            | Header::Allow(_)
+            | Header::Supported(_)
+            | Header::RecordRoute(_) => false,
+            Header::Other(name, _) => {
+                let lower = name.to_ascii_lowercase();
+                !matches!(
+                    lower.as_str(),
+                    "via"
+                        | "from"
+                        | "to"
+                        | "contact"
+                        | "call-id"
+                        | "cseq"
+                        | "max-forwards"
+                        | "content-length"
+                        | "content-type"
+                        | "route"
+                        | "record-route"
+                        | "authorization"
+                        | "proxy-authorization"
+                        | "proxy-authenticate"
+                        | "www-authenticate"
+                        | "user-agent"
+                        | "allow"
+                        | "supported"
+                )
+            }
+            _ => true,
+        }
+    }
+
+    pub fn build_invite_headers(&self, target: &Location) -> Option<Vec<rsipstack::sip::Header>> {
+        let mut headers = target.headers.clone().unwrap_or_default();
+        if self.with_original_headers {
+            for header in self.original.headers.iter() {
+                if !Self::should_forward_header(header) {
+                    continue;
+                }
+                headers.push(header.clone());
+            }
+        }
+
+        if headers.is_empty() {
+            None
+        } else {
+            Some(headers)
+        }
+    }
+}
+
+/// Determines whether media should be anchored (go through the media proxy)
+/// for a given dialplan. Each addon can provide its own policy.
+pub trait MediaPolicy: Send + Sync {
+    fn requires_anchored(&self, dialplan: &Dialplan, mode: &MediaProxyMode) -> bool;
+}
+
+/// Default media policy used when no addon overrides it.
+/// Logic:
+/// - Recording always anchors media
+/// - App/Queue flows anchor media in Auto/NAT mode
+/// - All mode always anchors
+/// - None mode never anchors
+pub struct DefaultMediaPolicy;
+
+impl MediaPolicy for DefaultMediaPolicy {
+    fn requires_anchored(&self, dialplan: &Dialplan, mode: &MediaProxyMode) -> bool {
+        if dialplan.recording.enabled {
+            return true;
+        }
+        let app_or_queue = matches!(
+            dialplan.flow,
+            DialplanFlow::Application { .. } | DialplanFlow::Queue { .. }
+        );
+        match mode {
+            MediaProxyMode::All => true,
+            MediaProxyMode::Auto | MediaProxyMode::Nat => app_or_queue,
+            MediaProxyMode::None | MediaProxyMode::Bypass => false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait RouteInvite: Sync + Send {
+    async fn route_invite(
+        &self,
+        option: InviteOption,
+        origin: &rsipstack::sip::Request,
+        direction: &DialDirection,
+        cookie: &TransactionCookie,
+    ) -> Result<RouteResult>;
+
+    async fn preview_route(
+        &self,
+        option: InviteOption,
+        origin: &rsipstack::sip::Request,
+        direction: &DialDirection,
+        cookie: &TransactionCookie,
+    ) -> Result<RouteResult> {
+        self.route_invite(option, origin, direction, cookie).await
+    }
+}
+
+/// Routing state for managing stateful load balancing
+#[derive(Debug)]
+pub struct RoutingState {
+    /// Round-robin counters for each destination group
+    round_robin_counters: Arc<Mutex<HashMap<String, usize>>>,
+    pub policy_guard: Option<Arc<crate::call::policy::PolicyGuard>>,
+}
+
+impl Default for RoutingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RoutingState {
+    pub fn new() -> Self {
+        Self {
+            round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
+            policy_guard: None,
+        }
+    }
+
+    /// Get the next trunk index for round-robin selection
+    pub fn next_round_robin_index(&self, destination_key: &str, trunk_count: usize) -> usize {
+        if trunk_count == 0 {
+            return 0;
+        }
+
+        let mut counters = self.round_robin_counters.lock();
+        let counter = counters
+            .entry(destination_key.to_string())
+            .or_insert_with(|| 0);
+        let r = *counter % trunk_count;
+        *counter += 1;
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_request() -> rsipstack::sip::Request {
+        let uri = rsipstack::sip::Uri {
+            scheme: Some(rsipstack::sip::Scheme::Sip),
+            auth: Some(rsipstack::sip::Auth {
+                user: "1001".into(),
+                password: None,
+            }),
+            host_with_port: rsipstack::sip::HostWithPort {
+                host: "pbx.local".parse().unwrap(),
+                port: None,
+            },
+            params: vec![],
+            headers: vec![],
+        };
+        rsipstack::sip::Request {
+            method: rsipstack::sip::Method::Invite,
+            uri,
+            version: rsipstack::sip::Version::V2,
+            headers: Default::default(),
+            body: vec![],
+        }
+    }
+
+    // ── Dialplan::voicemail_enabled ────────────────────────────────────────
+
+    #[test]
+    fn new_dialplan_has_voicemail_enabled_false_by_default() {
+        // Voicemail routing must be explicitly enabled by the proxy layer after
+        // looking up the callee.  Until then the flag is false so that calls
+        // without a resolvable callee extension are never silently routed to
+        // voicemail.
+        let dp = Dialplan::new(
+            "sess-001".into(),
+            minimal_request(),
+            DialDirection::Internal,
+        );
+        assert!(
+            !dp.voicemail_enabled,
+            "new Dialplan must default voicemail_enabled to false"
+        );
+    }
+
+    #[test]
+    fn dialplan_voicemail_enabled_can_be_set() {
+        let mut dp = Dialplan::new(
+            "sess-002".into(),
+            minimal_request(),
+            DialDirection::Internal,
+        );
+        dp.voicemail_enabled = true;
+        assert!(dp.voicemail_enabled);
+    }
+
+    #[test]
+    fn dialplan_voicemail_enabled_independent_of_call_forwarding() {
+        // voicemail_enabled and call_forwarding are orthogonal: a call can have
+        // forwarding configured AND voicemail enabled simultaneously.
+        let mut dp = Dialplan::new(
+            "sess-003".into(),
+            minimal_request(),
+            DialDirection::Internal,
+        );
+        dp.voicemail_enabled = true;
+        dp.call_forwarding = Some(CallForwardingConfig {
+            mode: CallForwardingMode::WhenNoAnswer,
+            endpoint: TransferEndpoint::Uri("sip:2001@pbx.local".into()),
+            timeout: std::time::Duration::from_secs(20),
+        });
+
+        assert!(dp.voicemail_enabled);
+        assert!(dp.call_forwarding.is_some());
+    }
+
+    // ── DialplanFlow::all_webrtc_target ────────────────────────────────────────
+
+    fn make_location(aor: &str, supports_webrtc: bool) -> Location {
+        Location {
+            aor: aor.try_into().unwrap(),
+            supports_webrtc,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_targets_returns_false_for_all_webrtc() {
+        // Empty targets should return false, not true (vacuous truth bug fix)
+        let flow = DialplanFlow::Targets(DialStrategy::Sequential(vec![]));
+        assert!(
+            !flow.all_webrtc_target(),
+            "empty targets should return false"
+        );
+    }
+
+    #[test]
+    fn single_webrtc_target_returns_true() {
+        let flow = DialplanFlow::Targets(DialStrategy::Sequential(vec![make_location(
+            "sip:webrtc@example.com",
+            true,
+        )]));
+        assert!(flow.all_webrtc_target());
+    }
+
+    #[test]
+    fn single_non_webrtc_target_returns_false() {
+        let flow = DialplanFlow::Targets(DialStrategy::Sequential(vec![make_location(
+            "sip:trunk@example.com",
+            false,
+        )]));
+        assert!(!flow.all_webrtc_target());
+    }
+
+    #[test]
+    fn mixed_targets_return_false() {
+        let flow = DialplanFlow::Targets(DialStrategy::Sequential(vec![
+            make_location("sip:webrtc@example.com", true),
+            make_location("sip:trunk@example.com", false),
+        ]));
+        assert!(
+            !flow.all_webrtc_target(),
+            "mixed targets should return false"
+        );
+    }
+
+    #[test]
+    fn all_webrtc_targets_return_true() {
+        let flow = DialplanFlow::Targets(DialStrategy::Sequential(vec![
+            make_location("sip:a@example.com", true),
+            make_location("sip:b@example.com", true),
+        ]));
+        assert!(flow.all_webrtc_target());
+    }
+
+    #[test]
+    fn queue_with_empty_dial_strategy_and_empty_next_returns_false() {
+        // This is the bug case: Queue with empty dial_strategy and empty next
+        // was incorrectly returning true due to vacuous truth
+        let queue_plan = QueuePlan {
+            accept_immediately: false,
+            passthrough_ringback: false,
+            hold: None,
+            dial_strategy: None,
+            ..Default::default()
+        };
+        let flow = DialplanFlow::Queue {
+            plan: queue_plan,
+            next: Box::new(DialplanFlow::Targets(DialStrategy::Sequential(vec![]))),
+        };
+        assert!(
+            !flow.all_webrtc_target(),
+            "queue with empty targets should return false"
+        );
+    }
+
+    #[test]
+    fn queue_with_webrtc_targets_in_dial_strategy_returns_true() {
+        let queue_plan = QueuePlan {
+            accept_immediately: false,
+            passthrough_ringback: false,
+            hold: None,
+            dial_strategy: Some(DialStrategy::Sequential(vec![make_location(
+                "sip:webrtc@example.com",
+                true,
+            )])),
+            ..Default::default()
+        };
+        let flow = DialplanFlow::Queue {
+            plan: queue_plan,
+            next: Box::new(DialplanFlow::Targets(DialStrategy::Sequential(vec![]))),
+        };
+        assert!(
+            flow.all_webrtc_target(),
+            "queue with webrtc dial_strategy should return true"
+        );
+    }
+
+    #[test]
+    fn queue_with_non_webrtc_targets_in_dial_strategy_returns_false() {
+        let queue_plan = QueuePlan {
+            accept_immediately: false,
+            passthrough_ringback: false,
+            hold: None,
+            dial_strategy: Some(DialStrategy::Sequential(vec![make_location(
+                "sip:trunk@example.com",
+                false,
+            )])),
+            ..Default::default()
+        };
+        let flow = DialplanFlow::Queue {
+            plan: queue_plan,
+            next: Box::new(DialplanFlow::Targets(DialStrategy::Sequential(vec![]))),
+        };
+        assert!(
+            !flow.all_webrtc_target(),
+            "queue with non-webrtc dial_strategy should return false"
+        );
+    }
+
+    #[test]
+    fn queue_fallback_to_next_when_dial_strategy_is_empty() {
+        // When dial_strategy is empty/None, should check next
+        let queue_plan = QueuePlan {
+            accept_immediately: false,
+            passthrough_ringback: false,
+            hold: None,
+            dial_strategy: Some(DialStrategy::Sequential(vec![])),
+            ..Default::default()
+        };
+        let flow = DialplanFlow::Queue {
+            plan: queue_plan,
+            next: Box::new(DialplanFlow::Targets(DialStrategy::Sequential(vec![
+                make_location("sip:webrtc@example.com", true),
+            ]))),
+        };
+        assert!(
+            flow.all_webrtc_target(),
+            "should fallback to next which has webrtc target"
+        );
+    }
+
+    #[test]
+    fn application_flow_returns_false() {
+        let flow = DialplanFlow::Application {
+            app_name: "voicemail".to_string(),
+            app_params: None,
+            auto_answer: false,
+        };
+        assert!(!flow.all_webrtc_target());
+    }
+}

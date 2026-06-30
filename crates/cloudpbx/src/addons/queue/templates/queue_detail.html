@@ -1,0 +1,1379 @@
+{% extends "console/layout.html" %}
+{% set has_model = model is defined and model is not none %}
+{% set page_mode = mode | default('create') %}
+{% set model_data = model if has_model else {} %}
+{% block title %}{{ model_data.name | default("queue.new_queue" | t) }} · {{ site_name | default('RustPBX') }}{%
+endblock %}
+{% block content %}
+{% set base_url = base_path | safe %}
+<div class="p-6" x-data='queueDetailPage({
+        basePath: {{ base_url | tojson }},
+        apiPrefix: {{ api_prefix | default('/api') | tojson }},
+        mode: {{ page_mode | tojson }},
+        model: {{ model_data | tojson }},
+        createUrl: {{ create_url | tojson }},
+        updateUrl: {{ update_url | tojson }},
+        listUrl: {{ list_url | default(create_url) | tojson }},
+        t: window._queueTranslations
+    })' x-init="init()">
+    <div class="mx-auto max-w-4xl space-y-6">
+        <header class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div class="space-y-3">
+                <a :href="listUrl"
+                    class="inline-flex items-center gap-2 text-sm font-medium text-slate-500 hover:text-slate-700">
+                    <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 5l-4 5 4 5" />
+                    </svg>
+                    <span x-text="tt('queue.detail_back')"></span>
+                </a>
+                <div>
+                    <h1 class="text-2xl font-semibold text-slate-900" x-text="pageTitle"></h1>
+                    <p class="mt-2 text-sm text-slate-500"
+                        x-text="mode === 'create' ? tt('queue.detail_subtitle_create') : tt('queue.detail_subtitle_edit')">
+                    </p>
+                </div>
+            </div>
+            <div class="rounded-xl bg-white p-4 text-sm text-slate-600 shadow-sm ring-1 ring-black/5"
+                x-show="mode === 'edit'" x-cloak>
+                <div class="flex items-center justify-between gap-4">
+                    <div class="font-semibold text-slate-900" x-text="tt('queue.detail_summary_title')"></div>
+                    <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                        :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100' : 'bg-amber-50 text-amber-600 ring-1 ring-amber-100'">
+                        <span class="h-1.5 w-1.5 rounded-full"
+                            :class="form.is_active ? 'bg-emerald-400' : 'bg-amber-400'"></span>
+                        <span x-text="form.is_active ? tt('queue.status_active') : tt('queue.status_paused')"></span>
+                    </span>
+                </div>
+                <dl class="mt-4 space-y-2 text-xs text-slate-500">
+                    <div class="flex items-center justify-between gap-6">
+                        <dt class="uppercase tracking-wide" x-text="tt('queue.detail_name_label')"></dt>
+                        <dd class="text-sm text-slate-700" x-text="form.name || '-'"></dd>
+                    </div>
+                    <div class="flex items-center justify-between gap-6">
+                        <dt class="uppercase tracking-wide" x-text="tt('queue.detail_updated_label')"></dt>
+                        <dd class="text-sm text-slate-700" x-text="formatDate(model?.updated_at)"></dd>
+                    </div>
+                </dl>
+            </div>
+        </header>
+
+        <template x-if="success">
+            <div class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700"
+                x-text="success"></div>
+        </template>
+        <template x-if="error">
+            <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700" x-text="error">
+            </div>
+        </template>
+
+        <form class="space-y-6" @submit.prevent="submit">
+            <div class="rounded-xl bg-white p-2 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-wrap gap-2">
+                    <button type="button" @click="activeTab = 'overview'" :class="tabButtonClasses('overview')"
+                        x-text="tt('queue.tab_overview')">
+                    </button>
+                    <button type="button" @click="activeTab = 'targets'" :class="tabButtonClasses('targets')"
+                        x-text="tt('queue.tab_targets')">
+                    </button>
+                    <button type="button" @click="activeTab = 'fallback'" :class="tabButtonClasses('fallback')"
+                        x-text="tt('queue.tab_fallback')">
+                    </button>
+                    <button type="button" @click="activeTab = 'voice_prompts'" :class="tabButtonClasses('voice_prompts')"
+                        x-text="tt('queue.tab_voice_prompts')">
+                    </button>
+                    <button type="button" @click="activeTab = 'callback'" :class="tabButtonClasses('callback')"
+                        x-text="tt('queue.tab_callback')">
+                    </button>
+                    <button type="button" @click="activeTab = 'announcements'" :class="tabButtonClasses('announcements')"
+                        x-text="tt('queue.tab_announcements')">
+                    </button>
+
+                </div>
+            </div>
+
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'overview'"
+                x-cloak>
+                <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_basics')"></h2>
+                <div class="mt-4 grid gap-4 md:grid-cols-2">
+                    <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.field_name')"></span>
+                        <input type="text" x-model.trim="form.name" maxlength="160" required
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                            :placeholder="tt('queue.field_name_placeholder')">
+                        <span class="text-xs font-normal text-slate-400" x-text="tt('queue.field_name_hint')"></span>
+                    </label>
+                    <div class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.field_status')"></span>
+                        <button type="button" @click="toggleActive()"
+                            class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                            :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                            <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                stroke-width="1.6">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4 4 6-8"
+                                    x-show="form.is_active"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M6 6l8 8M6 14l8-8"
+                                    x-show="!form.is_active"></path>
+                            </svg>
+                            <span
+                                x-text="form.is_active ? tt('queue.status_active') : tt('queue.status_paused')"></span>
+                        </button>
+                        <span class="text-xs font-normal text-slate-400" x-text="tt('queue.field_status_hint')"></span>
+                    </div>
+                    <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.field_description')"></span>
+                        <textarea rows="3" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                            :placeholder="tt('queue.field_description_placeholder')"></textarea>
+                    </label>
+                    <div class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.field_accept_immediately')"></span>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="checkbox"
+                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+                                x-model="form.spec.accept_immediately">
+                            <span x-text="tt('queue.field_accept_immediately_label')"></span>
+                        </label>
+                    </div>
+                    <div class="flex flex-col gap-2 text-sm font-medium text-slate-700"
+                        x-show="form.spec.accept_immediately" x-cloak>
+                        <span x-text="tt('queue.field_passthrough_ringback')"></span>
+                        <label class="inline-flex items-start gap-2 text-sm font-medium text-slate-700">
+                            <input type="checkbox"
+                                class="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+                                x-model="form.spec.passthrough_ringback">
+                            <span class="text-sm font-normal text-slate-600"
+                                x-text="tt('queue.field_passthrough_ringback_desc')"></span>
+                        </label>
+                    </div>
+                    <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.field_tags')"></span>
+                        <input type="text" x-model.trim="form.tags_input"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                            :placeholder="tt('queue.field_tags_placeholder')">
+                    </label>
+                </div>
+            </section>
+
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'overview'"
+                x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_hold')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_hold_desc')"></p>
+                </div>
+                <div class="mt-4 space-y-4">
+                    <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                        <input type="checkbox" class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+                            x-model="holdEnabled">
+                        <span x-text="tt('queue.hold_enable_label')"></span>
+                    </label>
+                    <div class="grid gap-4 md:grid-cols-2" x-show="holdEnabled" x-cloak>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.hold_audio_file')"></span>
+                            <input type="text" x-model.trim="form.spec.hold.audio_file"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.hold_audio_file_placeholder')">
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="checkbox"
+                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+                                x-model="form.spec.hold.loop_playback">
+                            <span x-text="tt('queue.hold_loop')"></span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'targets'"
+                x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_targets')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_targets_desc')"></p>
+                </div>
+                <div class="mt-4 space-y-5">
+                    <div class="grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.field_dial_mode')"></span>
+                            <select x-model="form.spec.strategy.mode"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="sequential" x-text="tt('queue.dial_sequential')"></option>
+                                <option value="parallel" x-text="tt('queue.dial_parallel')"></option>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.field_ring_timeout')"></span>
+                            <input type="number" min="0" x-model.number="form.spec.strategy.wait_timeout_secs"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.field_ring_timeout_placeholder')">
+                            <span class="text-xs font-normal text-slate-400"
+                                x-text="tt('queue.field_ring_timeout_hint')"></span>
+                        </label>
+                    </div>
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.dial_targets_title')">
+                            </h3>
+                            <div class="flex items-center gap-2">
+                                <button type="button" @click="addStrategyTarget('sip')"
+                                    class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                                    x-text="tt('queue.add_target')">
+                                </button>
+                                <button type="button" @click="addStrategyTarget('skill_group')"
+                                    x-show="skillGroups.length"
+                                    class="inline-flex items-center gap-2 rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-600 hover:bg-indigo-50"
+                                    x-text="tt('queue.add_skill_group_target')">
+                                </button>
+                            </div>
+                        </div>
+                        <template x-if="!form.spec.strategy.targets.length">
+                            <p class="text-xs text-slate-400" x-text="tt('queue.no_targets')"></p>
+                        </template>
+                        <div class="space-y-3">
+                            <template x-for="(target, index) in form.spec.strategy.targets" :key="index">
+                                <div
+                                    class="grid gap-3 rounded-lg border border-slate-200 p-3"
+                                    :class="target.uri && target.uri.startsWith('skill-group:') ? 'md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]' : 'md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]'">
+                                    <!-- SIP Target -->
+                                    <template x-if="!target.uri || !target.uri.startsWith('skill-group:')">
+                                        <label
+                                            class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                            <span x-text="tt('queue.target_uri')"></span>
+                                            <input type="text" x-model.trim="target.uri"
+                                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                                :placeholder="tt('queue.target_uri_placeholder')">
+                                        </label>
+                                    </template>
+                                    <!-- Skill Group Target -->
+                                    <template x-if="target.uri && target.uri.startsWith('skill-group:')">
+                                        <label class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                            <span x-text="tt('queue.target_skill_group')"></span>
+                                            <select x-model="target.skill_group_id"
+                                                x-effect="target.skill_group_id && skillGroups.length ? $el.value = target.skill_group_id : ''"
+                                                @change="target.uri = 'skill-group:' + target.skill_group_id"
+                                                class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                                <option value="" x-text="tt('queue.skill_group_select_placeholder')"></option>
+                                                <template x-for="group in skillGroups" :key="group.skill_group_id">
+                                                    <option :value="group.skill_group_id" x-text="group.display_name || group.skill_group_id"></option>
+                                                </template>
+                                            </select>
+                                        </label>
+                                    </template>
+                                    <label
+                                        class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                        <span x-text="tt('queue.target_label')"></span>
+                                        <input type="text" x-model.trim="target.label"
+                                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            :placeholder="tt('queue.target_label_placeholder')">
+                                    </label>
+                                    <div class="flex items-end justify-end">
+                                        <button type="button" @click="removeStrategyTarget(index)"
+                                            class="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-500 hover:bg-slate-50"
+                                            x-text="tt('queue.remove_target')">
+                                        </button>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'fallback'"
+                x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_fallback')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_fallback_desc')"></p>
+                </div>
+                <div class="mt-4 space-y-4">
+                    <div class="flex flex-wrap gap-3">
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="radio" name="queue-fallback" value="none" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_none')"></span>
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="radio" name="queue-fallback" value="redirect" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_redirect_opt')"></span>
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="radio" name="queue-fallback" value="queue" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_queue_opt')"></span>
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700" x-show="skillGroups.length" x-cloak>
+                            <input type="radio" name="queue-fallback" value="skill_group" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_skill_group_opt')"></span>
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="radio" name="queue-fallback" value="failure" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_failure_opt')"></span>
+                        </label>
+                    </div>
+                    <div x-show="fallbackMode === 'redirect'" x-cloak
+                        @destination-change="form.spec.fallback.redirect = $event.detail.type === 'extension' ? 'sip:' + $event.detail.value : ($event.detail.type === 'uri' ? $event.detail.value : $event.detail.type + ':' + $event.detail.value)">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_redirect_label')"></span>
+                            {% set queue_items = forwarding_catalog.queues | default([]) %}
+                            {% set ivr_items = forwarding_catalog.ivr_projects | default([]) %}
+                            {% include "console/_destination_selector.html" %}
+                        </label>
+                    </div>
+                    <div class="grid gap-4 md:grid-cols-2" x-show="fallbackMode === 'failure'" x-cloak>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_code_label')"></span>
+                            <input type="number" min="100" max="699" x-model.number="form.spec.fallback.failure_code"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.fallback_code_placeholder')">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_reason_label')"></span>
+                            <input type="text" x-model.trim="form.spec.fallback.failure_reason"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.fallback_reason_placeholder')">
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_prompt_label')"></span>
+                            <input type="text" x-model.trim="form.spec.fallback.failure_prompt"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.fallback_prompt_placeholder')">
+                            <span class="text-xs font-normal text-slate-400"
+                                x-text="tt('queue.fallback_prompt_hint')"></span>
+                        </label>
+                    </div>
+                    <div class="grid gap-4 md:grid-cols-2" x-show="fallbackMode === 'queue'" x-cloak>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_queue_label')"></span>
+                            <input type="text" x-model.trim="form.spec.fallback.queue_ref"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                :placeholder="tt('queue.fallback_queue_placeholder')">
+                            <span class="text-xs font-normal text-slate-400"
+                                x-text="tt('queue.fallback_queue_hint')"></span>
+                        </label>
+                    </div>
+                    <div class="grid gap-4 md:grid-cols-2" x-show="fallbackMode === 'skill_group'" x-cloak>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_skill_group_label')"></span>
+                            <template x-if="skillGroups.length">
+                                                <select x-model="form.spec.fallback.skill_group_ref"
+                                                    x-effect="form.spec.fallback.skill_group_ref && skillGroups.length ? $el.value = form.spec.fallback.skill_group_ref : ''"
+                                                    class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                                    <option value="" x-text="tt('queue.fallback_skill_group_placeholder')"></option>
+                                                    <template x-for="group in skillGroups" :key="group.skill_group_id">
+                                                        <option :value="group.skill_group_id" x-text="group.display_name || group.skill_group_id"></option>
+                                                    </template>
+                                                </select>
+                            </template>
+                            <template x-if="!skillGroups.length">
+                                <input type="text" x-model.trim="form.spec.fallback.skill_group_ref"
+                                    class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.fallback_skill_group_placeholder')">
+                            </template>
+                            <span class="text-xs font-normal text-slate-400" x-text="tt('queue.fallback_skill_group_hint')"></span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Voice Prompts tab -->
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'voice_prompts'" x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_voice_prompts')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_voice_prompts_desc')"></p>
+                </div>
+                <div class="mt-6 space-y-6">
+                    <!-- Transfer prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_transfer')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_transfer_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpTransferType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpTransferType === 'custom'" x-model.trim="vpTransferCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpTransferType === 'custom' && vpTransferCustom.startsWith('http')"
+                                    @click="downloadAudio(vpTransferCustom, 'transfer')"
+                                    :disabled="downloadingTransfer"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingTransfer ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('transfer')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpTransferPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Busy prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_busy')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_busy_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpBusyType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpBusyType === 'custom'" x-model.trim="vpBusyCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpBusyType === 'custom' && vpBusyCustom.startsWith('http')"
+                                    @click="downloadAudio(vpBusyCustom, 'busy')"
+                                    :disabled="downloadingBusy"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingBusy ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('busy')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpBusyPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Off-hours prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_off_hours')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_off_hours_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpOffHoursType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpOffHoursType === 'custom'" x-model.trim="vpOffHoursCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpOffHoursType === 'custom' && vpOffHoursCustom.startsWith('http')"
+                                    @click="downloadAudio(vpOffHoursCustom, 'offhours')"
+                                    :disabled="downloadingOffHours"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingOffHours ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('offhours')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpOffHoursPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- No-answer prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_no_answer')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_no_answer_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpNoAnswerType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpNoAnswerType === 'custom'" x-model.trim="vpNoAnswerCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpNoAnswerType === 'custom' && vpNoAnswerCustom.startsWith('http')"
+                                    @click="downloadAudio(vpNoAnswerCustom, 'noanswer')"
+                                    :disabled="downloadingNoAnswer"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingNoAnswer ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('noanswer')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpNoAnswerPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Preview audio element (hidden) -->
+                    <audio x-ref="audioPreview" controls class="hidden"></audio>
+                </div>
+            </section>
+
+            <!-- Callback tab -->
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'callback'"
+                x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_callback')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_callback_desc')"></p>
+                </div>
+                <div class="mt-4 flex items-center justify-between rounded-lg border border-slate-200 p-4">
+                    <div>
+                        <span class="text-sm font-medium text-slate-700" x-text="tt('queue.callback_enable')"></span>
+                        <p class="text-xs text-slate-400" x-text="tt('queue.callback_enable_desc')"></p>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" x-model="form.callback.callback_request_enabled" class="sr-only peer">
+                        <div class="w-11 h-6 bg-slate-200 peer-checked:bg-sky-600 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                    </label>
+                </div>
+                <div x-show="form.callback.callback_request_enabled" x-cloak class="mt-4 grid gap-4 sm:grid-cols-2">
+                    <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.callback_offer_after')"></span>
+                        <span class="text-xs font-normal text-slate-400" x-text="tt('queue.callback_offer_after_desc')"></span>
+                        <input type="number" min="0" x-model.number="form.callback.callback_offer_after_secs"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                    </label>
+                    <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <span x-text="tt('queue.callback_dtmf_key')"></span>
+                        <span class="text-xs font-normal text-slate-400" x-text="tt('queue.callback_dtmf_key_desc')"></span>
+                        <input type="text" maxlength="1" x-model="form.callback.callback_dtmf_key"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                    </label>
+                </div>
+                <div x-show="form.callback.callback_request_enabled" x-cloak class="mt-4 space-y-4">
+                    <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.callback_prompts')"></h3>
+                    <p class="text-xs text-slate-400" x-text="tt('queue.callback_prompts_desc')"></p>
+                    <!-- Offer prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h4 class="text-sm font-medium text-slate-700" x-text="tt('queue.callback_offer_prompt')"></h4>
+                        <p class="text-xs text-slate-400" x-text="tt('queue.callback_offer_prompt_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpCallbackOfferType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <input type="text" x-show="vpCallbackOfferType === 'custom'" x-model.trim="vpCallbackOfferCustom"
+                                class="md:col-span-2 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                :placeholder="tt('queue.vp_url_placeholder')">
+                        </div>
+                    </div>
+                    <!-- Confirm prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h4 class="text-sm font-medium text-slate-700" x-text="tt('queue.callback_confirm_prompt')"></h4>
+                        <p class="text-xs text-slate-400" x-text="tt('queue.callback_confirm_prompt_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpCallbackConfirmType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <input type="text" x-show="vpCallbackConfirmType === 'custom'" x-model.trim="vpCallbackConfirmCustom"
+                                class="md:col-span-2 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                :placeholder="tt('queue.vp_url_placeholder')">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Announcements tab -->
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'announcements'"
+                x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_announcements')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_announcements_desc')"></p>
+                </div>
+
+                <!-- EWT settings -->
+                <div class="mt-4">
+                    <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.section_ewt')"></h3>
+                    <p class="text-xs text-slate-400" x-text="tt('queue.section_ewt_desc')"></p>
+                    <div class="mt-3 grid gap-4 sm:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.ewt_interval')"></span>
+                            <input type="number" min="0" x-model.number="form.spec.announcements.ewt_announce_interval_secs"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <span class="text-xs font-normal text-slate-400" x-text="tt('queue.ewt_interval_desc')"></span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.ewt_max')"></span>
+                            <input type="number" min="10" x-model.number="form.spec.announcements.ewt_max_secs"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <span class="text-xs font-normal text-slate-400" x-text="tt('queue.ewt_max_desc')"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <hr class="my-6 border-slate-100">
+
+                <!-- Comfort prompts -->
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.section_comfort')"></h3>
+                        <p class="text-xs text-slate-400" x-text="tt('queue.section_comfort_desc')"></p>
+                    </div>
+                    <button type="button" @click="addComfort()"
+                        :disabled="(form.spec.announcements?.comfort_prompts?.length || 0) >= 15"
+                        class="inline-flex items-center gap-2 rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-500 transition hover:border-sky-300 hover:text-sky-700 disabled:cursor-not-allowed disabled:opacity-50">
+                        <span x-text="tt('queue.comfort_add')"></span>
+                    </button>
+                </div>
+                <p class="mt-1 text-xs text-slate-400" x-text="(form.spec.announcements?.comfort_prompts?.length || 0) + ' / 15'"></p>
+                <div class="mt-4 space-y-2">
+                    <template x-for="(prompt, idx) in form.spec.announcements?.comfort_prompts || []" :key="idx">
+                        <div class="flex items-center gap-3 rounded-lg border border-slate-200 p-3">
+                            <span class="text-xs font-semibold text-slate-400 w-5" x-text="(idx + 1) + '.'"></span>
+                            <input type="text" x-model.trim="prompt.audio_file"
+                                class="flex-1 rounded-lg border border-slate-200 px-3 py-1.5 text-sm"
+                                :placeholder="tt('queue.comfort_audio_placeholder')">
+                            <input type="number" min="5" x-model.number="prompt.interval_secs"
+                                class="w-20 rounded-lg border border-slate-200 px-2 py-1.5 text-sm">
+                            <span class="text-xs text-slate-400" x-text="tt('queue.seconds')"></span>
+                            <!-- Up/Down buttons instead of drag -->
+                            <div class="flex flex-col gap-0.5">
+                                <button type="button" @click="moveComfort(idx, -1)" :disabled="idx === 0"
+                                    class="p-1 text-slate-400 hover:text-sky-600 disabled:opacity-30">
+                                    <svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 20 20"><path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4-4 4 4"/></svg>
+                                </button>
+                                <button type="button" @click="moveComfort(idx, 1)" :disabled="idx >= (form.spec.announcements?.comfort_prompts?.length || 0) - 1"
+                                    class="p-1 text-slate-400 hover:text-sky-600 disabled:opacity-30">
+                                    <svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 20 20"><path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4 4 4-4"/></svg>
+                                </button>
+                            </div>
+                            <!-- Preview button -->
+                            <button type="button" @click="previewComfort(idx)"
+                                class="rounded-lg p-2 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600">
+                                <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                            </button>
+                            <!-- Delete -->
+                            <button type="button" @click="form.spec.announcements.comfort_prompts.splice(idx,1)"
+                                class="rounded-lg p-2 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600">
+                                <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                            </button>
+                        </div>
+                    </template>
+                    <div x-show="!form.spec.announcements?.comfort_prompts?.length"
+                        class="rounded-lg border border-dashed border-slate-200 p-6 text-center text-sm text-slate-400"
+                        x-text="tt('queue.comfort_empty')"></div>
+                </div>
+
+                <!-- Final destination prompt -->
+                <hr class="my-6 border-slate-100">
+                <div class="rounded-lg border border-slate-200 p-4">
+                    <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.section_final_prompt')"></h3>
+                    <p class="text-xs text-slate-400" x-text="tt('queue.section_final_prompt_desc')"></p>
+                    <div class="mt-3 grid gap-3 md:grid-cols-3">
+                        <select x-model="vpFinalDestType"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <option value="none" x-text="tt('queue.vp_none')"></option>
+                            <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                        </select>
+                        <input type="text" x-show="vpFinalDestType === 'custom'" x-model.trim="vpFinalDestCustom"
+                            class="md:col-span-2 rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                            :placeholder="tt('queue.vp_url_placeholder')">
+                    </div>
+                </div>
+            </section>
+
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <p class="text-xs text-slate-400" x-text="tt('queue.save_hint')"></p>
+                <div class="flex items-center gap-3">
+                    <a :href="listUrl"
+                        class="inline-flex items-center justify-center rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100"
+                        x-text="tt('queue.btn_cancel')">
+                    </a>
+                    <button type="submit"
+                        class="inline-flex items-center justify-center gap-2 rounded-lg bg-sky-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2"
+                        :disabled="saving">
+                        <svg class="h-4 w-4 animate-spin" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                            stroke-width="1.6" x-show="saving">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M4 10a6 6 0 0 1 6-6m0-3v3m6 6a6 6 0 0 1-6 6m0 3v-3m9-6h-3M1 10h3m10.95 4.95-2.12-2.12M4.05 5.05l2.12 2.12m0 5.66-2.12 2.12m9.9-9.9 2.12-2.12" />
+                        </svg>
+                        <span x-text="mode === 'edit' ? tt('queue.btn_save') : tt('queue.btn_create')"></span>
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+    window.__consoleApiPrefix = {{ api_prefix | default('/api') | tojson }};
+    window._queueTranslations = window.__i18n_t || {};
+    document.addEventListener('alpine:init', () => {
+        Alpine.data('queueDetailPage', (options) => ({
+            basePath: options.basePath || '/console',
+            apiPrefix: options.apiPrefix || '/api',
+            mode: options.mode || 'create',
+            model: options.model || null,
+            createUrl: options.createUrl || `${options.basePath || '/console'}/queues`,
+            updateUrl: options.updateUrl || null,
+            listUrl: options.listUrl || `${options.basePath || '/console'}/queues`,
+            t: window._queueTranslations,
+            pageTitle: options.mode === 'edit' ? (window._queueTranslations?.queue?.detail_subtitle_edit || 'Edit queue') : (window._queueTranslations?.queue?.new_queue || 'New queue'),
+            activeTab: 'overview',
+            skillGroups: [],
+            pendingSkillGroup: '',
+            form: {
+                name: '',
+                description: '',
+                is_active: true,
+                tags_input: '',
+                spec: {
+                    accept_immediately: false,
+                    passthrough_ringback: false,
+                    hold: {
+                        audio_file: '',
+                        loop_playback: true,
+                    },
+                    fallback: {
+                        redirect: '',
+                        failure_code: null,
+                        failure_reason: '',
+                        failure_prompt: '',
+                        queue_ref: '',
+                        skill_group_ref: '',
+                    },
+                    strategy: {
+                        mode: 'sequential',
+                        wait_timeout_secs: null,
+                        targets: [],
+                        skill_groups: [],
+                    },
+                    voice_prompts: null,
+                    // Callback
+                    callback: {
+                        callback_request_enabled: false,
+                        callback_offer_after_secs: 30,
+                        callback_dtmf_key: '2',
+                    },
+                    // Announcements / EWT / Comfort
+                    announcements: {
+                        ewt_announce_interval_secs: 0,
+                        ewt_max_secs: 1800,
+                        comfort_prompts: [],
+                    },
+                },
+            },
+            holdEnabled: false,
+            fallbackMode: 'none',
+
+            // Voice prompts
+            vpTransferType: 'none',
+            vpBusyType: 'none',
+            vpOffHoursType: 'none',
+            vpNoAnswerType: 'none',
+            vpTransferCustom: '',
+            vpBusyCustom: '',
+            vpOffHoursCustom: '',
+            vpNoAnswerCustom: '',
+            vpTransferPath: '',
+            vpBusyPath: '',
+            vpOffHoursPath: '',
+            vpNoAnswerPath: '',
+            downloadingTransfer: false,
+            downloadingBusy: false,
+            downloadingOffHours: false,
+            downloadingNoAnswer: false,
+            // Callback prompt types
+            vpCallbackOfferType: 'none',
+            vpCallbackConfirmType: 'none',
+            vpFinalDestType: 'none',
+            vpCallbackOfferCustom: '',
+            vpCallbackConfirmCustom: '',
+            vpFinalDestCustom: '',
+            saving: false,
+            success: null,
+            error: null,
+            normalizeApiPrefix(value) {
+                const raw = String(value || '/api').trim();
+                if (!raw) {
+                    return '/api';
+                }
+                const normalized = raw.replace(/\/+$/, '');
+                if (/\/api(?:\/|$)/.test(normalized)) {
+                    return normalized;
+                }
+                return `${normalized}/api`;
+            },
+            init() {
+                this.apiPrefix = this.normalizeApiPrefix(this.apiPrefix || window.__consoleApiPrefix || '/api');
+                this.applyModel(this.model || {});
+                this.loadSkillGroups();
+            },
+            extractSkillGroupId(value) {
+                const raw = String(value || '').trim();
+                if (!raw) {
+                    return '';
+                }
+                const match = raw.match(/^skill(?:-|_)?group:(.+)$/i);
+                if (match && match[1]) {
+                    return match[1].trim();
+                }
+                return raw;
+            },
+            toSkillGroupUri(value) {
+                const id = this.extractSkillGroupId(value);
+                return id ? `skill-group:${id}` : '';
+            },
+            reconcileSkillGroupTargets() {
+                const targets = this.form?.spec?.strategy?.targets;
+                if (!Array.isArray(targets)) {
+                    return;
+                }
+                targets.forEach((target) => {
+                    if (!target || typeof target !== 'object') {
+                        return;
+                    }
+                    // Only reconcile targets that are ACTUALLY skill groups.
+                    // `extractSkillGroupId` returns its input unchanged when there is no
+                    // `skill-group:` prefix, so without this guard a plain SIP target
+                    // (e.g. `sip:1000@localhost`) would be coerced into
+                    // `skill-group:sip:1000@localhost` and rendered as a skill-group
+                    // dropdown every time the form is (re)loaded.
+                    const isSkillGroup =
+                        (typeof target.uri === 'string' && /^skill(?:-|_)?group:/i.test(target.uri)) ||
+                        !!target.skill_group_id;
+                    if (!isSkillGroup) {
+                        return;
+                    }
+                    const groupId = this.extractSkillGroupId(target.skill_group_id || target.uri);
+                    if (!groupId) {
+                        return;
+                    }
+                    target.skill_group_id = groupId;
+                    target.uri = this.toSkillGroupUri(groupId);
+                });
+                const fallbackRef = this.extractSkillGroupId(this.form?.spec?.fallback?.skill_group_ref);
+                if (fallbackRef && this.form?.spec?.fallback) {
+                    this.form.spec.fallback.skill_group_ref = fallbackRef;
+                }
+            },
+            hasSkillGroupOption(value) {
+                const target = this.extractSkillGroupId(value);
+                if (!target) {
+                    return false;
+                }
+                return (this.skillGroups || []).some((group) => {
+                    const id = this.extractSkillGroupId(group?.skill_group_id);
+                    return id === target;
+                });
+            },
+            loadSkillGroups() {
+                // Try to load skill groups from CC addon API
+                const loader = window.__ccSkillGroupsLoader;
+                if (typeof loader === 'function') {
+                    loader()
+                        .then((groups) => {
+                            this.skillGroups = Array.isArray(groups) ? groups : [];
+                            this.reconcileSkillGroupTargets();
+                        })
+                        .catch(() => {
+                            this.skillGroups = [];
+                        });
+                } else {
+                    fetch(this.apiPrefix + '/cc/skill-groups', { credentials: 'same-origin' })
+                        .then(res => res.ok ? res.json() : null)
+                        .then(payload => {
+                            const arr = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.data) ? payload.data : []);
+                            this.skillGroups = arr;
+                            this.reconcileSkillGroupTargets();
+                        })
+                        .catch(() => {
+                            this.skillGroups = [];
+                        });
+                }
+            },
+
+            tt(key) {
+                const parts = key.split('.');
+                let val = this.t;
+                for (const part of parts) {
+                    if (val == null) return key;
+                    val = val[part];
+                }
+                return val != null ? String(val) : key;
+            },
+            VP_PATHS: {
+                transfer: { zh: 'config/sounds/queue-transfer-zh.wav', en: 'config/sounds/queue-transfer-en.wav' },
+                busy: { zh: 'config/sounds/queue-busy-zh.wav', en: 'config/sounds/queue-busy-en.wav' },
+                offhours: { zh: 'config/sounds/queue-off-hours-zh.wav', en: 'config/sounds/queue-off-hours-en.wav' },
+                noanswer: { zh: 'config/sounds/queue-no-answer-zh.wav', en: 'config/sounds/queue-no-answer-en.wav' },
+            },
+            vpTypeFor(path) {
+                if (!path) return 'none';
+                for (const [type, langs] of Object.entries(this.VP_PATHS)) {
+                    for (const [lang, p] of Object.entries(langs)) {
+                        if (path === p) return lang;
+                    }
+                }
+                return 'custom';
+            },
+            loadVoicePrompts(vp) {
+                if (!vp || typeof vp !== 'object') return;
+                this.vpTransferType = this.vpTypeFor(vp.transfer_prompt);
+                this.vpBusyType = this.vpTypeFor(vp.busy_prompt);
+                this.vpOffHoursType = this.vpTypeFor(vp.off_hours_prompt);
+                this.vpNoAnswerType = this.vpTypeFor(vp.no_answer_prompt);
+                this.vpTransferPath = vp.transfer_prompt || '';
+                this.vpBusyPath = vp.busy_prompt || '';
+                this.vpOffHoursPath = vp.off_hours_prompt || '';
+                this.vpNoAnswerPath = vp.no_answer_prompt || '';
+                if (this.vpTransferType === 'custom') this.vpTransferCustom = vp.transfer_prompt;
+                if (this.vpBusyType === 'custom') this.vpBusyCustom = vp.busy_prompt;
+                if (this.vpOffHoursType === 'custom') this.vpOffHoursCustom = vp.off_hours_prompt;
+                if (this.vpNoAnswerType === 'custom') this.vpNoAnswerCustom = vp.no_answer_prompt;
+                // Callback prompts
+                this.vpCallbackOfferType = vp.callback_offer_prompt ? 'custom' : 'none';
+                this.vpCallbackConfirmType = vp.callback_confirm_prompt ? 'custom' : 'none';
+                this.vpFinalDestType = vp.final_destination_prompt ? 'custom' : 'none';
+                this.vpCallbackOfferCustom = vp.callback_offer_prompt || '';
+                this.vpCallbackConfirmCustom = vp.callback_confirm_prompt || '';
+                this.vpFinalDestCustom = vp.final_destination_prompt || '';
+            },
+            buildVoicePrompts() {
+                const result = {};
+                const transfer = this.resolvePrompt('transfer', this.vpTransferType, this.vpTransferCustom);
+                const busy = this.resolvePrompt('busy', this.vpBusyType, this.vpBusyCustom);
+                const offhours = this.resolvePrompt('offhours', this.vpOffHoursType, this.vpOffHoursCustom);
+                const noanswer = this.resolvePrompt('noanswer', this.vpNoAnswerType, this.vpNoAnswerCustom);
+                if (transfer) result.transfer_prompt = transfer;
+                if (busy) result.busy_prompt = busy;
+                if (offhours) result.off_hours_prompt = offhours;
+                if (noanswer) result.no_answer_prompt = noanswer;
+                // New prompts
+                if (this.vpCallbackOfferType === 'custom' && this.vpCallbackOfferCustom) result.callback_offer_prompt = this.vpCallbackOfferCustom;
+                if (this.vpCallbackConfirmType === 'custom' && this.vpCallbackConfirmCustom) result.callback_confirm_prompt = this.vpCallbackConfirmCustom;
+                if (this.vpFinalDestType === 'custom' && this.vpFinalDestCustom) result.final_destination_prompt = this.vpFinalDestCustom;
+                return Object.keys(result).length ? result : null;
+            },
+            resolvePrompt(type, lang, custom) {
+                if (lang === 'none' || !lang) return null;
+                if (lang === 'custom') return custom || null;
+                return this.VP_PATHS[type]?.[lang] || null;
+            },
+            async downloadAudio(url, type) {
+                const loadingKey = type === 'transfer' ? 'downloadingTransfer'
+                    : type === 'busy' ? 'downloadingBusy'
+                    : type === 'noanswer' ? 'downloadingNoAnswer' : 'downloadingOffHours';
+                this[loadingKey] = true;
+                try {
+                    const resp = await fetch(`${this.apiPrefix}/queues/download-audio`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                        body: JSON.stringify({ url }),
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) throw new Error(data?.message || 'Download failed');
+                    const path = data.path;
+                    if (type === 'transfer') { this.vpTransferCustom = path; this.vpTransferPath = path; }
+                    else if (type === 'busy') { this.vpBusyCustom = path; this.vpBusyPath = path; }
+                    else if (type === 'noanswer') { this.vpNoAnswerCustom = path; this.vpNoAnswerPath = path; }
+                    else { this.vpOffHoursCustom = path; this.vpOffHoursPath = path; }
+                } catch (err) {
+                    console.error(err);
+                    alert(err.message || 'Download failed');
+                } finally {
+                    this[loadingKey] = false;
+                }
+            },
+            previewAudio(type) {
+                let path = type === 'transfer' ? this.vpTransferPath
+                    : type === 'busy' ? this.vpBusyPath
+                    : type === 'noanswer' ? this.vpNoAnswerPath : this.vpOffHoursPath;
+                if (!path) {
+                    const lang = type === 'transfer' ? this.vpTransferType
+                        : type === 'busy' ? this.vpBusyType
+                        : type === 'noanswer' ? this.vpNoAnswerType : this.vpOffHoursType;
+                    if (lang && lang !== 'none' && lang !== 'custom') {
+                        path = this.VP_PATHS[type]?.[lang];
+                    }
+                }
+                if (!path) return;
+                const url = `${this.basePath}/queues/sound/${path.replace(/^sounds\//, '')}`;
+                const audio = this.$refs.audioPreview;
+                if (audio) {
+                    audio.src = url;
+                    audio.classList.remove('hidden');
+                    audio.play().catch(() => {});
+                }
+            },
+            addComfort() {
+                if (!this.form.spec.announcements) {
+                    this.form.spec.announcements = { ewt_announce_interval_secs: 0, ewt_max_secs: 1800, comfort_prompts: [] };
+                }
+                if (!Array.isArray(this.form.spec.announcements.comfort_prompts)) {
+                    this.form.spec.announcements.comfort_prompts = [];
+                }
+                if (this.form.spec.announcements.comfort_prompts.length >= 15) return;
+                this.form.spec.announcements.comfort_prompts.push({
+                    audio_file: '',
+                    interval_secs: 30,
+                    order: this.form.spec.announcements.comfort_prompts.length,
+                });
+            },
+            moveComfort(idx, dir) {
+                const list = this.form.spec.announcements?.comfort_prompts;
+                if (!Array.isArray(list)) return;
+                const target = idx + dir;
+                if (target < 0 || target >= list.length) return;
+                const tmp = list[idx];
+                list[idx] = list[target];
+                list[target] = tmp;
+                // Reassign order
+                list.forEach(function(p, i) { p.order = i; });
+            },
+            previewComfort(idx) {
+                const list = this.form.spec.announcements?.comfort_prompts;
+                if (!Array.isArray(list) || !list[idx]) return;
+                const path = list[idx].audio_file;
+                if (!path) return;
+                const url = this.basePath + '/queues/sound/' + path.replace(/^sounds\//, '');
+                const audio = this.$refs.audioPreview;
+                if (audio) {
+                    audio.src = url;
+                    audio.classList.remove('hidden');
+                    audio.play().catch(function() {});
+                }
+            },
+            tabButtonClasses(tab) {
+                return this.activeTab === tab
+                    ? 'rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm'
+                    : 'rounded-lg px-4 py-2 text-sm font-semibold text-slate-600 hover:text-slate-900';
+            },
+            applyModel(model) {
+                if (!model || typeof model !== 'object') {
+                    return;
+                }
+                if (model.name) {
+                    this.form.name = model.name;
+                }
+                this.form.description = model.description || '';
+                this.form.is_active = model.is_active !== false;
+                const tags = Array.isArray(model.tags) ? model.tags : [];
+                this.form.tags_input = tags.join(', ');
+
+                const spec = this.normalizeSpec(model.spec || {});
+                this.form.spec = spec;
+                this.holdEnabled = Boolean(spec.hold && (spec.hold.audio_file || spec.hold.loop_playback === false));
+                this.fallbackMode = this.detectFallbackMode(spec.fallback);
+                // Parse voice prompts from spec
+                this.loadVoicePrompts(spec.voice_prompts);
+                this.pageTitle = this.mode === 'edit'
+                    ? (model.name ? `${this.tt('queue.detail_subtitle_edit')} - ${model.name}` : this.tt('queue.detail_subtitle_edit'))
+                    : this.tt('queue.new_queue');
+            },
+            normalizeSpec(raw) {
+                const spec = {
+                    accept_immediately: Boolean(raw.accept_immediately),
+                    passthrough_ringback: Boolean(raw.passthrough_ringback),
+                    hold: {
+                        audio_file: raw?.hold?.audio_file || '',
+                        loop_playback: raw?.hold?.loop_playback !== false,
+                    },
+                    fallback: {
+                        redirect: raw?.fallback?.redirect || '',
+                        failure_code: raw?.fallback?.failure_code || null,
+                        failure_reason: raw?.fallback?.failure_reason || '',
+                        failure_prompt: raw?.fallback?.failure_prompt || '',
+                        queue_ref: raw?.fallback?.queue_ref || '',
+                        skill_group_ref: this.extractSkillGroupId(raw?.fallback?.skill_group_ref || ''),
+                    },
+                    strategy: {
+                        mode: raw?.strategy?.mode === 'parallel' ? 'parallel' : 'sequential',
+                        wait_timeout_secs: Number.isFinite(Number(raw?.strategy?.wait_timeout_secs))
+                            ? Number(raw.strategy.wait_timeout_secs)
+                            : null,
+                        targets: (() => {
+                            const list = [];
+                            if (Array.isArray(raw?.strategy?.targets)) {
+                                raw.strategy.targets.forEach((target) => {
+                                    const uriText = (target?.uri || '').trim();
+                                    const legacySkillId = this.extractSkillGroupId(target?.skill_group_id || uriText);
+                                    if (legacySkillId && (/^skill(?:-|_)?group:/i.test(uriText) || target?.skill_group_id)) {
+                                        list.push({
+                                            uri: this.toSkillGroupUri(legacySkillId),
+                                            label: (target?.label || '').trim(),
+                                            skill_group_id: legacySkillId,
+                                        });
+                                        return;
+                                    }
+                                    if (uriText) {
+                                        list.push({
+                                            uri: uriText,
+                                            label: (target?.label || '').trim(),
+                                        });
+                                    }
+                                });
+                            }
+                            if (Array.isArray(raw?.strategy?.skill_groups)) {
+                                raw.strategy.skill_groups.forEach((entry) => {
+                                    const skillId = this.extractSkillGroupId(entry);
+                                    if (!skillId) {
+                                        return;
+                                    }
+                                    list.push({
+                                        uri: this.toSkillGroupUri(skillId),
+                                        label: '',
+                                        skill_group_id: skillId,
+                                    });
+                                });
+                            }
+                            const seen = new Set();
+                            return list.filter((target) => {
+                                const key = `${target.uri}|${target.label || ''}`;
+                                if (!target.uri || seen.has(key)) {
+                                    return false;
+                                }
+                                seen.add(key);
+                                return true;
+                            });
+                        })(),
+                    },
+                    voice_prompts: raw?.voice_prompts || null,
+                    // Callback
+                    callback: {
+                        callback_request_enabled: Boolean(raw?.callback?.callback_request_enabled),
+                        callback_offer_after_secs: Number.isFinite(Number(raw?.callback?.callback_offer_after_secs)) ? Number(raw.callback.callback_offer_after_secs) : 30,
+                        callback_dtmf_key: raw?.callback?.callback_dtmf_key || '2',
+                    },
+                    // Announcements
+                    announcements: {
+                        ewt_announce_interval_secs: Number.isFinite(Number(raw?.announcements?.ewt_announce_interval_secs)) ? Number(raw.announcements.ewt_announce_interval_secs) : 0,
+                        ewt_max_secs: Number.isFinite(Number(raw?.announcements?.ewt_max_secs)) ? Number(raw.announcements.ewt_max_secs) : 1800,
+                        comfort_prompts: Array.isArray(raw?.announcements?.comfort_prompts) ? raw.announcements.comfort_prompts.map(function(p, idx) { return { audio_file: p.audio_file || '', interval_secs: p.interval_secs || 30, order: p.order || idx }; }) : [],
+                    },
+                };
+                return spec;
+            },
+            detectFallbackMode(fallback) {
+                if ((fallback?.skill_group_ref || '').trim()) {
+                    return 'skill_group';
+                }
+                if ((fallback?.queue_ref || '').trim().toLowerCase().startsWith('skill-group:')) {
+                    const ref = this.extractSkillGroupId(fallback.queue_ref);
+                    if (this.form?.spec?.fallback) {
+                        this.form.spec.fallback.skill_group_ref = ref;
+                        this.form.spec.fallback.queue_ref = '';
+                    }
+                    return 'skill_group';
+                }
+                if ((fallback?.queue_ref || '').trim()) {
+                    return 'queue';
+                }
+                if (fallback?.redirect) {
+                    return 'redirect';
+                }
+                if (fallback && (fallback.failure_code || fallback.failure_prompt || fallback.failure_reason)) {
+                    return 'failure';
+                }
+                return 'none';
+            },
+            toggleActive() {
+                this.form.is_active = !this.form.is_active;
+            },
+            tagList() {
+                const parts = (this.form.tags_input || '')
+                    .split(',')
+                    .map((part) => part.trim())
+                    .filter(Boolean);
+                const unique = [];
+                parts.forEach((value) => {
+                    if (!unique.some((existing) => existing.toLowerCase() === value.toLowerCase())) {
+                        unique.push(value);
+                    }
+                });
+                return unique;
+            },
+            addStrategyTarget(type) {
+                if (!Array.isArray(this.form.spec.strategy.targets)) {
+                    this.form.spec.strategy.targets = [];
+                }
+                if (type === 'skill_group') {
+                    this.form.spec.strategy.targets.push({ 
+                        uri: 'skill-group:', 
+                        label: '',
+                        skill_group_id: ''
+                    });
+                } else {
+                    this.form.spec.strategy.targets.push({ uri: '', label: '' });
+                }
+            },
+            removeStrategyTarget(index) {
+                if (!Array.isArray(this.form.spec.strategy.targets)) {
+                    return;
+                }
+                this.form.spec.strategy.targets.splice(index, 1);
+            },
+            prepareSpec() {
+                const spec = {
+                    accept_immediately: Boolean(this.form.spec.accept_immediately),
+                    passthrough_ringback: Boolean(this.form.spec.passthrough_ringback && this.form.spec.accept_immediately),
+                };
+                if (this.holdEnabled) {
+                    const audio = (this.form.spec.hold?.audio_file || '').trim();
+                    if (audio) {
+                        spec.hold = {
+                            audio_file: audio,
+                            loop_playback: this.form.spec.hold?.loop_playback !== false,
+                        };
+                    }
+                }
+                if (this.fallbackMode === 'redirect') {
+                    const target = (this.form.spec.fallback?.redirect || '').trim();
+                    if (target) {
+                        spec.fallback = { redirect: target };
+                    }
+                } else if (this.fallbackMode === 'queue') {
+                    const queueRef = (this.form.spec.fallback?.queue_ref || '').trim();
+                    if (queueRef) {
+                        spec.fallback = { queue_ref: queueRef };
+                    }
+                } else if (this.fallbackMode === 'skill_group') {
+                    const skillGroupRef = (this.form.spec.fallback?.skill_group_ref || '').trim();
+                    if (skillGroupRef) {
+                        spec.fallback = { skill_group_ref: skillGroupRef };
+                    }
+                } else if (this.fallbackMode === 'failure') {
+                    const code = Number(this.form.spec.fallback?.failure_code);
+                    const payload = {
+                        failure_code: Number.isFinite(code) ? code : null,
+                        failure_reason: (this.form.spec.fallback?.failure_reason || '').trim() || null,
+                        failure_prompt: (this.form.spec.fallback?.failure_prompt || '').trim() || null,
+                    };
+                    if (payload.failure_code || payload.failure_reason || payload.failure_prompt) {
+                        spec.fallback = payload;
+                    }
+                }
+
+                const strategyMode = this.form.spec.strategy?.mode === 'parallel' ? 'parallel' : 'sequential';
+                const targets = (this.form.spec.strategy?.targets || [])
+                    .map((target) => {
+                        const uri = (target.uri || '').trim();
+                        // Handle skill-group targets
+                        if (/^skill(?:-|_)?group:/i.test(uri) || target?.skill_group_id) {
+                            const skillGroupId = this.extractSkillGroupId(target.skill_group_id || uri);
+                            if (skillGroupId) {
+                                return {
+                                    uri: this.toSkillGroupUri(skillGroupId),
+                                    label: (target.label || '').trim() || null,
+                                };
+                            }
+                            return null;
+                        }
+                        return {
+                            uri: uri,
+                            label: (target.label || '').trim() || null,
+                        };
+                    })
+                    .filter(Boolean)
+                    .filter((target) => target.uri);
+                const waitTimeoutRaw = Number(this.form.spec.strategy?.wait_timeout_secs);
+                const waitTimeout = Number.isFinite(waitTimeoutRaw) && waitTimeoutRaw > 0
+                    ? Math.trunc(waitTimeoutRaw)
+                    : null;
+                if (targets.length || waitTimeout !== null || strategyMode === 'parallel') {
+                    spec.strategy = {
+                        mode: strategyMode,
+                        wait_timeout_secs: waitTimeout,
+                        targets,
+                    };
+                }
+                // Voice prompts
+                spec.voice_prompts = this.buildVoicePrompts();
+                // Callback
+                if (this.form.spec.callback?.callback_request_enabled) {
+                    spec.callback = {
+                        callback_request_enabled: true,
+                        callback_offer_after_secs: this.form.spec.callback.callback_offer_after_secs || 30,
+                        callback_dtmf_key: this.form.spec.callback.callback_dtmf_key || '2',
+                    };
+                }
+                // Announcements
+                if (this.form.spec.announcements?.ewt_announce_interval_secs > 0
+                    || this.form.spec.announcements?.ewt_max_secs !== 1800
+                    || (this.form.spec.announcements?.comfort_prompts || []).length > 0) {
+                    const comfortPrompts = (this.form.spec.announcements?.comfort_prompts || [])
+                        .filter(function(p) { return p.audio_file && p.audio_file.trim(); })
+                        .map(function(p, idx) {
+                            return {
+                                audio_file: p.audio_file.trim(),
+                                interval_secs: p.interval_secs || 30,
+                                order: p.order != null ? p.order : idx,
+                            };
+                        });
+                    spec.announcements = {
+                        ewt_announce_interval_secs: this.form.spec.announcements.ewt_announce_interval_secs || 0,
+                        ewt_max_secs: this.form.spec.announcements.ewt_max_secs || 1800,
+                        comfort_prompts: comfortPrompts,
+                    };
+                }
+                return spec;
+            },
+            buildPayload() {
+                var payload = {
+                    name: this.form.name?.trim(),
+                    description: this.form.description?.trim() || null,
+                    is_active: Boolean(this.form.is_active),
+                    tags: this.tagList(),
+                    spec: this.prepareSpec(),
+                };
+                return payload;
+            },
+            async submit() {
+                this.saving = true;
+                this.success = null;
+                this.error = null;
+                try {
+                    const payload = this.buildPayload();
+                    const isEdit = this.mode === 'edit';
+                    const endpoint = isEdit && this.updateUrl ? this.updateUrl : this.createUrl;
+                    const method = isEdit ? 'PATCH' : 'PUT';
+                    const response = await fetch(endpoint, {
+                        method,
+                        headers: {
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || this.tt('queue.save_failed'));
+                    }
+                    this.success = isEdit ? this.tt('queue.queue_updated') : this.tt('queue.queue_created');
+                    if (!isEdit && data?.id) {
+                        window.location.href = `${this.basePath}/queues/${data.id}`;
+                        return;
+                    }
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || this.tt('queue.save_failed');
+                } finally {
+                    this.saving = false;
+                }
+            },
+            formatDate(value) {
+                if (!value) return '-';
+                const date = new Date(value);
+                if (Number.isNaN(date.getTime())) {
+                    return value;
+                }
+                return date.toLocaleString();
+            },
+        }));
+    });
+</script>
+{% endblock %}

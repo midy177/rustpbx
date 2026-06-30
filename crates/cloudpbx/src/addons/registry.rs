@@ -1,0 +1,439 @@
+use crate::addons::Addon;
+use crate::addons::export_reload::ExportReloadRegistry;
+use crate::app::AppState;
+use std::sync::Arc;
+
+/// Replace `/static` prefix in a URL with the configured static_path.
+fn normalize_static_url(url: &str, config: &crate::config::Config) -> String {
+    let prefix = config.static_path();
+    if url.starts_with("/static/") && prefix != "/static" {
+        format!("{}{}", prefix, &url["/static".len()..])
+    } else {
+        url.to_string()
+    }
+}
+
+pub struct AddonRegistry {
+    addons: Vec<Box<dyn Addon>>,
+    pub export_reload: ExportReloadRegistry,
+}
+
+impl Default for AddonRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AddonRegistry {
+    pub fn new() -> Self {
+        let mut addons: Vec<Box<dyn Addon>> = Vec::new();
+
+        // Observability: community build uses ObservabilityAddon (/metrics + /healthz);
+        // commercial addon-telemetry replaces it with OTel tracing + Prometheus.
+        #[cfg(all(feature = "addon-observability", not(feature = "addon-telemetry")))]
+        {
+            super::observability::ObservabilityAddon::install_recorder().ok();
+            addons.push(Box::new(super::observability::ObservabilityAddon::new()));
+        }
+        #[cfg(feature = "addon-telemetry")]
+        {
+            super::telemetry::TelemetryAddon::install_recorder().ok();
+            addons.push(Box::new(super::telemetry::TelemetryAddon::new()));
+        }
+
+        // ACME Addon (Free/Built-in for now as per request)
+        #[cfg(feature = "addon-acme")]
+        addons.push(Box::new(super::acme::AcmeAddon::new()));
+
+        // Archive Addon
+        #[cfg(feature = "addon-archive")]
+        addons.push(Box::new(super::archive::ArchiveAddon::new()));
+
+        // Wholesale Addon
+        #[cfg(feature = "addon-wholesale")]
+        addons.push(Box::new(super::wholesale::WholesaleAddon::new()));
+
+        // Transcript Addon
+        #[cfg(feature = "addon-transcript")]
+        addons.push(Box::new(super::transcript::TranscriptAddon::new()));
+
+        // Endpoint Manager Addon
+        #[cfg(feature = "addon-endpoint-manager")]
+        addons.push(Box::new(
+            super::endpoint_manager::EndpointManagerAddon::new(),
+        ));
+
+        // Enterprise Auth Addon
+        #[cfg(feature = "addon-enterprise-auth")]
+        addons.push(Box::new(super::enterprise_auth::EnterpriseAuthAddon::new()));
+
+        // Voicemail Addon (Commercial)
+        #[cfg(feature = "addon-voicemail")]
+        addons.push(Box::new(super::voicemail::VoicemailAddon::new()));
+
+        // IVR Editor Addon (Commercial)
+        #[cfg(feature = "addon-ivr-editor")]
+        addons.push(Box::new(super::ivr_editor::IvrEditorAddon::new()));
+
+        // SBC Addon
+        #[cfg(feature = "addon-sbc")]
+        addons.push(Box::new(super::sbc::SbcAddon::new()));
+
+        // Queue Addon
+        addons.push(Box::new(super::queue::QueueAddon::new()));
+
+        // CC Addon (Contact Center)
+        #[cfg(feature = "addon-cc")]
+        addons.push(Box::new(super::cc::CcAddon::new()));
+
+        // Collect export/reload handlers from addons (not gated by feature)
+        let mut export_reload = ExportReloadRegistry::default();
+        for addon in &addons {
+            if let Some(handler) = addon.export_reload_handler() {
+                export_reload.register(handler);
+            }
+        }
+
+        Self {
+            addons,
+            export_reload,
+        }
+    }
+
+    pub async fn initialize_all(&self, state: AppState) -> anyhow::Result<()> {
+        let config = state.config();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                tracing::info!("Addon {} is disabled", addon.name());
+                continue;
+            }
+            tracing::info!("Initializing addon: {}", addon.name());
+            // Commercial addons would check license here
+            if let Err(e) = addon.initialize(state.clone()).await {
+                tracing::error!("Failed to initialize addon {}: {}", addon.name(), e);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn seed_all_fixtures(&self, state: AppState) -> anyhow::Result<()> {
+        let config = state.config();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Err(e) = addon.seed_fixtures(state.clone()).await {
+                tracing::error!("Failed to seed fixtures for addon {}: {}", addon.name(), e);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_routers(&self, state: AppState) -> axum::Router {
+        let config = state.config();
+        let mut router = axum::Router::new();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(r) = addon.router(state.clone()) {
+                router = router.merge(r);
+            }
+        }
+        router
+    }
+
+    pub fn get_injected_scripts(&self, path: &str, config: &crate::config::Config) -> Vec<String> {
+        let mut scripts = Vec::new();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            for injection in addon.inject_scripts() {
+                if let Ok(re) = regex::Regex::new(injection.url_path_regex)
+                    && re.is_match(path)
+                {
+                    scripts.push(normalize_static_url(&injection.script_url, config));
+                }
+            }
+        }
+        scripts
+    }
+
+    pub fn get_sidebar_items(&self, state: AppState) -> Vec<super::SidebarItem> {
+        let config = state.config();
+        self.addons
+            .iter()
+            .filter(|a| self.is_enabled(a.id(), config))
+            .flat_map(|a| a.sidebar_items(state.clone()))
+            .collect()
+    }
+
+    pub fn get_template_dirs(&self, state: AppState) -> Vec<String> {
+        let config = state.config();
+        self.addons
+            .iter()
+            .filter(|a| self.is_enabled(a.id(), config))
+            .flat_map(|a| {
+                [
+                    format!("src/addons/{}/templates", a.id()),
+                    format!("templates/{}", a.id()),
+                ]
+            })
+            .collect()
+    }
+
+    /// Return locale directories for all addons that provide translations (not just enabled ones).
+    /// This is needed because the admin UI needs to display all addons even if not enabled.
+    pub fn get_locale_dirs(&self, _state: AppState) -> Vec<(String, String)> {
+        self.addons
+            .iter()
+            .filter_map(|a| a.locales_dir().map(|dir| (a.id().to_string(), dir)))
+            .collect()
+    }
+
+    pub fn list_addons(&self, state: AppState) -> Vec<super::AddonInfo> {
+        let config = state.config().clone();
+        self.addons
+            .iter()
+            .map(|a| {
+                let config_url = a.config_url(state.clone());
+
+                super::AddonInfo {
+                    id: a.id().to_string(),
+                    name: a.name().to_string(),
+                    description: a.description().to_string(),
+                    enabled: false, // Caller should set this
+                    config_url,
+                    category: a.category(),
+                    bundle: a.bundle().map(|s| s.to_string()),
+                    developer: a.developer().to_string(),
+                    website: a.website().to_string(),
+                    cost: a.cost().to_string(),
+                    screenshots: a
+                        .screenshots()
+                        .iter()
+                        .map(|s| normalize_static_url(s, &config))
+                        .collect(),
+                    restart_required: false, // Caller should set this
+                    #[cfg(feature = "commerce")]
+                    license_status: None,
+                    #[cfg(feature = "commerce")]
+                    license_expiry: None,
+                    #[cfg(feature = "commerce")]
+                    license_plan: None,
+                }
+            })
+            .collect()
+    }
+
+    pub fn is_enabled(&self, id: &str, config: &crate::config::Config) -> bool {
+        if let Some(addons) = &config.proxy.addons {
+            return addons.iter().any(|a| a == id);
+        }
+        false
+    }
+
+    // ── Console route hooks ──────────────────────────────────────────────────
+
+    /// Collect console page routes from all enabled addons.
+    #[cfg(feature = "console")]
+    pub fn get_console_page_routes(
+        &self,
+        state: &crate::console::ConsoleState,
+        config: &crate::config::Config,
+    ) -> Vec<axum::Router<Arc<crate::console::ConsoleState>>> {
+        let mut routers = Vec::new();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(r) = addon.console_page_routes(state) {
+                routers.push(r);
+            }
+        }
+        routers
+    }
+
+    /// Collect console API routes from all enabled addons.
+    #[cfg(feature = "console")]
+    pub fn get_console_api_routes(
+        &self,
+        state: &crate::console::ConsoleState,
+        config: &crate::config::Config,
+    ) -> Vec<axum::Router<Arc<crate::console::ConsoleState>>> {
+        let mut routers = Vec::new();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(r) = addon.console_api_routes(state) {
+                routers.push(r);
+            }
+        }
+        routers
+    }
+
+    /// Get the first phone auth token validator from any enabled addon.
+    #[cfg(feature = "console")]
+    pub fn get_phone_auth_validator(
+        &self,
+        state: &crate::console::ConsoleState,
+        config: &crate::config::Config,
+    ) -> Option<crate::auth::DynTokenValidator> {
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(validator) = addon.phone_auth_validator(state) {
+                return Some(validator);
+            }
+        }
+        None
+    }
+
+    pub fn get_call_record_hooks(
+        &self,
+        config: &crate::config::Config,
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<Box<dyn crate::callrecord::CallRecordHook>> {
+        self.addons
+            .iter()
+            .filter(|a| self.is_enabled(a.id(), config))
+            .filter_map(|a| a.call_record_hook(db))
+            .collect()
+    }
+
+    pub fn get_addon(&self, id: &str) -> Option<&dyn Addon> {
+        self.addons
+            .iter()
+            .find(|a| a.id() == id)
+            .map(|a| a.as_ref())
+    }
+
+    pub async fn authenticate_all(
+        &self,
+        state: AppState,
+        identifier: &str,
+        password: &str,
+    ) -> anyhow::Result<Option<crate::models::user::Model>> {
+        let config = state.config();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(user) = addon
+                .authenticate(state.clone(), identifier, password)
+                .await?
+            {
+                return Ok(Some(user));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn apply_proxy_server_hooks(
+        &self,
+        mut builder: crate::proxy::server::SipServerBuilder,
+        ctx: Arc<crate::app::CoreContext>,
+    ) -> crate::proxy::server::SipServerBuilder {
+        let config = &ctx.config;
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            builder = addon.proxy_server_hook(builder, ctx.clone());
+            // Register dialplan inspectors from addons
+            if let Some(inspector) = addon.dialplan_inspector() {
+                builder = builder.with_dialplan_inspector(inspector);
+            }
+            if let Some(enricher) = addon.queue_location_enricher() {
+                builder = builder.with_queue_location_enricher(enricher);
+            }
+        }
+        builder
+    }
+
+    // ── Extension lifecycle hooks ───────────────────────────────────────────
+
+    pub async fn on_extension_created(
+        &self,
+        config: &crate::config::Config,
+        db: &sea_orm::DatabaseConnection,
+        extension: &str,
+    ) {
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Err(e) = addon.on_extension_created(db, extension).await {
+                tracing::warn!(
+                    addon = %addon.id(),
+                    extension = %extension,
+                    error = %e,
+                    "on_extension_created hook failed"
+                );
+            }
+        }
+    }
+
+    pub async fn on_extension_updated(
+        &self,
+        config: &crate::config::Config,
+        db: &sea_orm::DatabaseConnection,
+        extension: &str,
+    ) {
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Err(e) = addon.on_extension_updated(db, extension).await {
+                tracing::warn!(
+                    addon = %addon.id(),
+                    extension = %extension,
+                    error = %e,
+                    "on_extension_updated hook failed"
+                );
+            }
+        }
+    }
+
+    pub async fn on_extension_deleting(
+        &self,
+        config: &crate::config::Config,
+        db: &sea_orm::DatabaseConnection,
+        extension: &str,
+    ) {
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Err(e) = addon.on_extension_deleting(db, extension).await {
+                tracing::warn!(
+                    addon = %addon.id(),
+                    extension = %extension,
+                    error = %e,
+                    "on_extension_deleting hook failed"
+                );
+            }
+        }
+    }
+
+    /// Run database migrations for all enabled addons.
+    pub async fn run_migrations(&self, db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
+        let manager = sea_orm_migration::SchemaManager::new(db);
+        for addon in &self.addons {
+            for migration in addon.migrations() {
+                if let Err(e) = migration.up(&manager).await {
+                    return Err(anyhow::anyhow!(
+                        "Migration '{}' for addon '{}' failed: {}",
+                        migration.name(),
+                        addon.name(),
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}

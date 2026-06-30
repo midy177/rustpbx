@@ -1,0 +1,1570 @@
+use crate::rwi::auth::RwiConfig;
+use crate::{
+    call::{CallRecordingConfig, DialDirection, QueuePlan, user::SipUser},
+    proxy::routing::{RouteQueueConfig, RouteRule, TrunkConfig},
+    storage::StorageConfig,
+};
+use anyhow::{Error, Result};
+use clap::Parser;
+use ipnetwork::IpNetwork;
+use rsipstack::dialog::invitation::InviteOption;
+use rsipstack::sip::StatusCode;
+use rustrtc::IceServer;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf};
+
+#[derive(Parser, Debug)]
+#[command(version)]
+pub(crate) struct Cli {
+    #[clap(long, default_value = "rustpbx.toml")]
+    pub conf: Option<String>,
+}
+
+pub(crate) fn default_config_recorder_path() -> String {
+    #[cfg(target_os = "windows")]
+    return "./config/recorders".to_string();
+    #[cfg(not(target_os = "windows"))]
+    return "./config/recorders".to_string();
+}
+
+fn default_config_http_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+fn default_ami_config() -> Option<AmiConfig> {
+    Some(AmiConfig::default())
+}
+fn default_database_url() -> String {
+    "sqlite://rustpbx.sqlite3".to_string()
+}
+
+fn default_console_session_secret() -> String {
+    rsipstack::transaction::random_text(32)
+}
+
+fn default_console_base_path() -> String {
+    "/console".to_string()
+}
+
+fn default_console_api_prefix() -> String {
+    "/api".to_string()
+}
+
+fn default_config_rtp_start_port() -> Option<u16> {
+    Some(12000)
+}
+
+fn default_config_rtp_end_port() -> Option<u16> {
+    Some(42000)
+}
+
+fn default_config_webrtc_start_port() -> Option<u16> {
+    Some(30000)
+}
+
+fn default_config_webrtc_end_port() -> Option<u16> {
+    Some(40000)
+}
+
+fn default_useragent() -> Option<String> {
+    Some(crate::version::get_useragent())
+}
+
+fn default_nat_fix() -> bool {
+    true
+}
+
+fn default_callid_suffix() -> Option<String> {
+    Some("miuda.ai".to_string())
+}
+
+fn default_user_backends() -> Vec<UserBackendConfig> {
+    vec![UserBackendConfig::default()]
+}
+
+fn default_enable_latching() -> bool {
+    true
+}
+
+fn default_latching_probation_max_packets() -> Option<u8> {
+    Some(6)
+}
+
+fn default_rtp_timeout() -> Option<u64> {
+    Some(30)
+}
+
+fn default_generated_config_dir() -> String {
+    "./config".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingDirection {
+    Inbound,
+    Outbound,
+    Internal,
+}
+
+impl RecordingDirection {
+    pub fn matches(&self, direction: &DialDirection) -> bool {
+        matches!(
+            (self, direction),
+            (RecordingDirection::Inbound, DialDirection::Inbound)
+                | (RecordingDirection::Outbound, DialDirection::Outbound)
+                | (RecordingDirection::Internal, DialDirection::Internal)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingType {
+    #[default]
+    Local,
+    Http,
+    S3,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, rename_all = "snake_case")]
+pub struct RecordingPolicy {
+    pub enabled: Option<bool>,
+    #[serde(rename = "type")]
+    pub recording_type: Option<RecordingType>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub directions: Vec<RecordingDirection>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caller_allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caller_deny: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub callee_allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub callee_deny: Vec<String>,
+    pub auto_start: Option<bool>,
+    pub filename_pattern: Option<String>,
+    pub samplerate: Option<u32>,
+    pub ptime: Option<u32>,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub vendor: Option<crate::storage::S3Vendor>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub endpoint: Option<String>,
+    pub root: Option<String>,
+    /// When true, always use the legacy WAV file recorder for media capture
+    /// even if SipFlow backend is available. SipFlow will capture SIP
+    /// signalling only (no RTP). Media upload is handled by the
+    /// `[recording]` upload path, not `[sipflow.upload]`.
+    pub force_file: Option<bool>,
+}
+
+impl RecordingPolicy {
+    pub fn new_recording_config(&self) -> CallRecordingConfig {
+        crate::call::CallRecordingConfig {
+            enabled: self.enabled.unwrap_or(false),
+            auto_start: self.auto_start.unwrap_or(true),
+            force_file: self.force_file.unwrap_or(false),
+            option: None,
+        }
+    }
+    pub fn recorder_path(&self) -> String {
+        self.path
+            .as_ref()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .unwrap_or_else(default_config_recorder_path)
+    }
+
+    pub fn uploads_recording(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn ensure_defaults(&mut self) -> bool {
+        if self
+            .path
+            .as_ref()
+            .map(|p| p.trim().is_empty())
+            .unwrap_or(true)
+        {
+            self.path = Some(default_config_recorder_path());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    #[serde(default = "default_config_http_addr")]
+    pub http_addr: String,
+    #[serde(default)]
+    pub http_gzip: bool,
+    pub https_addr: Option<String>,
+    pub ssl_certificate: Option<String>,
+    pub ssl_private_key: Option<String>,
+    pub log_level: Option<String>,
+    pub log_file: Option<String>,
+    #[serde(default)]
+    pub log_rotation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_access_skip_paths: Vec<String>,
+    pub proxy: ProxyConfig,
+
+    pub external_ip: Option<String>,
+    pub auto_external_ip: Option<String>,
+    #[serde(default = "default_config_rtp_start_port")]
+    pub rtp_start_port: Option<u16>,
+    #[serde(default = "default_config_rtp_end_port")]
+    pub rtp_end_port: Option<u16>,
+
+    #[serde(default = "default_config_webrtc_start_port")]
+    pub webrtc_port_start: Option<u16>,
+    #[serde(default = "default_config_webrtc_end_port")]
+    pub webrtc_port_end: Option<u16>,
+
+    pub callrecord: Option<CallRecordConfig>,
+    pub ice_servers: Option<Vec<IceServer>>,
+    #[serde(default = "default_ami_config")]
+    pub ami: Option<AmiConfig>,
+    #[cfg(feature = "console")]
+    pub console: Option<ConsoleConfig>,
+    #[serde(default = "default_database_url")]
+    pub database_url: String,
+    #[serde(default)]
+    pub recording: Option<RecordingPolicy>,
+    #[serde(default)]
+    pub demo_mode: bool,
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub sipflow: Option<SipFlowConfig>,
+    #[cfg(feature = "commerce")]
+    #[serde(default)]
+    pub licenses: Option<LicenseConfig>,
+    #[serde(default)]
+    pub rwi: Option<RwiConfig>,
+    #[serde(default)]
+    pub rwi_webhook: Option<LocatorWebhookConfig>,
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterPeer {
+    pub addr: String,
+    pub sip_port: u16,
+    pub ami_port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ClusterConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<ClusterPeer>,
+}
+
+fn default_locale() -> String {
+    "en".to_string()
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LocaleInfo {
+    pub name: String,
+    pub native_name: String,
+}
+
+fn default_locales() -> std::collections::HashMap<String, LocaleInfo> {
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "en".to_string(),
+        LocaleInfo {
+            name: "English".to_string(),
+            native_name: "English".to_string(),
+        },
+    );
+    m.insert(
+        "zh".to_string(),
+        LocaleInfo {
+            name: "Chinese".to_string(),
+            native_name: "中文".to_string(),
+        },
+    );
+    m
+}
+
+#[cfg(feature = "commerce")]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct LicenseConfig {
+    #[serde(default)]
+    pub addons: HashMap<String, String>,
+    #[serde(default)]
+    pub keys: HashMap<String, String>,
+}
+
+#[cfg(feature = "commerce")]
+impl LicenseConfig {
+    pub fn get_license_for_addon(&self, addon_id: &str) -> Option<(String, String)> {
+        self.addons.get(addon_id).and_then(|key_name| {
+            self.keys
+                .get(key_name)
+                .map(|key_value| (key_name.clone(), key_value.clone()))
+        })
+    }
+
+    pub fn get_addons_for_key(&self, key_name: &str) -> Vec<&str> {
+        self.addons
+            .iter()
+            .filter(|(_, k)| k == &key_name)
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ConsoleConfig {
+    #[serde(default = "default_console_session_secret")]
+    pub session_secret: String,
+    #[serde(default = "default_console_base_path")]
+    pub base_path: String,
+    /// API prefix for REST endpoints (default: "/api")
+    /// All REST API endpoints will be prefixed with this path
+    #[serde(default = "default_console_api_prefix")]
+    pub api_prefix: String,
+    #[serde(default)]
+    pub allow_registration: bool,
+    #[serde(default)]
+    pub secure_cookie: bool,
+    pub alpine_js: Option<String>,
+    pub tailwind_js: Option<String>,
+    pub chart_js: Option<String>,
+    pub jssip_js: Option<String>,
+    /// Default locale code, e.g. "en" or "zh"
+    #[serde(default = "default_locale")]
+    pub locale_default: String,
+    /// Supported locales map: code -> LocaleInfo
+    #[serde(default = "default_locales")]
+    pub locales: std::collections::HashMap<String, LocaleInfo>,
+    /// Static files HTTP path prefix (default: "/static")
+    pub static_path: Option<String>,
+    /// Static API tokens for authenticating to /api endpoints.
+    /// Each token has an optional list of scopes (e.g. ["call.control", "recording"]).
+    #[serde(default)]
+    pub api_tokens: Vec<ApiTokenConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ApiTokenConfig {
+    pub token: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            session_secret: default_console_session_secret(),
+            base_path: default_console_base_path(),
+            api_prefix: default_console_api_prefix(),
+            allow_registration: false,
+            secure_cookie: false,
+            alpine_js: None,
+            tailwind_js: None,
+            chart_js: None,
+            jssip_js: None,
+            locale_default: default_locale(),
+            locales: default_locales(),
+            static_path: None,
+            api_tokens: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum UserBackendConfig {
+    Memory {
+        users: Option<Vec<SipUser>>,
+    },
+    Http {
+        url: String,
+        method: Option<String>,
+        username_field: Option<String>,
+        realm_field: Option<String>,
+        request_uri_field: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        sip_headers: Option<Vec<String>>,
+        /// If set, enables one-shot token auth: when the SIP request carries
+        /// this header, the token is forwarded to the HTTP service for
+        /// immediate validation (skipping the 401/407 Digest challenge).
+        token_header: Option<String>,
+        /// HTTP request timeout in milliseconds (applies to both token auth
+        /// and Digest password lookup). Default: 5000.
+        http_timeout_ms: Option<u64>,
+        /// Number of retries on HTTP failure. Default: 1.
+        http_retry_count: Option<u32>,
+        /// Delay between retries in milliseconds. Default: 500.
+        http_retry_delay_ms: Option<u64>,
+        /// Token cache TTL in seconds. 0 = disabled. Default: 0.
+        token_cache_ttl_secs: Option<u64>,
+        /// Maximum token cache entries (LRU eviction). Default: 10000.
+        token_cache_size: Option<usize>,
+    },
+    Plain {
+        path: String,
+    },
+    Database {
+        url: Option<String>,
+        table_name: Option<String>,
+        id_column: Option<String>,
+        username_column: Option<String>,
+        password_column: Option<String>,
+        enabled_column: Option<String>,
+        realm_column: Option<String>,
+    },
+    Extension {
+        #[serde(default)]
+        database_url: Option<String>,
+        #[serde(default)]
+        ttl: Option<u64>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum LocatorConfig {
+    #[default]
+    Memory,
+    Http {
+        url: String,
+        method: Option<String>,
+        username_field: Option<String>,
+        expires_field: Option<String>,
+        realm_field: Option<String>,
+        headers: Option<HashMap<String, String>>,
+    },
+    Database {
+        url: String,
+    },
+}
+
+pub use crate::storage::S3Vendor;
+
+pub const DEFAULT_CALL_RECORD_MAX_CONCURRENT: usize = 64;
+
+fn default_call_record_max_concurrent() -> usize {
+    DEFAULT_CALL_RECORD_MAX_CONCURRENT
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct CallRecordConfig {
+    /// Maximum concurrent call record save/hook tasks (minimum: 1).
+    #[serde(default = "default_call_record_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(flatten)]
+    pub storage: CallRecordStorageConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum CallRecordStorageConfig {
+    Local {
+        root: String,
+    },
+    S3 {
+        vendor: S3Vendor,
+        bucket: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+        endpoint: String,
+        root: String,
+        /// Deprecated and unused. Recording media upload is configured by `[recording]`.
+        with_media: Option<bool>,
+        /// Deprecated with `with_media`; accepted for config compatibility.
+        keep_media_copy: Option<bool>,
+    },
+    Http {
+        url: String,
+        headers: Option<HashMap<String, String>>,
+        /// Deprecated and unused. Recording media upload is configured by `[recording]`.
+        with_media: Option<bool>,
+        /// Deprecated with `with_media`; accepted for config compatibility.
+        keep_media_copy: Option<bool>,
+    },
+    Database {
+        /// Database URL for call records.
+        database_url: Option<String>,
+        /// Table name for call records (default: "call_records")
+        #[serde(default = "default_call_record_table")]
+        table_name: String,
+    },
+}
+
+fn default_call_record_table() -> String {
+    "call_records".to_string()
+}
+
+/// Directory structure for sipflow storage
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SipFlowSubdirs {
+    /// No subdirectory structure - all files in root
+    None,
+    /// Daily subdirectories (YYYYMMDD)
+    #[default]
+    Daily,
+    /// Hourly subdirectories (YYYYMMDD/HH)
+    Hourly,
+}
+
+/// Storage engine selection for the Local sipflow backend.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub enum SipFlowEngine {
+    /// Use FlowDB LSM-tree engine.
+    #[serde(rename = "flowdb")]
+    FlowDb,
+    /// Use SQLite + raw-file engine (default).
+    #[default]
+    #[serde(rename = "sqlite")]
+    Sqlite,
+}
+
+/// Upload configuration for SipFlow recordings
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum SipFlowUploadConfig {
+    S3 {
+        vendor: S3Vendor,
+        bucket: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+        endpoint: String,
+        root: String,
+        #[serde(default)]
+        signaling: Option<bool>,
+        #[serde(default = "default_true")]
+        media: Option<bool>,
+    },
+    Http {
+        url: String,
+        headers: Option<HashMap<String, String>>,
+        #[serde(default)]
+        signaling: Option<bool>,
+        #[serde(default = "default_true")]
+        media: Option<bool>,
+    },
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct SipFlowClusterNode {
+    pub udp: String,
+    pub http: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum SipFlowConfig {
+    Local {
+        root: String,
+        #[serde(default)]
+        subdirs: SipFlowSubdirs,
+        #[serde(default = "default_sipflow_flush_count")]
+        flush_count: usize,
+        #[serde(default = "default_sipflow_flush_interval")]
+        flush_interval_secs: u64,
+        #[serde(default = "default_sipflow_id_cache_size")]
+        id_cache_size: usize,
+        /// Storage engine: "flowdb" or "sqlite" (default).
+        #[serde(default)]
+        engine: SipFlowEngine,
+        /// TTL in seconds for FlowDB records (optional). When set,
+        /// expired records are automatically garbage-collected.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+        /// FlowDB memtable size in MB (default 64).
+        #[serde(default = "default_flowdb_memtable_mb")]
+        memtable_size_mb: usize,
+        /// FlowDB block cache capacity in MB (default 128).
+        #[serde(default = "default_flowdb_block_cache_mb")]
+        block_cache_capacity_mb: usize,
+        #[serde(default)]
+        upload: Option<SipFlowUploadConfig>,
+    },
+    Remote {
+        #[serde(default)]
+        nodes: Vec<SipFlowClusterNode>,
+        #[serde(default)]
+        udp_addr: Option<String>,
+        #[serde(default)]
+        http_addr: Option<String>,
+        #[serde(default = "default_sipflow_timeout")]
+        timeout_secs: u64,
+        #[serde(default)]
+        upload: Option<SipFlowUploadConfig>,
+    },
+}
+
+fn default_sipflow_flush_count() -> usize {
+    0
+}
+
+fn default_sipflow_flush_interval() -> u64 {
+    0
+}
+
+fn default_sipflow_timeout() -> u64 {
+    10
+}
+
+fn default_sipflow_id_cache_size() -> usize {
+    8192
+}
+
+fn default_flowdb_memtable_mb() -> usize {
+    64
+}
+
+fn default_flowdb_block_cache_mb() -> usize {
+    128
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(PartialEq, Default)]
+pub enum MediaProxyMode {
+    /// All media goes through proxy
+    All,
+    /// Auto detect if media proxy is needed (webrtc to rtp)
+    #[default]
+    Auto,
+    /// Only handle NAT (private IP addresses)
+    Nat,
+    /// Do not handle media proxy
+    None,
+    /// Bypass: rewrite SDP but let RTP flow directly between endpoints
+    Bypass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTimerMode {
+    Off,
+    Supported,
+    Always,
+}
+
+impl SessionTimerMode {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn is_always(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct RtpConfig {
+    pub external_ip: Option<String>,
+    pub auto_external_ip: Option<String>,
+    pub bind_ip: Option<String>,
+    pub start_port: Option<u16>,
+    pub end_port: Option<u16>,
+    pub webrtc_start_port: Option<u16>,
+    pub webrtc_end_port: Option<u16>,
+    pub ice_servers: Option<Vec<IceServer>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct HttpRouterConfig {
+    pub url: String,
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub fallback_to_static: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LocatorWebhookConfig {
+    pub url: String,
+    #[serde(default)]
+    pub events: Vec<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JwtAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub secret: String,
+    #[serde(default = "default_jwt_user_id_claim")]
+    pub user_id_claim: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_jwt_sip_header")]
+    pub sip_header_name: String,
+    #[serde(default)]
+    pub check_local_user: bool,
+    #[serde(default = "default_jwt_ws_token_param")]
+    pub ws_token_param: String,
+}
+
+fn default_jwt_user_id_claim() -> String {
+    "userId".to_string()
+}
+fn default_jwt_sip_header() -> String {
+    "X-Auth-Token".to_string()
+}
+fn default_jwt_ws_token_param() -> String {
+    "token".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProxyConfig {
+    pub modules: Option<Vec<String>>,
+    pub addr: String,
+    #[serde(default = "default_useragent")]
+    pub useragent: Option<String>,
+    #[serde(default = "default_callid_suffix")]
+    pub callid_suffix: Option<String>,
+    pub t1_timer: Option<u64>,
+    pub t1x64_timer: Option<u64>,
+    pub ssl_private_key: Option<String>,
+    pub ssl_certificate: Option<String>,
+    pub udp_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_ports: Option<Vec<u16>>,
+    pub tcp_port: Option<u16>,
+    pub tls_port: Option<u16>,
+    pub ws_port: Option<u16>,
+    pub acl_rules: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl_files: Vec<String>,
+    pub ua_white_list: Option<Vec<String>>,
+    pub ua_black_list: Option<Vec<String>>,
+    pub max_concurrency: Option<usize>,
+    pub registrar_expires: Option<u32>,
+    pub max_registrar_expires: Option<u32>,
+    pub ensure_user: Option<bool>,
+    #[serde(default = "default_user_backends")]
+    pub user_backends: Vec<UserBackendConfig>,
+    #[serde(default)]
+    pub locator: LocatorConfig,
+    pub locator_webhook: Option<LocatorWebhookConfig>,
+    #[serde(default)]
+    pub media_proxy: MediaProxyMode,
+    pub audio_codecs: Option<Vec<String>>,
+    #[serde(default)]
+    pub frequency_limiter: Option<String>,
+    #[serde(default)]
+    pub realms: Option<Vec<String>>,
+    pub ws_handler: Option<String>,
+    pub ami_path: Option<String>,
+    pub rwi_path: Option<String>,
+    pub ice_servers_path: Option<String>,
+    pub http_router: Option<HttpRouterConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<RouteRule>>,
+    #[serde(default)]
+    pub session_timer: bool,
+    #[serde(default)]
+    pub session_timer_always: bool,
+    #[serde(default)]
+    pub session_expires: Option<u64>,
+    #[serde(default = "default_rtp_timeout")]
+    pub rtp_timeout: Option<u64>,
+    #[serde(default = "default_session_cmd_channel_capacity")]
+    pub session_cmd_channel_capacity: usize,
+    #[serde(default = "default_session_state_channel_capacity")]
+    pub session_state_channel_capacity: usize,
+    #[serde(default = "default_media_cmd_channel_capacity")]
+    pub media_cmd_channel_capacity: usize,
+    #[serde(default = "default_media_event_channel_capacity")]
+    pub media_event_channel_capacity: usize,
+    #[serde(default)]
+    pub queues: HashMap<String, RouteQueueConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queues_files: Vec<String>,
+    #[serde(default = "default_enable_latching")]
+    pub enable_latching: bool,
+    #[serde(default = "default_latching_probation_max_packets")]
+    pub latching_probation_max_packets: Option<u8>,
+    #[serde(default)]
+    pub trunks: HashMap<String, TrunkConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trunks_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivr_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ivr_files: Vec<String>,
+    #[serde(default)]
+    pub recording: Option<RecordingPolicy>,
+    #[serde(default = "default_generated_config_dir")]
+    pub generated_dir: String,
+    #[serde(default = "default_nat_fix")]
+    pub nat_fix: bool,
+    pub sip_flow_max_items: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addons: Option<Vec<String>>,
+    #[serde(default = "default_passthrough_failure")]
+    pub passthrough_failure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codecs: Option<Vec<String>>,
+    #[serde(default = "default_dialog_auth_cache")]
+    pub dialog_auth_cache: Option<AuthCacheConfig>,
+    #[serde(default)]
+    pub blind_transfer_use_refer: bool,
+
+    #[serde(default)]
+    pub dos_enabled: bool,
+    #[serde(default = "default_dos_max_cps")]
+    pub dos_max_cps_per_ip: u32,
+    #[serde(default = "default_dos_max_concurrent")]
+    pub dos_max_concurrent_per_ip: u32,
+    #[serde(default = "default_dos_scan_threshold")]
+    pub dos_scan_probe_threshold: u32,
+    #[serde(default = "default_dos_scan_block_secs")]
+    pub dos_scan_block_duration_secs: u64,
+
+    #[serde(default = "default_uri_max_length")]
+    pub uri_max_length: usize,
+    #[serde(default)]
+    pub uri_reject_malformed: bool,
+    #[serde(default)]
+    pub emergency: Option<EmergencyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_cname: Option<String>,
+    #[serde(default)]
+    pub jwt_auth: Option<JwtAuthConfig>,
+}
+
+/// Emergency number routing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EmergencyConfig {
+    pub enabled: bool,
+    #[serde(default = "default_emergency_numbers")]
+    pub numbers: Vec<String>,
+    pub emergency_trunk: String,
+}
+
+fn default_emergency_numbers() -> Vec<String> {
+    vec![
+        "110".to_string(),
+        "119".to_string(),
+        "120".to_string(),
+        "122".to_string(),
+        "911".to_string(),
+        "999".to_string(),
+    ]
+}
+
+fn default_dos_max_cps() -> u32 {
+    100
+}
+fn default_dos_max_concurrent() -> u32 {
+    500
+}
+fn default_dos_scan_threshold() -> u32 {
+    50
+}
+fn default_dos_scan_block_secs() -> u64 {
+    600
+}
+fn default_uri_max_length() -> usize {
+    256
+}
+fn default_session_cmd_channel_capacity() -> usize {
+    256
+}
+fn default_session_state_channel_capacity() -> usize {
+    256
+}
+fn default_media_cmd_channel_capacity() -> usize {
+    512
+}
+fn default_media_event_channel_capacity() -> usize {
+    1024
+}
+
+fn default_auth_cache_size() -> usize {
+    10000
+}
+
+fn default_auth_cache_ttl_seconds() -> u64 {
+    3600 // 1 hour
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthCacheConfig {
+    /// Whether to enable in-dialog authentication caching. Default: true.
+    #[serde(default = "default_auth_cache_enabled")]
+    pub enabled: bool,
+    /// Maximum number of cached authenticated dialogs (LRU cache size). Default: 10000.
+    #[serde(default = "default_auth_cache_size")]
+    pub cache_size: usize,
+    /// TTL (time-to-live) in seconds for cached entries. Default: 3600.
+    #[serde(default = "default_auth_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+fn default_auth_cache_enabled() -> bool {
+    true
+}
+
+fn default_dialog_auth_cache() -> Option<AuthCacheConfig> {
+    Some(AuthCacheConfig::default())
+}
+
+impl Default for AuthCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auth_cache_enabled(),
+            cache_size: default_auth_cache_size(),
+            ttl_seconds: default_auth_cache_ttl_seconds(),
+        }
+    }
+}
+
+fn default_passthrough_failure() -> bool {
+    true
+}
+
+#[derive(Default, Clone)]
+pub struct DialplanHints {
+    pub enable_recording: Option<bool>,
+    pub recording: Option<RecordingPolicy>,
+    pub bypass_media: Option<bool>,
+    pub max_duration: Option<std::time::Duration>,
+    pub enable_sipflow: Option<bool>,
+    pub allow_codecs: Option<Vec<String>>,
+    pub extensions: http::Extensions,
+    pub disable_ice_servers: Option<bool>,
+    /// Media mode override from trunk config
+    pub media_mode: Option<MediaProxyMode>,
+    /// Video policy from trunk config
+    pub video_policy: Option<crate::proxy::routing::VideoPolicy>,
+    /// Per-trunk ringback/early-media audio configuration
+    pub ringback: Option<crate::proxy::routing::RingbackAudio>,
+}
+
+impl std::fmt::Debug for DialplanHints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialplanHints")
+            .field("enable_recording", &self.enable_recording)
+            .field("recording", &self.recording)
+            .field("bypass_media", &self.bypass_media)
+            .field("max_duration", &self.max_duration)
+            .field("enable_sipflow", &self.enable_sipflow)
+            .field("disable_ice_servers", &self.disable_ice_servers)
+            .field("media_mode", &self.media_mode)
+            .field("video_policy", &self.video_policy)
+            .finish()
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum RouteResult {
+    Forward(InviteOption, Option<DialplanHints>),
+    Queue {
+        option: InviteOption,
+        queue: QueuePlan,
+        hints: Option<DialplanHints>,
+    },
+    Application {
+        option: InviteOption,
+        app_name: String,
+        app_params: Option<serde_json::Value>,
+        auto_answer: bool,
+    },
+    NotHandled(InviteOption, Option<DialplanHints>),
+    Abort(StatusCode, Option<String>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AmiConfig {
+    pub allows: Option<Vec<String>>,
+}
+
+impl AmiConfig {
+    pub fn is_allowed(&self, addr: &str) -> bool {
+        if let Some(allows) = &self.allows {
+            let ip = addr.parse::<IpAddr>().ok();
+
+            allows.iter().any(|allow| {
+                let allow = allow.trim();
+
+                allow == addr
+                    || allow == "*"
+                    || ip.is_some_and(|ip| {
+                        allow
+                            .parse::<IpNetwork>()
+                            .is_ok_and(|network| network.contains(ip))
+                    })
+            })
+        } else {
+            addr == "127.0.0.1" || addr == "::1" || addr == "localhost"
+        }
+    }
+}
+
+impl ProxyConfig {
+    pub fn session_timer_mode(&self) -> SessionTimerMode {
+        if !self.session_timer {
+            SessionTimerMode::Off
+        } else if self.session_timer_always {
+            SessionTimerMode::Always
+        } else {
+            SessionTimerMode::Supported
+        }
+    }
+
+    pub fn normalize_realm(realm: &str) -> &str {
+        let realm = if let Some(pos) = realm.find(':') {
+            &realm[..pos]
+        } else {
+            realm
+        };
+        if realm.is_empty() || realm == "*" || realm == "127.0.0.1" || realm == "::1" {
+            "localhost"
+        } else {
+            realm
+        }
+    }
+
+    pub fn select_realm(&self, request_host: &str) -> String {
+        let requested = request_host.trim();
+        let normalized = ProxyConfig::normalize_realm(requested);
+        if let Some(realms) = self.realms.as_ref() {
+            if let Some(existing) = realms
+                .iter()
+                .find(|realm| realm.as_str() == requested || realm.as_str() == normalized)
+            {
+                return existing.clone();
+            }
+            if let Some(first) = realms.first()
+                && !first.is_empty()
+            {
+                return first.clone();
+            }
+        }
+
+        if requested.is_empty() {
+            normalized.to_string()
+        } else {
+            requested.to_string()
+        }
+    }
+
+    pub fn generated_root_dir(&self) -> PathBuf {
+        let trimmed = self.generated_dir.trim();
+        if trimmed.is_empty() {
+            return PathBuf::from("./config");
+        }
+        PathBuf::from(trimmed)
+    }
+
+    pub fn generated_trunks_dir(&self) -> PathBuf {
+        self.generated_root_dir().join("trunks")
+    }
+
+    pub fn generated_routes_dir(&self) -> PathBuf {
+        self.generated_root_dir().join("routes")
+    }
+
+    pub fn generated_queue_dir(&self) -> PathBuf {
+        if let Some(dir) = self
+            .queue_dir
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+        {
+            PathBuf::from(dir)
+        } else {
+            self.generated_root_dir().join("queue")
+        }
+    }
+
+    pub fn generated_ivr_dir(&self) -> PathBuf {
+        if let Some(dir) = self
+            .ivr_dir
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+        {
+            PathBuf::from(dir)
+        } else {
+            self.generated_root_dir().join("ivr")
+        }
+    }
+
+    pub fn generated_acl_dir(&self) -> PathBuf {
+        self.generated_root_dir().join("acl")
+    }
+
+    pub fn all_udp_ports(&self) -> Vec<u16> {
+        let primary = self.udp_port.unwrap_or(5060);
+        let mut ports = vec![primary];
+        if let Some(extra) = &self.udp_ports {
+            for p in extra {
+                if !ports.contains(p) {
+                    ports.push(*p);
+                }
+            }
+        }
+        ports
+    }
+
+    pub fn ensure_recording_defaults(&mut self) -> bool {
+        let mut fallback = false;
+
+        if let Some(policy) = self.recording.as_mut() {
+            fallback |= policy.ensure_defaults();
+        }
+
+        for trunk in self.trunks.values_mut() {
+            if let Some(policy) = trunk.recording.as_mut() {
+                fallback |= policy.ensure_defaults();
+            }
+        }
+        fallback
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            acl_rules: Some(vec!["allow all".to_string(), "deny all".to_string()]),
+            ua_white_list: Some(vec![]),
+            ua_black_list: Some(vec![]),
+            addr: "0.0.0.0".to_string(),
+            modules: Some(vec![
+                "acl".to_string(),
+                "auth".to_string(),
+                "registrar".to_string(),
+                "call".to_string(),
+                "presence".to_string(),
+            ]),
+            useragent: default_useragent(),
+            callid_suffix: default_callid_suffix(),
+            t1_timer: None,
+            t1x64_timer: None,
+            ssl_private_key: None,
+            ssl_certificate: None,
+            udp_port: Some(5060),
+            udp_ports: None,
+            tcp_port: None,
+            tls_port: None,
+            ws_port: None,
+            max_concurrency: None,
+            registrar_expires: Some(30),
+            max_registrar_expires: Some(50),
+            ensure_user: Some(true),
+            enable_latching: true,
+            latching_probation_max_packets: default_latching_probation_max_packets(),
+            user_backends: default_user_backends(),
+            locator: LocatorConfig::default(),
+            locator_webhook: None,
+            media_proxy: MediaProxyMode::default(),
+            audio_codecs: None,
+            frequency_limiter: None,
+            realms: Some(vec![]),
+            ws_handler: None,
+            ami_path: None,
+            rwi_path: None,
+            ice_servers_path: None,
+            http_router: None,
+            routes_files: Vec::new(),
+            acl_files: Vec::new(),
+            routes: None,
+            session_timer: false,
+            session_timer_always: false,
+            session_expires: None,
+            rtp_timeout: default_rtp_timeout(),
+            session_cmd_channel_capacity: default_session_cmd_channel_capacity(),
+            session_state_channel_capacity: default_session_state_channel_capacity(),
+            media_cmd_channel_capacity: default_media_cmd_channel_capacity(),
+            media_event_channel_capacity: default_media_event_channel_capacity(),
+            queues: HashMap::new(),
+            queues_files: Vec::new(),
+            trunks: HashMap::new(),
+            trunks_files: Vec::new(),
+            queue_dir: None,
+            ivr_dir: None,
+            ivr_files: Vec::new(),
+            recording: None,
+            generated_dir: default_generated_config_dir(),
+            nat_fix: true,
+            sip_flow_max_items: None,
+            addons: None,
+            passthrough_failure: true,
+            video_codecs: None,
+            dialog_auth_cache: default_dialog_auth_cache(),
+            blind_transfer_use_refer: false,
+            dos_enabled: false,
+            dos_max_cps_per_ip: default_dos_max_cps(),
+            dos_max_concurrent_per_ip: default_dos_max_concurrent(),
+            dos_scan_probe_threshold: default_dos_scan_threshold(),
+            dos_scan_block_duration_secs: default_dos_scan_block_secs(),
+            uri_max_length: default_uri_max_length(),
+            uri_reject_malformed: false,
+            emergency: None,
+            contact_username: None,
+            rtc_cname: None,
+            jwt_auth: None,
+        }
+    }
+}
+
+impl Default for UserBackendConfig {
+    fn default() -> Self {
+        Self::Memory { users: None }
+    }
+}
+
+impl Default for CallRecordConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_call_record_max_concurrent(),
+            storage: CallRecordStorageConfig::Local {
+                #[cfg(target_os = "windows")]
+                root: "./config/cdr".to_string(),
+                #[cfg(not(target_os = "windows"))]
+                root: "./config/cdr".to_string(),
+            },
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            http_addr: default_config_http_addr(),
+            http_gzip: false,
+            https_addr: None,
+            ssl_certificate: None,
+            ssl_private_key: None,
+            log_level: None,
+            log_file: None,
+            log_rotation: String::new(),
+            http_access_skip_paths: Vec::new(),
+            proxy: ProxyConfig::default(),
+            callrecord: None,
+            ice_servers: None,
+            ami: Some(AmiConfig::default()),
+            external_ip: None,
+            auto_external_ip: None,
+            rtp_start_port: default_config_rtp_start_port(),
+            rtp_end_port: default_config_rtp_end_port(),
+            webrtc_port_start: default_config_webrtc_start_port(),
+            webrtc_port_end: default_config_webrtc_end_port(),
+            #[cfg(feature = "console")]
+            console: None,
+            rwi: None,
+            database_url: default_database_url(),
+            recording: None,
+            demo_mode: false,
+            storage: None,
+            sipflow: None,
+            #[cfg(feature = "commerce")]
+            licenses: None,
+            rwi_webhook: None,
+            cluster: None,
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: &str) -> Result<Self, Error> {
+        let mut config: Self = toml::from_str(
+            &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
+        )?;
+        if std::env::var("RUSTPBX_DEMO_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+        {
+            config.demo_mode = true;
+        }
+        config.ensure_recording_defaults();
+        Ok(config)
+    }
+
+    pub fn rtp_config(&self) -> RtpConfig {
+        RtpConfig {
+            external_ip: self.external_ip.clone(),
+            auto_external_ip: self.auto_external_ip.clone(),
+            bind_ip: Some(self.proxy.addr.clone()),
+            start_port: self.rtp_start_port,
+            end_port: self.rtp_end_port,
+            webrtc_start_port: self.webrtc_port_start,
+            webrtc_end_port: self.webrtc_port_end,
+            ice_servers: self.ice_servers.clone(),
+        }
+    }
+
+    pub fn recorder_path(&self) -> String {
+        self.recording
+            .as_ref()
+            .map(|policy| policy.recorder_path())
+            .unwrap_or_else(default_config_recorder_path)
+    }
+
+    pub fn ensure_recording_defaults(&mut self) -> bool {
+        let mut fallback = false;
+
+        if let Some(policy) = self.recording.as_mut() {
+            fallback |= policy.ensure_defaults();
+        }
+
+        fallback |= self.proxy.ensure_recording_defaults();
+
+        fallback
+    }
+
+    pub fn config_dir(&self) -> std::path::PathBuf {
+        self.proxy.generated_root_dir()
+    }
+
+    /// Returns the configured static files HTTP path prefix.
+    /// Defaults to "/static" when not configured.
+    #[cfg(feature = "console")]
+    pub fn static_path(&self) -> String {
+        self.console
+            .as_ref()
+            .and_then(|c| c.static_path.clone())
+            .unwrap_or_else(|| "/static".to_string())
+    }
+
+    /// Returns the configured static files HTTP path prefix.
+    /// Defaults to "/static" when the console feature is not compiled.
+    #[cfg(not(feature = "console"))]
+    pub fn static_path(&self) -> String {
+        "/static".to_string()
+    }
+
+    /// Returns the wholesale bills directory.
+    pub fn wholesale_bills_dir(&self) -> String {
+        format!(
+            "{}/wholesale_bills",
+            self.recorder_path().trim_end_matches('/')
+        )
+    }
+}
+
+// ===================================================================
+// Tests
+// ===================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_callrecord_max_concurrent_is_shared_config() {
+        let callrecord: CallRecordConfig = toml::from_str(
+            r#"
+            type = "http"
+            url = "https://example.com/cdr"
+            max_concurrent = 7
+            "#,
+        )
+        .unwrap();
+        assert_eq!(callrecord.max_concurrent, 7);
+        assert!(matches!(
+            callrecord.storage,
+            CallRecordStorageConfig::Http { .. }
+        ));
+
+        let defaulted: CallRecordConfig = toml::from_str(
+            r#"
+            type = "local"
+            root = "./cdr"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(defaulted.max_concurrent, DEFAULT_CALL_RECORD_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn test_select_realm() {
+        let mut config = ProxyConfig::default();
+        config.realms = Some(vec!["example.com".to_string(), "test.com".to_string()]);
+
+        // Exact match
+        assert_eq!(config.select_realm("example.com"), "example.com");
+        // Match with port (should return normalized/existing realm)
+        assert_eq!(config.select_realm("example.com:5060"), "example.com");
+        // Match with different port
+        assert_eq!(config.select_realm("test.com:8888"), "test.com");
+        // No match, return first realm if configured
+        assert_eq!(config.select_realm("other.com"), "example.com");
+        // No match with port, return first realm if configured
+        assert_eq!(config.select_realm("other.com:5060"), "example.com");
+    }
+
+    #[test]
+    fn test_session_timer_mode_defaults_to_supported_when_enabled() {
+        #[derive(Deserialize)]
+        struct SessionTimerWrapper {
+            session_timer: bool,
+            #[serde(default)]
+            session_timer_always: bool,
+        }
+
+        let disabled: SessionTimerWrapper = toml::from_str("session_timer=false").unwrap();
+        assert!(!disabled.session_timer);
+        assert!(!disabled.session_timer_always);
+
+        let enabled: SessionTimerWrapper = toml::from_str("session_timer=true").unwrap();
+        assert!(enabled.session_timer);
+        assert!(!enabled.session_timer_always);
+    }
+
+    #[test]
+    fn test_session_timer_mode_uses_always_flag() {
+        let mut config = ProxyConfig::default();
+
+        assert_eq!(config.session_timer_mode(), SessionTimerMode::Off);
+
+        config.session_timer = true;
+        assert_eq!(config.session_timer_mode(), SessionTimerMode::Supported);
+
+        config.session_timer_always = true;
+        assert_eq!(config.session_timer_mode(), SessionTimerMode::Always);
+
+        config.session_timer = false;
+        assert_eq!(config.session_timer_mode(), SessionTimerMode::Off);
+    }
+
+    #[test]
+    fn test_rtp_config_uses_proxy_addr_for_bind_ip() {
+        let mut config = Config::default();
+        config.proxy.addr = "120.228.209.243".to_string();
+        config.external_ip = Some("203.0.113.10".to_string());
+
+        let rtp_config = config.rtp_config();
+
+        assert_eq!(rtp_config.bind_ip.as_deref(), Some("120.228.209.243"));
+        assert_eq!(rtp_config.external_ip.as_deref(), Some("203.0.113.10"));
+    }
+
+    #[cfg(feature = "commerce")]
+    #[test]
+    fn test_cluster_config_default_is_none() {
+        let config = Config::default();
+        assert!(config.cluster.is_none());
+    }
+
+    #[cfg(feature = "commerce")]
+    #[test]
+    fn test_cluster_peer_roundtrip() {
+        let peer = ClusterPeer {
+            addr: "10.0.0.2".to_string(),
+            sip_port: 5060,
+            ami_port: 8080,
+        };
+        let toml_str = toml::to_string(&peer).unwrap();
+        let parsed: ClusterPeer = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.addr, "10.0.0.2");
+        assert_eq!(parsed.sip_port, 5060);
+        assert_eq!(parsed.ami_port, 8080);
+    }
+
+    #[cfg(feature = "commerce")]
+    #[test]
+    fn test_cluster_config_toml_roundtrip() {
+        let config = ClusterConfig {
+            peers: vec![
+                ClusterPeer {
+                    addr: "10.0.0.2".to_string(),
+                    sip_port: 5060,
+                    ami_port: 8080,
+                },
+                ClusterPeer {
+                    addr: "10.0.0.3".to_string(),
+                    sip_port: 5061,
+                    ami_port: 8081,
+                },
+            ],
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let parsed: ClusterConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.peers.len(), 2);
+        assert_eq!(parsed.peers[0].addr, "10.0.0.2");
+        assert_eq!(parsed.peers[1].addr, "10.0.0.3");
+    }
+
+    #[cfg(feature = "commerce")]
+    #[test]
+    fn test_cluster_config_empty_peers() {
+        let config = ClusterConfig::default();
+        assert!(config.peers.is_empty());
+        let toml_str = toml::to_string(&config).unwrap();
+        let parsed: ClusterConfig = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.peers.is_empty());
+    }
+
+    /// Regression: `Config::clone` used to round-trip through TOML which is
+    /// expensive (called on every server bootstrap and config reload). The
+    /// derive(d Clone implementation must produce a deeply-equal copy while
+    /// avoiding the serialization hop. We assert equality on a representative
+    /// field set covering primitives, Vec, nested config and Option types.
+    #[test]
+    fn test_config_clone_preserves_all_fields() {
+        let mut original = Config::default();
+        original.http_addr = "127.0.0.1:8080".to_string();
+        original.http_gzip = true;
+        original.http_access_skip_paths = vec!["/health".to_string(), "/metrics".to_string()];
+        original.proxy.addr = "127.0.0.1:5060".to_string();
+        original.proxy.useragent = Some("TestPBX/1.0".to_string());
+        original.database_url = "sqlite://test.db".to_string();
+        original.demo_mode = true;
+        original.ami = Some(AmiConfig {
+            allows: Some(vec!["10.0.0.0/8".to_string()]),
+        });
+        original.recording = Some(RecordingPolicy::default());
+
+        let cloned = original.clone();
+
+        // Equality is intentionally checked via TOML round-trip serialization
+        // (not PartialEq, which is not derived) so we exercise the same
+        // surface the previous implementation relied on, but at clone time we
+        // no longer pay that cost.
+        let original_toml = toml::to_string(&original).unwrap();
+        let cloned_toml = toml::to_string(&cloned).unwrap();
+        assert_eq!(original_toml, cloned_toml, "Config::clone lost data");
+
+        // Mutating the clone must not bleed into the original (deep copy).
+        let mut cloned2 = original.clone();
+        cloned2.http_addr = "0.0.0.0:9999".to_string();
+        assert_ne!(original.http_addr, cloned2.http_addr);
+        assert_eq!(original.http_addr, "127.0.0.1:8080");
+    }
+}

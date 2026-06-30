@@ -1,0 +1,684 @@
+{% extends "console/layout.html" %}
+{% block title %}{{ "queue.title" | t }} · {{ site_name | default('RustPBX') }}{% endblock %}
+{% block content %}
+{% set base_url = base_path | safe %}
+<div class="p-6" x-data='queuePage({
+        basePath: {{ base_url | tojson }},
+        filters: {{ filters | default({}) | tojson }},
+        createUrl: {{ create_url | tojson }},
+        t: window._queueTranslations
+    })' x-init="init()">
+    <div class="mx-auto max-w-6xl space-y-6">
+        <header class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div class="space-y-1">
+                <p class="text-xs font-semibold uppercase tracking-wide text-sky-600">{{ "queue.subtitle" | t }}</p>
+                <h1 class="text-2xl font-semibold text-slate-900">{{ "queue.title" | t }}</h1>
+                <p class="text-sm text-slate-500">{{ "queue.subtitle_desc" | t }}</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+                <button type="button"
+                    class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700 focus:outline-none focus:ring-2 focus:ring-sky-200 focus:ring-offset-2"
+                    :class="[reloading ? 'cursor-wait border-slate-200 text-slate-400 hover:border-slate-200 hover:text-slate-400' : '', pendingReload && !reloading ? 'reload-glow reload-glow-accent' : '']"
+                    :disabled="reloading" @click="confirmReload()">
+                    <template x-if="!reloading">
+                        <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M4.5 10a5.5 5.5 0 0 1 9.35-3.89l.65.65M15.5 10a5.5 5.5 0 0 1-9.35 3.89l-.65-.65M10 4.5V2m0 18v-2" />
+                        </svg>
+                    </template>
+                    <template x-if="reloading">
+                        <svg class="h-4 w-4 animate-spin text-slate-400" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="1.8">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 3v3m6.364 1.636-2.121 2.121M21 12h-3m-1.636 6.364-2.121-2.121M12 21v-3m-6.364-1.636 2.121-2.121M3 12h3m1.636-6.364 2.121 2.121" />
+                        </svg>
+                    </template>
+                    {{ "queue.reload_queues" | t }}
+                </button>
+                <button type="button"
+                    class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700 focus:outline-none focus:ring-2 focus:ring-sky-200 focus:ring-offset-2"
+                    :class="exportingAll ? 'cursor-wait border-slate-200 text-slate-400 hover:border-slate-200 hover:text-slate-400' : ''"
+                    :disabled="exportingAll" @click="confirmExportAll()">
+                    <template x-if="!exportingAll">
+                        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M4.5 10a5.5 5.5 0 0 1 9.35-3.89l.65.65M15.5 10a5.5 5.5 0 0 1-9.35 3.89l-.65-.65M10 4.5V2m0 18v-2" />
+                        </svg>
+                    </template>
+                    <template x-if="exportingAll">
+                        <svg class="h-4 w-4 animate-spin text-slate-400" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="1.8">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 3v3m6.364 1.636-2.121 2.121M21 12h-3m-1.636 6.364-2.121-2.121M12 21v-3m-6.364-1.636 2.121-2.121M3 12h3m1.636-6.364 2.121 2.121" />
+                        </svg>
+                    </template>
+                    {{ "queue.export_all" | t }}
+                </button>
+                <a :href="createUrl"
+                    class="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2">
+                    <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10 4v12m6-6H4" />
+                    </svg>
+                    {{ "queue.new_queue" | t }}
+                </a>
+            </div>
+        </header>
+
+        <template x-if="flash">
+            <div class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700"
+                x-text="flash"></div>
+        </template>
+        <template x-if="error">
+            <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600" x-text="error">
+            </div>
+        </template>
+
+        <section class="grid gap-4 sm:grid-cols-3">
+            <div class="rounded-xl bg-white p-4 shadow-sm ring-1 ring-black/5">
+                <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ "queue.total_queues" | t }}
+                </div>
+                <div class="mt-2 text-2xl font-semibold text-slate-900" x-text="summary.total || 0"></div>
+            </div>
+            <div class="rounded-xl bg-white p-4 shadow-sm ring-1 ring-black/5">
+                <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ "queue.active" | t }}</div>
+                <div class="mt-2 text-2xl font-semibold text-emerald-600" x-text="summary.active || 0"></div>
+            </div>
+            <div class="rounded-xl bg-white p-4 shadow-sm ring-1 ring-black/5">
+                <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ "queue.paused" | t }}</div>
+                <div class="mt-2 text-2xl font-semibold text-amber-500" x-text="summary.inactive || 0"></div>
+            </div>
+        </section>
+
+        <section class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-black/5">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                <div class="flex flex-wrap items-center gap-2">
+                    <button type="button"
+                        class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold transition"
+                        :class="statusFilter === 'all' ? 'border-sky-200 bg-sky-100 text-sky-700' : 'border-slate-200 text-slate-600 hover:border-sky-300 hover:text-sky-700'"
+                        @click="selectStatus('all')">
+                        {{ "queue.all_statuses" | t }}
+                    </button>
+                    <template x-for="tab in statusTabs" :key="tab.value">
+                        <button type="button"
+                            class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold transition"
+                            :class="statusFilter === tab.value ? 'border-sky-200 bg-sky-100 text-sky-700' : 'border-slate-200 text-slate-600 hover:border-sky-300 hover:text-sky-700'"
+                            @click="selectStatus(tab.value)">
+                            <span x-text="tab.label"></span>
+                        </button>
+                    </template>
+                </div>
+                <label class="relative w-full lg:w-80" aria-label="{{ "queue.search_placeholder" | t }}">
+                    <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+                        viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+                        <path stroke-linecap="round" stroke-linejoin="round"
+                            d="m17.5 17.5-3.65-3.65m0 0a5.5 5.5 0 1 0-7.778-7.778 5.5 5.5 0 0 0 7.778 7.778Z" />
+                    </svg>
+                    <input type="search" x-model.trim="keyword" @input.debounce.400ms="applyFilters()"
+                        class="w-full rounded-lg border border-slate-200 px-3 py-2 pl-9 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                        placeholder="{{ "queue.search_placeholder" | t }}">
+                </label>
+            </div>
+        </section>
+
+        <section class="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-black/5">
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
+                    <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        <tr>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_queue" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_hold_treatment" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_targets" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_fallback" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_prompts" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_updated" | t }}</th>
+                            <th scope="col" class="px-4 py-2">{{ "queue.col_actions" | t }}</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 bg-white text-slate-600">
+                        <template x-if="loading">
+                            <tr>
+                                <td colspan="7" class="px-4 py-6 text-center text-sm text-slate-500">
+                                    <div class="inline-flex items-center gap-2">
+                                        <svg class="h-4 w-4 animate-spin text-slate-400" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round"
+                                                d="M12 3v3m6.364 1.636-2.121 2.121M21 12h-3m-1.636 6.364-2.121-2.121M12 21v-3m-6.364-1.636 2.121-2.121M3 12h3m1.636-6.364 2.121 2.121" />
+                                        </svg>
+                                        <span x-text="tt('queue.loading')"></span>
+                                    </div>
+                                </td>
+                            </tr>
+                        </template>
+                        <template x-if="!loading && !queues.length">
+                            <tr>
+                                <td colspan="7" class="px-4 py-6 text-center text-sm text-slate-500"
+                                    x-text="tt('queue.no_queues')">
+                                </td>
+                            </tr>
+                        </template>
+                        <template x-for="queue in queues" :key="queue.id">
+                            <tr class="hover:bg-slate-50">
+                                <td class="px-4 py-3">
+                                    <div class="flex items-center gap-3">
+                                        <div>
+                                            <a :href="queue.detail_url || detailUrl(queue.id)"
+                                                class="font-semibold text-slate-900 transition hover:text-sky-600"
+                                                x-text="queue.name"></a>
+                                            <div class="text-xs text-slate-400" x-text="queue.description || '—'"></div>
+                                            <div class="mt-2 flex flex-wrap gap-1">
+                                                <span
+                                                    class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                                                    :class="queue.is_active ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100' : 'bg-amber-50 text-amber-600 ring-1 ring-amber-100'">
+                                                    <span class="h-1.5 w-1.5 rounded-full"
+                                                        :class="queue.is_active ? 'bg-emerald-400' : 'bg-amber-400'"></span>
+                                                    <span
+                                                        x-text="queue.is_active ? tt('queue.status_active') : tt('queue.status_paused')"></span>
+                                                </span>
+                                                <template x-for="tag in queue.tags" :key="tag">
+                                                    <span
+                                                        class="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600"
+                                                        x-text="tag"></span>
+                                                </template>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="px-4 py-3">
+                                    <div class="text-sm font-semibold text-slate-800" x-text="holdSummary(queue)"></div>
+                                    <div class="text-xs text-slate-500" x-text="holdDetail(queue)"></div>
+                                </td>
+                                <td class="px-4 py-3">
+                                    <div class="text-sm text-slate-700" x-text="targetSummary(queue)"></div>
+                                    <div class="text-xs text-slate-400" x-text="targetDetails(queue)"></div>
+                                </td>
+                                <td class="px-4 py-3">
+                                    <span class="text-sm text-slate-700" x-text="fallbackSummary(queue)"></span>
+                                </td>
+                                <td class="px-4 py-3">
+                                    <span class="text-xs text-slate-500" x-text="promptsSummary(queue)"></span>
+                                </td>
+                                <td class="whitespace-nowrap px-4 py-3 text-slate-500"
+                                    x-text="formatDate(queue.updated_at)"></td>
+                                <td class="px-4 py-3">
+                                    <div class="flex items-center gap-2">
+                                        <a :href="queue.detail_url || detailUrl(queue.id)"
+                                            :title="tt('queue.view_queue')"
+                                            class="inline-flex items-center justify-center rounded-full border border-slate-200 p-2 text-slate-500 transition hover:border-sky-300 hover:text-sky-600">
+                                            <span class="sr-only" x-text="tt('queue.view_queue')"></span>
+                                            <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                                stroke-width="1.6">
+                                                <path stroke-linecap="round" stroke-linejoin="round"
+                                                    d="M13.5 3.5l3 3-8 8H5.5v-3l8-8z" />
+                                            </svg>
+                                        </a>
+                                        <button type="button" :title="tt('queue.delete_queue')"
+                                            class="inline-flex items-center justify-center rounded-full border border-slate-200 p-2 text-slate-500 transition"
+                                            :class="processingDelete === queue.id ? 'cursor-not-allowed border-slate-100 text-slate-300' : 'hover:border-rose-300 hover:text-rose-600'"
+                                            :disabled="processingDelete === queue.id" @click="confirmDelete(queue)">
+                                            <span class="sr-only" x-text="tt('queue.delete_queue')"></span>
+                                            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                stroke-width="1.6">
+                                                <path stroke-linecap="round" stroke-linejoin="round"
+                                                    d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" />
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+
+            <template x-if="pagination">
+                <div
+                    class="flex items-center justify-between border-t border-slate-200 px-4 py-3 text-xs text-slate-500">
+                    <div>
+                        <span x-text="tt('queue.showing')"></span>
+                        <span class="font-semibold" x-text="showingFrom"></span>
+                        –
+                        <span class="font-semibold" x-text="showingTo"></span>
+                        <span x-text="tt('queue.of')"></span>
+                        <span class="font-semibold" x-text="pagination.total_items"></span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button type="button"
+                            class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 font-semibold transition"
+                            :class="pagination.has_prev ? 'text-slate-600 hover:border-sky-300 hover:text-sky-700' : 'cursor-not-allowed text-slate-300'"
+                            :disabled="!pagination.has_prev" @click="prevPage()" x-text="tt('queue.prev')">
+                        </button>
+                        <div class="text-sm font-semibold text-slate-600">
+                            <span x-text="tt('queue.page')"></span>
+                            <span x-text="pagination.current_page"></span>
+                            /
+                            <span x-text="pagination.total_pages"></span>
+                        </div>
+                        <button type="button"
+                            class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 font-semibold transition"
+                            :class="pagination.has_next ? 'text-slate-600 hover:border-sky-300 hover:text-sky-700' : 'cursor-not-allowed text-slate-300'"
+                            :disabled="!pagination.has_next" @click="nextPage()" x-text="tt('queue.next')">
+                        </button>
+                    </div>
+                </div>
+            </template>
+        </section>
+
+        <!-- Issue #179: file-sourced queues (read-only) -->
+        <template x-if="fileQueues.length > 0">
+            <section class="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-black/5">
+                <div class="border-b border-slate-200 bg-slate-50 px-4 py-3 flex items-center gap-2">
+                    <svg class="h-4 w-4 text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd" />
+                    </svg>
+                    <span class="text-sm font-semibold text-slate-700">{{ "queue.file_queues_title" | t }}</span>
+                    <span class="ml-auto inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500" x-text="fileQueues.length"></span>
+                </div>
+                <p class="px-4 py-2 text-xs text-slate-500">{{ "queue.file_queues_notice" | t }}</p>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
+                        <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            <tr>
+                                <th scope="col" class="px-4 py-2">{{ "queue.col_queue" | t }}</th>
+                                <th scope="col" class="px-4 py-2">{{ "queue.col_hold_treatment" | t }}</th>
+                                <th scope="col" class="px-4 py-2">{{ "queue.col_targets" | t }}</th>
+                                <th scope="col" class="px-4 py-2">{{ "queue.col_fallback" | t }}</th>
+                                <th scope="col" class="px-4 py-2">{{ "sip_trunk.source_file" | t }}</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100 bg-white text-slate-600">
+                            <template x-for="(queue, idx) in fileQueues" :key="idx">
+                                <tr class="bg-slate-50/50">
+                                    <td class="px-4 py-3">
+                                        <div class="flex items-center gap-3">
+                                            <div>
+                                                <span class="font-semibold text-slate-900" x-text="queue.name"></span>
+                                                <span class="ml-2 inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">{{ "sip_trunk.read_only" | t }}</span>
+                                                <div class="text-xs text-slate-400" x-text="queue.description || '—'"></div>
+                                                <div class="mt-2 flex flex-wrap gap-1">
+                                                    <span class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 ring-1 ring-emerald-100">
+                                                        <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+                                                        <span x-text="tt('queue.status_active')"></span>
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <div class="text-sm font-semibold text-slate-800" x-text="holdSummary(queue)"></div>
+                                        <div class="text-xs text-slate-500" x-text="holdDetail(queue)"></div>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <div class="text-sm text-slate-700" x-text="targetSummary(queue)"></div>
+                                        <div class="text-xs text-slate-400" x-text="targetDetails(queue)"></div>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <span class="text-sm text-slate-700" x-text="fallbackSummary(queue)"></span>
+                                    </td>
+                                    <td class="px-4 py-3 text-xs text-slate-400 font-mono break-all" x-text="queue.source_file || '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </template>
+    </div>
+</div>
+
+<script>
+    window._queueTranslations = window.__i18n_t || {};
+    document.addEventListener('alpine:init', () => {
+        Alpine.data('queuePage', (options) => ({
+            basePath: options.basePath || '/console',
+            apiBase: '{{ api_prefix | safe }}',
+            listEndpoint: `{{ api_prefix | safe }}/queues`,
+            createUrl: options.createUrl || `${options.basePath || '/console'}/queues/new`,
+            exportAllEndpoint: `{{ api_prefix | safe }}/queues/export`,
+            reloadEndpoint: `{{ api_prefix | safe }}/queues/reload`,
+            filtersRaw: options.filters || {},
+            t: options.t || {},
+            keyword: '',
+            statusFilter: 'all',
+            statusOptions: [],
+            statusTabs: [],
+            queues: [],
+            fileQueues: [],
+            pagination: null,
+            loading: false,
+            error: null,
+            flash: null,
+            summary: { total: 0, active: 0, inactive: 0 },
+            page: 1,
+            perPage: 20,
+            processingDelete: null,
+            exportingAll: false,
+            reloading: false,
+            pendingReload: false,
+            showingFrom: 0,
+            showingTo: 0,
+            tt(key) {
+                const parts = key.split('.');
+                let val = this.t;
+                for (const p of parts) {
+                    if (val == null || typeof val !== 'object') return key;
+                    val = val[p];
+                }
+                return (typeof val === 'string' && val) ? val : key;
+            },
+            init() {
+                this.loadStatusOptions();
+                this.fetchQueues();
+                this.fetchPendingReload();
+            },
+            async fetchPendingReload() {
+                try {
+                    const r = await fetch('{{ api_prefix | safe }}/pending-reloads');
+                    if (r.ok) { const d = await r.json(); this.pendingReload = !!d.pending?.queues; }
+                } catch (_) {}
+            },
+            loadStatusOptions() {
+                const opts = Array.isArray(this.filtersRaw.status_options) ? this.filtersRaw.status_options : [];
+                this.statusOptions = opts.length ? opts : [
+                    { value: 'all', label: this.tt('queue.all_statuses') },
+                    { value: 'active', label: this.tt('queue.status_active') },
+                    { value: 'inactive', label: this.tt('queue.status_paused') },
+                ];
+                this.statusTabs = this.statusOptions.filter((opt) => opt.value !== 'all');
+            },
+            buildParams() {
+                return {
+                    page: this.page,
+                    per_page: this.perPage,
+                    filters: {
+                        q: this.keyword.trim() || undefined,
+                        status: this.statusFilter !== 'all' ? this.statusFilter : undefined,
+                    },
+                };
+            },
+            async fetchQueues() {
+                this.loading = true;
+                this.error = null;
+                try {
+                    const response = await fetch(this.listEndpoint, {
+                        method: 'POST',
+                        headers: {
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(this.buildParams()),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || this.tt('queue.load_error'));
+                    }
+
+                    this.queues = Array.isArray(data?.items) ? data.items : [];
+                    this.fileQueues = Array.isArray(data?.file_queues) ? data.file_queues : [];
+                    this.summary = typeof data?.summary === 'object' && data.summary !== null
+                        ? {
+                            total: Number(data.summary.total) || 0,
+                            active: Number(data.summary.active) || 0,
+                            inactive: Number(data.summary.inactive) || 0,
+                        }
+                        : {
+                            total: this.queues.length,
+                            active: this.queues.filter((q) => q.is_active).length,
+                            inactive: this.queues.filter((q) => !q.is_active).length,
+                        };
+
+                    const perPage = Number(data?.per_page) > 0 ? Number(data.per_page) : this.perPage;
+                    const totalItems = Number(data?.total_items) >= 0 ? Number(data.total_items) : this.queues.length;
+                    const totalPages = Number(data?.total_pages) >= 1 ? Number(data.total_pages) : Math.max(Math.ceil(totalItems / perPage), 1);
+                    const currentPage = Number(data?.page) >= 1 ? Number(data.page) : Math.min(this.page, totalPages);
+
+                    this.perPage = perPage;
+                    this.pagination = {
+                        current_page: currentPage,
+                        per_page: perPage,
+                        total_items: totalItems,
+                        total_pages: totalPages,
+                        has_prev: currentPage > 1,
+                        has_next: currentPage < totalPages,
+                    };
+
+                    this.showingFrom = this.queues.length ? ((currentPage - 1) * perPage) + 1 : 0;
+                    this.showingTo = this.queues.length ? this.showingFrom + this.queues.length - 1 : 0;
+
+                    if (data?.filters) {
+                        this.filtersRaw = data.filters;
+                        this.loadStatusOptions();
+                    }
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || this.tt('queue.load_error');
+                    this.queues = [];
+                    this.pagination = null;
+                } finally {
+                    this.loading = false;
+                }
+            },
+            applyFilters() {
+                this.page = 1;
+                this.fetchQueues();
+            },
+            selectStatus(value) {
+                if (this.statusFilter === value) return;
+                this.statusFilter = value;
+                this.applyFilters();
+            },
+            refresh() {
+                this.fetchQueues();
+            },
+            prevPage() {
+                if (this.pagination?.has_prev) {
+                    this.page = Math.max((this.pagination.current_page || 1) - 1, 1);
+                    this.fetchQueues();
+                }
+            },
+            nextPage() {
+                if (this.pagination?.has_next) {
+                    const totalPages = this.pagination.total_pages || 1;
+                    this.page = Math.min((this.pagination.current_page || 1) + 1, totalPages);
+                    this.fetchQueues();
+                }
+            },
+            formatDate(value) {
+                if (!value) return '—';
+                const date = new Date(value);
+                if (Number.isNaN(date.getTime())) return value;
+                return date.toLocaleString();
+            },
+            detailUrl(id) {
+                return `${this.basePath}/queues/${id}`;
+            },
+            holdSummary(queue) {                const spec = queue?.spec || {};
+                if (spec?.accept_immediately) {
+                    return spec?.passthrough_ringback
+                        ? this.tt('queue.hold_immediate_passthrough')
+                        : this.tt('queue.hold_immediate_audio');
+                }
+                const audio = spec?.hold?.audio_file;
+                if (audio) {
+                    return spec?.hold?.loop_playback === false ? audio : `${audio} · loop`;
+                }
+                return this.tt('queue.hold_default');
+            },
+            holdDetail(queue) {
+                const spec = queue?.spec || {};
+                if (spec?.accept_immediately) {
+                    return spec?.passthrough_ringback
+                        ? this.tt('queue.hold_immediate_passthrough')
+                        : this.tt('queue.hold_immediate_audio');
+                }
+                return '';
+            },
+            strategyTargets(queue) {
+                const rawTargets = queue?.spec?.strategy?.targets;
+                if (!Array.isArray(rawTargets)) return [];
+                return rawTargets
+                    .map((t) => ({ uri: (t?.uri || '').trim(), label: (t?.label || '').trim() }))
+                    .filter((t) => t.uri);
+            },
+            targetSummary(queue) {
+                const targets = this.strategyTargets(queue);
+                if (!targets.length) return this.tt('queue.targets_route_trunks');
+                const modeLabel = queue?.spec?.strategy?.mode === 'parallel'
+                    ? this.tt('queue.targets_parallel')
+                    : this.tt('queue.targets_sequential');
+                const timeoutRaw = Number(queue?.spec?.strategy?.wait_timeout_secs);
+                const timeoutLabel = Number.isFinite(timeoutRaw) && timeoutRaw > 0
+                    ? ` · ${timeoutRaw}s`
+                    : '';
+                const count = targets.length;
+                const countLabel = count > 1
+                    ? this.tt('queue.targets_count_plural').replace('{count}', count)
+                    : this.tt('queue.targets_count').replace('{count}', count);
+                return `${modeLabel} · ${countLabel}${timeoutLabel}`;
+            },
+            targetDetails(queue) {
+                const targets = this.strategyTargets(queue);
+                if (!targets.length) return this.tt('queue.targets_configure');
+                const names = targets.map((t) => t.label || t.uri).slice(0, 3).join(', ');
+                const extra = targets.length > 3 ? ` +${targets.length - 3}` : '';
+                return names + extra;
+            },
+            promptsSummary(queue) {
+                const vp = queue?.spec?.voice_prompts;
+                if (!vp) return '—';
+                const labels = [];
+                if (vp.transfer_prompt) labels.push('T');
+                if (vp.busy_prompt) labels.push('B');
+                if (vp.off_hours_prompt) labels.push('O');
+                if (vp.no_answer_prompt) labels.push('N');
+                return labels.length ? labels.join(' · ') : '—';
+            },
+            fallbackSummary(queue) {
+                const fallback = queue?.spec?.fallback;
+                if (!fallback) return this.tt('queue.fallback_continue');
+                if (fallback.redirect) {
+                    return this.tt('queue.fallback_redirect').replace('{uri}', fallback.redirect);
+                }
+                if (fallback.failure_prompt) {
+                    const code = fallback.failure_code || 480;
+                    return this.tt('queue.fallback_play')
+                        .replace('{file}', fallback.failure_prompt)
+                        .replace('{code}', code);
+                }
+                if (fallback.failure_code) {
+                    const base = this.tt('queue.fallback_fail').replace('{code}', fallback.failure_code);
+                    return fallback.failure_reason ? `${base} · ${fallback.failure_reason}` : base;
+                }
+                return this.tt('queue.fallback_custom');
+            },
+            confirmDelete(queue) {
+                if (!queue || !queue.id) return;
+                window.dispatchEvent(new CustomEvent('console:confirm', {
+                    detail: {
+                        title: this.tt('queue.delete_confirm_title'),
+                        message: this.tt('queue.delete_confirm_msg').replace('{name}', queue.name),
+                        confirmLabel: this.tt('queue.delete_confirm_label'),
+                        destructive: true,
+                        onConfirm: () => this.deleteQueue(queue),
+                    },
+                }));
+            },
+            async deleteQueue(queue) {
+                if (!queue || !queue.id) return;
+                this.processingDelete = queue.id;
+                this.error = null;
+                try {
+                    const response = await fetch(queue.delete_url || this.detailUrl(queue.id), {
+                        method: 'DELETE',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data?.message || this.tt('queue.delete_error'));
+                    this.flash = this.tt('queue.queue_deleted');
+                    await this.fetchQueues();
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || this.tt('queue.delete_error');
+                } finally {
+                    this.processingDelete = null;
+                }
+            },
+            confirmReload() {
+                if (this.reloading) return;
+                window.dispatchEvent(new CustomEvent('console:confirm', {
+                    detail: {
+                        title: this.tt('queue.reload_confirm_title'),
+                        message: this.tt('queue.reload_confirm_msg'),
+                        confirmLabel: this.tt('queue.reload_confirm_label'),
+                        cancelLabel: this.tt('common.cancel'),
+                        destructive: false,
+                        onConfirm: () => this.reloadQueues(),
+                    },
+                }));
+            },
+            async reloadQueues() {
+                if (this.reloading) return;
+                this.pendingReload = false;
+                this.reloading = true;
+                this.error = null;
+                try {
+                    const response = await fetch(this.reloadEndpoint, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data?.message || this.tt('queue.reload_error'));
+                    const count = data?.queues_reloaded || 0;
+                    this.flash = this.tt('queue.queues_reloaded').replace('{count}', count);
+                    await this.refresh();
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || this.tt('queue.reload_error');
+                } finally {
+                    this.reloading = false;
+                }
+            },
+            confirmExportAll() {
+                if (this.exportingAll) return;
+                window.dispatchEvent(new CustomEvent('console:confirm', {
+                    detail: {
+                        title: this.tt('queue.export_all_confirm_title'),
+                        message: this.tt('queue.export_all_confirm_msg'),
+                        confirmLabel: this.tt('queue.export_confirm_label'),
+                        cancelLabel: this.tt('common.cancel'),
+                        destructive: false,
+                        onConfirm: () => this.exportAllQueues(),
+                    },
+                }));
+            },
+            async exportAllQueues() {
+                if (this.exportingAll) return;
+                this.exportingAll = true;
+                this.error = null;
+                try {
+                    const response = await fetch(this.exportAllEndpoint, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data?.message || this.tt('queue.export_all_error'));
+                    const paths = Array.isArray(data?.paths) ? data.paths : [];
+                    const count = paths.length;
+                    if (count === 1) {
+                        this.flash = this.tt('queue.queues_exported_n').replace('{count}', count);
+                    } else if (count > 1) {
+                        this.flash = this.tt('queue.queues_exported_n_plural').replace('{count}', count);
+                    } else {
+                        this.flash = this.tt('queue.queues_exported');
+                    }
+                    await this.refresh();
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || this.tt('queue.export_all_error');
+                } finally {
+                    this.exportingAll = false;
+                }
+            },
+        }));
+    });
+</script>
+{% endblock %}

@@ -1,0 +1,1078 @@
+use crate::{
+    call::{DialDirection, DialStrategy, Location},
+    config::RecordingPolicy,
+};
+use anyhow::{Result, anyhow};
+use ipnetwork::IpNetwork;
+use regex::Regex;
+use rsipstack::sip::prelude::HeadersExt;
+use rsipstack::sip::{StatusCode, Uri};
+use rsipstack::transport::SipAddr;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+use tokio::net::lookup_host;
+
+pub mod http;
+#[cfg(test)]
+mod http_tests;
+pub mod matcher;
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConfigOrigin {
+    #[default]
+    Embedded,
+    File(String),
+}
+
+impl ConfigOrigin {
+    pub fn embedded() -> Self {
+        Self::Embedded
+    }
+
+    pub fn from_file(path: impl Into<String>) -> Self {
+        Self::File(path.into())
+    }
+}
+
+/// Single trunk configuration
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TrunkConfig {
+    pub dest: String,
+    pub backup_dest: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(
+        default,
+        alias = "allow_codecs",
+        alias = "audio_codecs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub codec: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<TrunkDirection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<RecordingPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_from_user_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_to_user_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::models::policy::PolicySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_expires: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_extra_headers: Option<std::collections::HashMap<String, String>>,
+    #[serde(default = "default_rewrite_hostport")]
+    pub rewrite_hostport: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id_mode: Option<CallIdMode>,
+
+    // SBC Health Check
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_per_ip: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_probe_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_fallback_trunk: Option<String>,
+
+    // SBC CAC
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cac_policy: Option<CacPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow_threshold: Option<u32>,
+
+    // SBC Header Manipulation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_rules: Option<Vec<HeaderRule>>,
+
+    // SBC Media
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_mode: Option<MediaMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_policy: Option<VideoPolicy>,
+
+    #[serde(skip)]
+    pub origin: ConfigOrigin,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub did_numbers: Vec<String>,
+
+    /// Per-trunk ringback/early-media audio configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ringback: Option<RingbackAudio>,
+}
+
+/// Per-trunk ringback/early-media audio configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RingbackAudio {
+    /// Ringback/waiting tone — played as 183 early media while callee rings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring: Option<String>,
+    /// Busy tone — played as 183 early media before sending 486
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy: Option<String>,
+    /// Reject tone — played as 183 early media before sending 603
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject: Option<String>,
+    /// Offline/unavailable tone — played as 183 early media before sending 480
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
+    /// Not-found tone — played as 183 early media before sending 404
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notfound: Option<String>,
+    /// How many seconds to play the tone before sending the final rejection.
+    /// Defaults to 2 seconds when not set (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_duration_secs: Option<u32>,
+}
+
+impl RingbackAudio {
+    /// Get the audio file for a specific SIP status code
+    pub fn for_status(&self, code: &rsipstack::sip::StatusCode) -> Option<&str> {
+        match code {
+            c if *c == rsipstack::sip::StatusCode::BusyHere => self.busy.as_deref(),
+            c if *c == rsipstack::sip::StatusCode::TemporarilyUnavailable => {
+                self.offline.as_deref()
+            }
+            c if *c == rsipstack::sip::StatusCode::NotFound => self.notfound.as_deref(),
+            c if *c == rsipstack::sip::StatusCode::Decline => self.reject.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if any failure tone (busy/reject/offline/notfound) is configured
+    pub fn has_failure_tone(&self) -> bool {
+        self.busy.is_some()
+            || self.reject.is_some()
+            || self.offline.is_some()
+            || self.notfound.is_some()
+    }
+
+    /// Get the play duration before rejection for a given status code.
+    /// Returns `None` if no tone is configured for the given status code.
+    pub fn play_duration_for(
+        &self,
+        code: &rsipstack::sip::StatusCode,
+    ) -> Option<std::time::Duration> {
+        if self.for_status(code).is_some() {
+            Some(std::time::Duration::from_secs(
+                self.play_duration_secs.unwrap_or(2) as u64,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacPolicy {
+    Lossy,
+    Reject,
+    Overflow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaMode {
+    None,
+    Bypass,
+    Auto,
+    ForceTranscode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoPolicy {
+    PassThrough,
+    Strip,
+    Transcode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HeaderRule {
+    pub action: HeaderAction,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_caller_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_callee_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderAction {
+    Add,
+    Remove,
+    Set,
+    Rename,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallIdMode {
+    Transparent,
+    Rewrite,
+}
+
+fn default_rewrite_hostport() -> bool {
+    true
+}
+
+impl Default for TrunkConfig {
+    fn default() -> Self {
+        Self {
+            dest: String::new(),
+            backup_dest: None,
+            username: None,
+            password: None,
+            codec: Vec::new(),
+            disabled: None,
+            max_calls: None,
+            max_cps: None,
+            weight: None,
+            transport: None,
+            id: None,
+            direction: None,
+            inbound_hosts: Vec::new(),
+            recording: None,
+            incoming_from_user_prefix: None,
+            incoming_to_user_prefix: None,
+            country: None,
+            policy: None,
+            register_enabled: None,
+            register_expires: None,
+            register_extra_headers: None,
+            rewrite_hostport: true,
+            call_id_mode: None,
+            health_check_enabled: None,
+            health_check_per_ip: None,
+            health_check_interval_secs: None,
+            health_check_probe_count: None,
+            health_check_fallback_trunk: None,
+            cac_policy: None,
+            overflow_threshold: None,
+            header_rules: None,
+            media_mode: None,
+            video_policy: None,
+            did_numbers: Vec::new(),
+            ringback: None,
+            origin: ConfigOrigin::embedded(),
+        }
+    }
+}
+
+impl TrunkConfig {
+    pub async fn matches_inbound_ip(&self, addr: &IpAddr) -> bool {
+        for host in &self.inbound_hosts {
+            if candidate_matches(host, addr).await {
+                return true;
+            }
+        }
+
+        if candidate_matches(&self.dest, addr).await {
+            return true;
+        }
+
+        if let Some(backup) = &self.backup_dest
+            && candidate_matches(backup, addr).await
+        {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn matches_incoming_user_prefixes(
+        &self,
+        from_user: Option<&str>,
+        to_user: Option<&str>,
+    ) -> Result<bool, PrefixMismatch> {
+        if let Some(pattern) = &self.incoming_from_user_prefix {
+            let candidate = from_user.unwrap_or_default();
+            if pattern.trim().is_empty() {
+                // Treat empty string as unset
+            } else if !matches_user_prefix(pattern, candidate).map_err(|e| PrefixMismatch {
+                field: "from_user".to_string(),
+                expected: pattern.clone(),
+                actual: format!("{} (pattern error: {})", candidate, e),
+            })? {
+                return Err(PrefixMismatch {
+                    field: "from_user".to_string(),
+                    expected: pattern.clone(),
+                    actual: candidate.to_string(),
+                });
+            }
+        }
+
+        if let Some(pattern) = &self.incoming_to_user_prefix {
+            let candidate = to_user.unwrap_or_default();
+            if pattern.trim().is_empty() {
+                // Treat empty string as unset
+            } else if !matches_user_prefix(pattern, candidate).map_err(|e| PrefixMismatch {
+                field: "to_user".to_string(),
+                expected: pattern.clone(),
+                actual: format!("{} (pattern error: {})", candidate, e),
+            })? {
+                return Err(PrefixMismatch {
+                    field: "to_user".to_string(),
+                    expected: pattern.clone(),
+                    actual: candidate.to_string(),
+                });
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+/// Detailed information about a prefix mismatch for SIP Reason header
+#[derive(Debug, Clone)]
+pub struct PrefixMismatch {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+impl std::fmt::Display for PrefixMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prefix mismatch: {} expected '{}', got '{}'",
+            self.field, self.expected, self.actual
+        )
+    }
+}
+
+/// Build a [`SourceTrunk`] instance when direction is allowed by trunk configuration.
+pub fn build_source_trunk(
+    name: String,
+    config: &TrunkConfig,
+    direction: &DialDirection,
+) -> Option<SourceTrunk> {
+    if let Some(trunk_direction) = config.direction
+        && !trunk_direction.allows(direction)
+    {
+        return None;
+    }
+
+    Some(SourceTrunk {
+        name,
+        id: config.id,
+        direction: config.direction,
+    })
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TrunkDirection {
+    Inbound,
+    Outbound,
+    Bidirectional,
+}
+
+impl TrunkDirection {
+    pub fn allows(&self, direction: &DialDirection) -> bool {
+        match self {
+            TrunkDirection::Inbound => matches!(direction, DialDirection::Inbound),
+            TrunkDirection::Outbound => matches!(direction, DialDirection::Outbound),
+            TrunkDirection::Bidirectional => true,
+        }
+    }
+}
+
+impl From<crate::models::sip_trunk::SipTrunkDirection> for TrunkDirection {
+    fn from(value: crate::models::sip_trunk::SipTrunkDirection) -> Self {
+        match value {
+            crate::models::sip_trunk::SipTrunkDirection::Inbound => TrunkDirection::Inbound,
+            crate::models::sip_trunk::SipTrunkDirection::Outbound => TrunkDirection::Outbound,
+            crate::models::sip_trunk::SipTrunkDirection::Bidirectional => {
+                TrunkDirection::Bidirectional
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceTrunk {
+    pub name: String,
+    pub id: Option<i64>,
+    pub direction: Option<TrunkDirection>,
+}
+
+/// Destination configuration (can be single or multiple trunks)
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum DestConfig {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+/// Route rule
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RouteRule {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_trunks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_trunk_ids: Vec<i64>,
+
+    /// Match conditions
+    #[serde(rename = "match")]
+    pub match_conditions: MatchConditions,
+
+    /// Rewrite rules
+    #[serde(default)]
+    pub rewrite: Option<RewriteRules>,
+
+    /// Route action
+    #[serde(flatten)]
+    pub action: RouteAction,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<String>,
+
+    /// When `true`, ice_servers will not be applied for calls matching this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_ice_servers: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::models::policy::PolicySpec>,
+    #[serde(skip)]
+    pub origin: ConfigOrigin,
+}
+
+impl Default for RouteRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: None,
+            priority: 0,
+            source_trunks: Vec::new(),
+            source_trunk_ids: Vec::new(),
+            match_conditions: MatchConditions::default(),
+            rewrite: None,
+            action: RouteAction::default(),
+            codecs: Vec::new(),
+            disable_ice_servers: None,
+            disabled: None,
+            policy: None,
+            origin: ConfigOrigin::embedded(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum RouteDirection {
+    #[default]
+    Any,
+    Inbound,
+    Outbound,
+}
+
+impl RouteDirection {
+    pub fn matches(&self, direction: &DialDirection) -> bool {
+        match self {
+            RouteDirection::Any => true,
+            RouteDirection::Inbound => matches!(direction, DialDirection::Inbound),
+            RouteDirection::Outbound => matches!(direction, DialDirection::Outbound),
+        }
+    }
+}
+
+/// Match conditions
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct MatchConditions {
+    /// From user part
+    #[serde(rename = "from.user")]
+    pub from_user: Option<String>,
+    /// From host part
+    #[serde(rename = "from.host")]
+    pub from_host: Option<String>,
+    /// To user part
+    #[serde(rename = "to.user")]
+    pub to_user: Option<String>,
+    /// To host part
+    #[serde(rename = "to.host")]
+    pub to_host: Option<String>,
+    /// To port
+    #[serde(rename = "to.port")]
+    pub to_port: Option<String>,
+    /// Request URI user part
+    #[serde(rename = "request_uri.user")]
+    pub request_uri_user: Option<String>,
+    /// Request URI host part
+    #[serde(rename = "request_uri.host")]
+    pub request_uri_host: Option<String>,
+    /// Request URI port
+    #[serde(rename = "request_uri.port")]
+    pub request_uri_port: Option<String>,
+    /// SIP header fields (starting with header.)
+    #[serde(flatten)]
+    pub headers: HashMap<String, String>,
+
+    // Compatible simplified field names
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub caller: Option<String>,
+    pub callee: Option<String>,
+}
+
+/// Rewrite rules
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RewriteRules {
+    /// Rewrite From user part
+    #[serde(rename = "from.user")]
+    pub from_user: Option<String>,
+    /// Rewrite From host part
+    #[serde(rename = "from.host")]
+    pub from_host: Option<String>,
+    /// Rewrite To user part
+    #[serde(rename = "to.user")]
+    pub to_user: Option<String>,
+    /// Rewrite To host part
+    #[serde(rename = "to.host")]
+    pub to_host: Option<String>,
+    /// Rewrite To port
+    #[serde(rename = "to.port")]
+    pub to_port: Option<String>,
+    /// Rewrite Request URI user part
+    #[serde(rename = "request_uri.user")]
+    pub request_uri_user: Option<String>,
+    /// Rewrite Request URI host part
+    #[serde(rename = "request_uri.host")]
+    pub request_uri_host: Option<String>,
+    /// Rewrite Request URI port
+    #[serde(rename = "request_uri.port")]
+    pub request_uri_port: Option<String>,
+    /// Add/modify header fields (starting with header.)
+    #[serde(flatten)]
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RouteAction {
+    #[serde(default)]
+    pub action: Option<String>,
+
+    #[serde(default)]
+    pub dest: Option<DestConfig>,
+
+    #[serde(default = "default_select")]
+    pub select: String,
+
+    #[serde(default)]
+    pub hash_key: Option<String>,
+
+    #[serde(default)]
+    pub reject: Option<RejectConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_params: Option<serde_json::Value>,
+
+    #[serde(default = "default_auto_answer")]
+    pub auto_answer: bool,
+}
+
+fn default_auto_answer() -> bool {
+    true
+}
+
+impl Default for RouteAction {
+    fn default() -> Self {
+        RouteAction {
+            action: None,
+            dest: None,
+            select: default_select(),
+            hash_key: None,
+            reject: None,
+            queue: None,
+            app: None,
+            app_params: None,
+            auto_answer: default_auto_answer(),
+        }
+    }
+}
+
+impl RouteAction {
+    pub fn get_action_type(&self) -> ActionType {
+        match &self.action {
+            Some(action) => match action.as_str() {
+                "reject" => ActionType::Reject,
+                "busy" => ActionType::Busy,
+                "queue" => ActionType::Queue,
+                "application" => ActionType::Application,
+                _ => ActionType::Forward,
+            },
+            None => {
+                if self.app.is_some() {
+                    ActionType::Application
+                } else if self.queue.is_some() {
+                    ActionType::Queue
+                } else if self.reject.is_some() {
+                    ActionType::Reject
+                } else {
+                    ActionType::Forward
+                }
+            }
+        }
+    }
+}
+
+/// Action type enum
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionType {
+    Forward,
+    Reject,
+    Busy,
+    Queue,
+    Application,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RouteQueueConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub accept_immediately: bool,
+    #[serde(default)]
+    pub passthrough_ringback: bool,
+    #[serde(default)]
+    pub hold: Option<RouteQueueHoldConfig>,
+    #[serde(default)]
+    pub fallback: Option<RouteQueueFallbackConfig>,
+    #[serde(default)]
+    pub strategy: RouteQueueStrategyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_prompts: Option<crate::call::VoicePrompts>,
+    #[serde(skip)]
+    pub origin: ConfigOrigin,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RouteQueueHoldConfig {
+    pub audio_file: Option<String>,
+    #[serde(default = "RouteQueueHoldConfig::default_loop")]
+    pub loop_playback: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RouteQueueStrategyConfig {
+    #[serde(default = "QueueDialMode::default_mode")]
+    pub mode: QueueDialMode,
+    pub wait_timeout_secs: Option<u16>,
+    #[serde(default)]
+    pub targets: Vec<RouteQueueTargetConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RouteQueueTargetConfig {
+    pub uri: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum QueueDialMode {
+    #[default]
+    Sequential,
+    Parallel,
+}
+
+impl QueueDialMode {
+    pub fn default_mode() -> Self {
+        QueueDialMode::Sequential
+    }
+}
+
+impl RouteQueueHoldConfig {
+    fn default_loop() -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RouteQueueFallbackConfig {
+    pub redirect: Option<String>,
+    pub failure_code: Option<u16>,
+    pub failure_reason: Option<String>,
+    pub failure_prompt: Option<String>,
+    pub queue_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_group_ref: Option<String>,
+}
+
+impl RouteQueueConfig {
+    pub fn to_queue_plan(&self) -> Result<crate::call::QueuePlan> {
+        let failure_audio = self
+            .voice_prompts
+            .as_ref()
+            .and_then(|prompts| prompts.busy_prompt.as_ref())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let mut plan = crate::call::QueuePlan {
+            accept_immediately: self.accept_immediately,
+            passthrough_ringback: self.passthrough_ringback && self.accept_immediately,
+            hold: None,
+            failure_audio,
+            ..Default::default()
+        };
+        if let Some(hold) = &self.hold {
+            let mut cfg = crate::call::QueueHoldConfig::default();
+            if let Some(file) = &hold.audio_file {
+                cfg = cfg.with_audio_file(file.clone());
+            }
+            cfg = cfg.with_loop_playback(hold.loop_playback);
+            plan.hold = Some(cfg);
+        }
+        if let Some(fallback) = &self.fallback {
+            plan.fallback = Some(fallback.to_action()?);
+        }
+        if let Some(strategy) = self.build_dial_strategy()? {
+            plan.dial_strategy = Some(strategy);
+        }
+        if let Some(timeout) = self.strategy.wait_timeout_secs
+            && timeout > 0
+        {
+            plan.ring_timeout = Some(Duration::from_secs(timeout as u64));
+        }
+        plan.voice_prompts = self.voice_prompts.clone();
+        plan.queue_name = self.name.clone().unwrap_or_default();
+        Ok(plan)
+    }
+
+    fn build_dial_strategy(&self) -> Result<Option<DialStrategy>> {
+        if self.strategy.targets.is_empty() {
+            return Ok(None);
+        }
+
+        let mut locations = Vec::new();
+        for target in &self.strategy.targets {
+            let uri_text = target.uri.trim();
+            if uri_text.is_empty() {
+                continue;
+            }
+
+            // Handle skill-group targets (serialized as uri: "skill-group:{id}")
+            if uri_text.starts_with("skill-group:") {
+                let skill_group_id = uri_text
+                    .strip_prefix("skill-group:")
+                    .unwrap_or(uri_text)
+                    .trim();
+                if !skill_group_id.is_empty() {
+                    // Create a special location for skill group that will be resolved at runtime
+                    let location = Location {
+                        aor: Uri::try_from(format!("skill-group:{}", skill_group_id)).map_err(
+                            |err| anyhow!("invalid skill group uri '{}': {}", uri_text, err),
+                        )?,
+                        contact_raw: Some(uri_text.to_string()),
+                        ..Default::default()
+                    };
+                    locations.push(location);
+                }
+                continue;
+            }
+
+            let uri = Uri::try_from(uri_text)
+                .map_err(|err| anyhow!("invalid queue target uri '{}': {}", uri_text, err))?;
+            let location = Location {
+                aor: uri.clone(),
+                contact_raw: Some(uri.to_string()),
+                ..Default::default()
+            };
+            locations.push(location);
+        }
+
+        if locations.is_empty() {
+            return Ok(None);
+        }
+
+        let strategy = match self.strategy.mode {
+            QueueDialMode::Parallel => DialStrategy::Parallel(locations),
+            QueueDialMode::Sequential => DialStrategy::Sequential(locations),
+        };
+        Ok(Some(strategy))
+    }
+}
+
+impl RouteQueueFallbackConfig {
+    fn to_action(&self) -> Result<crate::call::QueueFallbackAction> {
+        // Check queue_ref - can be either a queue name or skill-group:{id}
+        if let Some(queue) = self
+            .queue_ref
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(crate::call::QueueFallbackAction::Queue {
+                name: queue.to_string(),
+            });
+        }
+
+        // Check direct skill_group_ref field (stored as skill-group:{id} in queue_ref)
+        if let Some(skill_group_id) = self
+            .skill_group_ref
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(crate::call::QueueFallbackAction::Queue {
+                name: format!("skill-group:{}", skill_group_id),
+            });
+        }
+        if let Some(target) = &self.redirect {
+            let uri = Uri::try_from(target.as_str())?;
+            return Ok(crate::call::QueueFallbackAction::Redirect { target: uri });
+        }
+        if self.failure_code.is_some() || self.failure_prompt.is_some() {
+            let status = match self.failure_code {
+                Some(code) => {
+                    if !(100..=699).contains(&code) {
+                        return Err(anyhow!("invalid failure_code {}: must be 100-699", code));
+                    }
+                    StatusCode::from(code)
+                }
+                None => StatusCode::TemporarilyUnavailable,
+            };
+
+            let action = if let Some(prompt) = &self.failure_prompt {
+                crate::call::FailureAction::PlayThenHangup {
+                    audio_file: prompt.clone(),
+                    use_early_media: false, // Use 200 OK for routing failures
+                    status_code: status.clone(),
+                    reason: self.failure_reason.clone(),
+                }
+            } else {
+                crate::call::FailureAction::Hangup {
+                    code: Some(status),
+                    reason: self.failure_reason.clone(),
+                }
+            };
+            return Ok(crate::call::QueueFallbackAction::Failure(action));
+        }
+        Err(anyhow!(
+            "Queue fallback must specify redirect or failure action"
+        ))
+    }
+}
+/// Reject configuration
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RejectConfig {
+    pub code: u16,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_select() -> String {
+    "rr".to_string()
+}
+
+async fn candidate_matches(candidate: &str, addr: &IpAddr) -> bool {
+    let trimmed = candidate.trim().trim_matches(|c| c == '<' || c == '>');
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Ok(network) = trimmed.parse::<IpNetwork>() {
+        return network.contains(*addr);
+    }
+
+    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
+        return socket.ip() == *addr;
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return ip == *addr;
+    }
+
+    if let Ok(uri) = rsipstack::sip::Uri::try_from(trimmed) {
+        return host_matches(&uri.host_with_port.host.to_string(), addr).await;
+    }
+
+    if let Some((host, _)) = split_host_port(trimmed) {
+        return host_matches(host, addr).await;
+    }
+
+    host_matches(trimmed, addr).await
+}
+
+/// Public helper to validate whether a candidate host definition resolves to the provided IP.
+pub async fn candidate_matches_ip(candidate: &str, addr: &IpAddr) -> bool {
+    candidate_matches(candidate, addr).await
+}
+
+pub fn source_addr_ip(source_addr: &SipAddr) -> Option<IpAddr> {
+    let ip: IpAddr = source_addr.addr.host.clone().try_into().ok()?;
+    Some(ip)
+}
+
+async fn host_matches(host: &str, addr: &IpAddr) -> bool {
+    let cleaned = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    if let Ok(network) = cleaned.parse::<IpNetwork>() {
+        return network.contains(*addr);
+    }
+
+    if let Ok(socket) = cleaned.parse::<SocketAddr>() {
+        return socket.ip() == *addr;
+    }
+
+    if let Ok(ip) = cleaned.parse::<IpAddr>() {
+        return ip == *addr;
+    }
+
+    let lookup_target = match split_host_port(cleaned) {
+        Some((host_part, _)) => host_part.to_string(),
+        None => cleaned.to_string(),
+    };
+
+    match lookup_host((lookup_target.as_str(), 0)).await {
+        Ok(addrs) => addrs.into_iter().any(|resolved| resolved.ip() == *addr),
+        Err(_) => false,
+    }
+}
+
+fn split_host_port(input: &str) -> Option<(&str, &str)> {
+    if let Some(end) = input.find(']')
+        && input.starts_with('[')
+        && input.len() > end + 1
+        && input[end + 1..].starts_with(':')
+    {
+        return Some((&input[1..end], &input[end + 2..]));
+    }
+
+    if let Some(idx) = input.rfind(':') {
+        if input[..idx].contains(':') {
+            return None;
+        }
+        return Some((&input[..idx], &input[idx + 1..]));
+    }
+
+    None
+}
+
+fn matches_user_prefix(pattern: &str, value: &str) -> Result<bool> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+
+    let mut is_regex = false;
+    for ch in trimmed.chars() {
+        match ch {
+            '^' | '$' | '.' | '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '\\' => {
+                is_regex = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if !is_regex {
+        return Ok(value.starts_with(trimmed));
+    }
+
+    let regex =
+        Regex::new(trimmed).map_err(|err| anyhow!("invalid regex '{}': {}", trimmed, err))?;
+    Ok(regex.is_match(value))
+}
+
+/// Resolve a transport enum from a lowercase string (e.g. "udp", "tcp", "tls", "ws", "wss").
+/// Returns `None` for unrecognized values.
+pub fn resolve_transport_from_str(s: &str) -> Option<rsipstack::sip::transport::Transport> {
+    match s.to_lowercase().as_str() {
+        "udp" => Some(rsipstack::sip::transport::Transport::Udp),
+        "tcp" => Some(rsipstack::sip::transport::Transport::Tcp),
+        "tls" => Some(rsipstack::sip::transport::Transport::Tls),
+        "ws" => Some(rsipstack::sip::transport::Transport::Ws),
+        "wss" => Some(rsipstack::sip::transport::Transport::Wss),
+        _ => None,
+    }
+}
+
+pub fn extract_via_ip(origin: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    let via = origin.via_header().ok()?;
+    let (_, target) = rsipstack::transport::SipConnection::parse_target_from_via(via).ok()?;
+    target.host.try_into().ok()
+}
+
+pub fn extract_from_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin
+        .from_header()
+        .ok()
+        .and_then(|h| h.uri().ok())
+        .and_then(|uri| uri.user().map(|u| u.to_string()))
+}
+
+pub fn extract_to_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin
+        .to_header()
+        .ok()
+        .and_then(|h| h.uri().ok())
+        .and_then(|uri| uri.user().map(|u| u.to_string()))
+}
+
+pub fn extract_request_user(origin: &rsipstack::sip::Request) -> Option<String> {
+    origin.uri.user().map(|u| u.to_string())
+}
+
+pub fn escape_sip_quoted(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
+}
