@@ -270,19 +270,23 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 后续按以下顺序推进：
 
-1. **抽共享 Dialplan Resolver**：Worker 已抽出 `dialplan_resolver` 边界承载内部
-   INVITE → `Dialplan` 构建；单体 `CallModule::default_resolve` 接入需等根 `src/`
-   允许修改后再做，避免两套路由行为分叉。
-2. **RTP Gateway Phase 2**：`MediaThreadCallSink` 与 `spawn_media_thread_bridge`
-   已建立可调用的专用线程边界；后续把 PCM 注入、SDP renegotiate 和真实
-   RTP/codec 循环接入该线程，并通过 `MediaEvent` 返回成功/失败。
-3. **调度增强**：Control 已按健康、draining、容量、labels、capabilities、
-   租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序；后续可继续补跨 AZ
-   failure-domain 分散或更复杂的成本模型。
-4. **状态流**：如果需要实时观测，继续补 Worker 呼叫过程中的 ringing/answered
-   中间态 hook，而不是仅在 CDR 完成时回放时间线。
-5. **CDR 可靠性**：Worker 已在 Control 上传失败时把 CDR 落盘到 `cdr_spool_dir`
-   并后台重试；生产环境应把该目录挂到持久卷。
+1. **分机 Contact 粒度路由**：在 Control affinity 状态中保留 Contact/q/expires
+   元数据，Edge 按 Contact 去重与优先级生成 fork 目标；仍兼容现有
+   `extension:<tenant>:<ext>` worker 级 sticky routing。
+2. **多 Control 即时配置广播**：当前已有数据库单调版本、watch 重连 resync 和 Edge
+   周期 poll 兜底；后续接入 Raft event bus 或数据库通知，把配置事件从写入节点广播
+   到所有 Control 节点的本地 watch stream。
+3. **RTP Gateway Phase 2 实体处理**：`MediaThreadCallSink` 与
+   `spawn_media_thread_bridge` 已建立可调用的专用线程边界；后续把 PCM 注入、SDP
+   renegotiate 和真实 RTP/codec 循环接入该线程，并通过 `MediaEvent` 返回成功/失败。
+4. **调度 failure-domain 策略**：Control 已按健康、draining、容量、labels、
+   capabilities、租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序；后续补跨 AZ
+   分散、故障域避让和更细的权重组合。
+5. **受根 `src/` 限制的事项**：共享 Dialplan Resolver 接入单体
+   `CallModule::default_resolve`，以及真正实时的 ringing/answered 状态 hook，都需要
+   修改根 `src/` 的通话状态机；在允许改根 `src/` 前只保留设计边界，不落代码。
+6. **CDR 可靠性运维化**：Worker 已在 Control 上传失败时把 CDR 落盘到
+   `cdr_spool_dir` 并后台重试；生产环境应把该目录挂到持久卷，并补监控/告警指标。
 
 多节点仍需关注：
 
