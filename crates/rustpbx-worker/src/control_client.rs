@@ -126,6 +126,7 @@ impl ControlClient {
                 capabilities: self.capabilities.clone(),
                 edge_worker_addr: self.edge_worker_addr.clone(),
                 nat_type: self.nat_type.clone(),
+                extension_contacts: Vec::new(),
             })
             .await?;
         Ok(resp.into_inner())

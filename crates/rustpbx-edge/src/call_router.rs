@@ -309,7 +309,7 @@ impl EdgeCallRouter {
             })?;
             locations.push(Location {
                 aor: worker_uri,
-                headers: Some(encode_headers(ctx)),
+                headers: Some(encode_headers_for_worker(ctx, &worker)),
                 transport: Some(Transport::Tcp),
                 ..Default::default()
             });
@@ -661,6 +661,22 @@ fn extension_affinity_key(tenant_id: Option<i64>, ctx: &InternalCallContext) -> 
     ))
 }
 
+fn encode_headers_for_worker(
+    ctx: &InternalCallContext,
+    worker: &crate::worker_selector::WorkerEndpoint,
+) -> Vec<rsipstack::sip::Header> {
+    if worker.extension_contacts.is_empty() {
+        return encode_headers(ctx);
+    }
+    let mut worker_ctx = ctx.clone();
+    worker_ctx.targets = worker
+        .extension_contacts
+        .iter()
+        .map(|contact| contact.contact.clone())
+        .collect();
+    encode_headers(&worker_ctx)
+}
+
 /// Build the carrier-facing Request-URI: keep the dialed number (callee user
 /// part) and swap the host/port to the trunk's destination. Mirrors the
 /// `rewrite_hostport` behaviour of the monolith's `apply_trunk_config`.
@@ -738,6 +754,39 @@ mod tests {
         assert_eq!(
             extension_affinity_key(ctx.tenant_id, &ctx).as_deref(),
             Some("extension:7:1002")
+        );
+    }
+
+    #[test]
+    fn worker_contact_metadata_sets_internal_targets() {
+        let ctx = InternalCallContext {
+            targets: vec!["sip:1002@example.com".to_string()],
+            ..Default::default()
+        };
+        let worker = crate::worker_selector::WorkerEndpoint {
+            worker_id: "worker-a".to_string(),
+            sip_contact: "sip:10.0.0.7:5070".to_string(),
+            available_capacity: 10,
+            edge_worker_addr: String::new(),
+            extension_contacts: vec![
+                crate::proto::control::ExtensionContact {
+                    contact: "sip:1002@ua-a".to_string(),
+                    q_milli: 900,
+                    expires_at_unix_ms: 1,
+                },
+                crate::proto::control::ExtensionContact {
+                    contact: "sip:1002@ua-b".to_string(),
+                    q_milli: 500,
+                    expires_at_unix_ms: 1,
+                },
+            ],
+        };
+
+        let headers = rsipstack::sip::Headers::from(encode_headers_for_worker(&ctx, &worker));
+        let decoded = crate::headers::decode_headers(&headers).unwrap();
+        assert_eq!(
+            decoded.targets,
+            vec!["sip:1002@ua-a".to_string(), "sip:1002@ua-b".to_string()]
         );
     }
 }

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
 
+pub use crate::proto::control::ExtensionContact;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WorkerEndpoint {
@@ -20,6 +22,8 @@ pub struct WorkerEndpoint {
     /// EdgeWorker gRPC addr (host:port) for AllocateCall; empty if the worker
     /// doesn't serve it (Edge then forwards without reservation).
     pub edge_worker_addr: String,
+    /// Extension Contact metadata when the selection used an extension affinity key.
+    pub extension_contacts: Vec<ExtensionContact>,
 }
 
 pub struct WorkerSelector {
@@ -100,6 +104,7 @@ impl WorkerSelector {
                     sip_contact: format!("sip:{}", worker.sip_addr),
                     available_capacity: capacity,
                     edge_worker_addr: worker.edge_worker_addr,
+                    extension_contacts: worker.extension_contacts,
                 }
             })
             .collect())

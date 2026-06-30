@@ -303,6 +303,13 @@ message WorkerInfo {
   // Detected NAT type (open/cone/symmetric/nat/blocked/unknown), from STUN.
   string nat_type = 10;
   repeated string capabilities = 11;
+  repeated ExtensionContact extension_contacts = 12;
+}
+
+message ExtensionContact {
+  string contact = 1;
+  uint32 q_milli = 2;
+  uint64 expires_at_unix_ms = 3;
 }
 
 message RegisterAck    { bool accepted = 1; }

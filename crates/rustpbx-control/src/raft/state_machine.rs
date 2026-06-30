@@ -168,6 +168,32 @@ impl StateMachineStore {
             .into_iter()
             .collect()
     }
+
+    /// Resolve extension Contact metadata by worker for an affinity key.
+    pub async fn contacts_for_affinity(
+        &self,
+        affinity_key: &str,
+    ) -> BTreeMap<String, Vec<ExtensionContactRecord>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let data = self.data.lock().await;
+        let mut out = BTreeMap::new();
+        let Some(members) = data.worker_affinity_contacts.get(affinity_key) else {
+            return out;
+        };
+        for (worker_id, contacts) in members {
+            let mut records: Vec<ExtensionContactRecord> = contacts
+                .values()
+                .filter(|record| record.expires_at_ms == 0 || record.expires_at_ms > now_ms)
+                .cloned()
+                .collect();
+            records
+                .sort_by_key(|record| (std::cmp::Reverse(record.q_milli), record.contact.clone()));
+            if !records.is_empty() {
+                out.insert(worker_id.clone(), records);
+            }
+        }
+        out
+    }
 }
 
 fn remove_worker_from_affinity(data: &mut StateMachineData, worker_id: &str) {

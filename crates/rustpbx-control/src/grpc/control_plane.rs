@@ -384,6 +384,11 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<WorkerList>, Status> {
         let req = request.into_inner();
 
+        let contacts_by_worker = match req.affinity_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => self.workers.contacts_for_affinity(key).await,
+            _ => Default::default(),
+        };
+
         let workers = self
             .workers
             .available_with_constraints(
@@ -395,6 +400,17 @@ impl ControlPlane for ControlPlaneService {
             .await
             .into_iter()
             .map(|w| WorkerInfo {
+                extension_contacts: contacts_by_worker
+                    .get(&w.worker_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| crate::grpc::proto::control::ExtensionContact {
+                        contact: c.contact,
+                        q_milli: c.q_milli as u32,
+                        expires_at_unix_ms: c.expires_at_ms.max(0) as u64,
+                    })
+                    .collect(),
                 worker_id: w.worker_id,
                 sip_addr: w.sip_addr,
                 rtp_external_ip: w.rtp_external_ip,

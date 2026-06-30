@@ -19,7 +19,8 @@ use super::log_store::LogStore;
 use super::network::NetworkFactory;
 use super::state_machine::StateMachineStore;
 use super::types::{
-    EdgeRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig, WorkerRecord, node_addr,
+    EdgeRecord, ExtensionContactRecord, NodeId, RegistryCommand, RegistryResponse, TypeConfig,
+    WorkerRecord, node_addr,
 };
 
 /// Current wall-clock in unix-millis. Used by the leader to stamp commands so
@@ -503,6 +504,14 @@ impl RaftRegistry {
             })
             .await?;
         Ok(resp.removed)
+    }
+
+    /// Contact metadata for one affinity key, grouped by worker.
+    pub async fn contacts_for_affinity(
+        &self,
+        affinity_key: &str,
+    ) -> BTreeMap<String, Vec<ExtensionContactRecord>> {
+        self.sm.contacts_for_affinity(affinity_key).await
     }
 
     /// Healthy workers with spare capacity, most-available first.
