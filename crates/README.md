@@ -289,7 +289,7 @@ Worker → Edge 的 CDR 时间线状态上报。
    真正挂入当前运行的 `CallModule` 需要修改根 `src/` 的通话会话边界，当前按约束暂不动。
 4. **调度 failure-domain 策略**：Control 已按健康、draining、容量、labels、
    capabilities、租户亲和、NAT 可达性与 `schedule_cost` 筛选/排序，并对候选 Worker
-   按故障域交错；后续可继续补基于实时域内负载的权重组合。
+   按实时域内负载排序后再做故障域交错，优先把新呼叫分配到更空闲的故障域。
 5. **受根 `src/` 限制的事项**：共享 Dialplan Resolver 接入单体
    `CallModule::default_resolve`，以及真正实时的 ringing/answered 状态 hook，都需要
    修改根 `src/` 的通话状态机；在允许改根 `src/` 前只保留设计边界，不落代码。

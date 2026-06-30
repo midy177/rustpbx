@@ -594,29 +594,53 @@ impl RaftRegistry {
     }
 }
 
+struct FailureDomainGroup {
+    domain: String,
+    active_calls: u32,
+    available_capacity: u32,
+    workers: VecDeque<WorkerRecord>,
+}
+
 fn interleave_failure_domains(workers: Vec<WorkerRecord>) -> Vec<WorkerRecord> {
     if workers.len() < 3 {
         return workers;
     }
 
-    let mut groups: Vec<(String, VecDeque<WorkerRecord>)> = Vec::new();
+    let mut groups: Vec<FailureDomainGroup> = Vec::new();
     for worker in workers {
         let domain = worker.failure_domain();
-        if let Some((_, group)) = groups.iter_mut().find(|(key, _)| key == &domain) {
-            group.push_back(worker);
+        if let Some(group) = groups.iter_mut().find(|group| group.domain == domain) {
+            group.active_calls = group.active_calls.saturating_add(worker.active_calls);
+            group.available_capacity = group
+                .available_capacity
+                .saturating_add(worker.available_capacity());
+            group.workers.push_back(worker);
         } else {
-            groups.push((domain, VecDeque::from([worker])));
+            groups.push(FailureDomainGroup {
+                domain,
+                active_calls: worker.active_calls,
+                available_capacity: worker.available_capacity(),
+                workers: VecDeque::from([worker]),
+            });
         }
     }
 
     if groups.len() <= 1 {
-        return groups.into_iter().flat_map(|(_, group)| group).collect();
+        return groups.into_iter().flat_map(|group| group.workers).collect();
     }
 
+    groups.sort_by_key(|group| {
+        (
+            group.active_calls,
+            std::cmp::Reverse(group.available_capacity),
+            group.domain.clone(),
+        )
+    });
+
     let mut out = Vec::new();
-    while groups.iter().any(|(_, group)| !group.is_empty()) {
-        for (_, group) in &mut groups {
-            if let Some(worker) = group.pop_front() {
+    while groups.iter().any(|group| !group.workers.is_empty()) {
+        for group in &mut groups {
+            if let Some(worker) = group.workers.pop_front() {
                 out.push(worker);
             }
         }
@@ -1050,6 +1074,39 @@ mod tests {
                 "a2".to_string(),
                 "b2".to_string(),
                 "a3".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn available_orders_failure_domains_by_realtime_load() {
+        let reg = start().await;
+
+        for (id, zone, active_calls) in [
+            ("hot-a1", "az-hot", 70),
+            ("hot-a2", "az-hot", 60),
+            ("cool-b1", "az-cool", 10),
+            ("cool-b2", "az-cool", 20),
+        ] {
+            let mut worker = rec(id);
+            worker.active_calls = active_calls;
+            worker
+                .labels
+                .insert("failure_domain".to_string(), zone.to_string());
+            reg.register(worker).await.unwrap();
+        }
+
+        let avail = reg
+            .available_with_constraints(None, &HashMap::new(), &[], None)
+            .await;
+        let ids: Vec<String> = avail.into_iter().map(|w| w.worker_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "cool-b1".to_string(),
+                "hot-a2".to_string(),
+                "cool-b2".to_string(),
+                "hot-a1".to_string()
             ]
         );
     }
