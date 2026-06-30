@@ -6,6 +6,7 @@ pub mod auth;
 pub mod auto_external_ip;
 pub mod call;
 pub mod callrecord;
+pub mod cloudpbx;
 pub mod config;
 #[cfg(feature = "console")]
 pub mod console;

@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::{
     compression::CompressionLayer,
     cors::{AllowOrigin, CorsLayer},
-    services::ServeDir,
+    services::{ServeDir, ServeFile},
 };
 use tracing::{info, warn};
 
@@ -795,6 +795,13 @@ async fn phone_config_handler(State(state): State<AppState>) -> impl IntoRespons
     Json(config).into_response()
 }
 
+async fn cloudpbx_spa_index() -> Response {
+    match tokio::fs::read_to_string("web/dist/index.html").await {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new();
 
@@ -843,6 +850,11 @@ pub fn create_router(state: AppState) -> Router {
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     #[allow(unused_mut)]
     let mut router = router
+        .route("/app", get(cloudpbx_spa_index))
+        .nest_service(
+            "/app",
+            ServeDir::new("web/dist").not_found_service(ServeFile::new("web/dist/index.html")),
+        )
         .route(
             "/api/config/phone",
             get(phone_config_handler).with_state(state.clone()),
@@ -852,6 +864,7 @@ pub fn create_router(state: AppState) -> Router {
             get(iceservers_handler).with_state(state.clone()),
         )
         .merge(state.addon_registry.get_routers(state.clone()))
+        .merge(crate::cloudpbx::router())
         .nest_service(&static_path, static_files_service)
         .merge(call_routes)
         .layer(cors);
