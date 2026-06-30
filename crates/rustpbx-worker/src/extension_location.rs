@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use metrics::{counter, gauge};
 use prost::Message;
 use rsipstack::sip::Method;
 use rsipstack::sip::prelude::HeadersExt;
@@ -274,17 +275,23 @@ async fn report_location_with_retry(report: PendingReport) {
 async fn spool_and_report_location(report: PendingReport) {
     let spool = ExtensionLocationSpool::new(report.cfg.spool_dir.clone());
     match spool.enqueue(&report.to_proto()).await {
-        Ok(path) => match report_location_with_retry_result(&report).await {
-            Ok(()) => {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    warn!(error = %e, path = %path.display(), "failed to remove sent extension location spool file");
+        Ok(path) => {
+            counter!("worker_extension_location_spooled_total").increment(1);
+            match report_location_with_retry_result(&report).await {
+                Ok(()) => {
+                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                        warn!(error = %e, path = %path.display(), "failed to remove sent extension location spool file");
+                    }
+                    spool.update_pending_gauge().await;
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), extension = %report.extension, "extension location report remains spooled");
+                    spool.update_pending_gauge().await;
                 }
             }
-            Err(e) => {
-                warn!(error = %e, path = %path.display(), extension = %report.extension, "extension location report remains spooled");
-            }
-        },
+        }
         Err(e) => {
+            counter!("worker_extension_location_spool_write_failures_total").increment(1);
             warn!(error = %e, "extension location spool write failed; falling back to in-memory retry");
             report_location_with_retry(report).await;
         }
@@ -366,6 +373,7 @@ impl ExtensionLocationSpool {
         let tmp = path.with_extension("tmp");
         tokio::fs::write(&tmp, report.encode_to_vec()).await?;
         tokio::fs::rename(&tmp, &path).await?;
+        self.update_pending_gauge().await;
         Ok(path)
     }
 
@@ -392,6 +400,7 @@ impl ExtensionLocationSpool {
                 Ok(report) => report,
                 Err(e) => {
                     warn!(error = %e, path = %path.display(), "invalid extension location spool file; moving aside");
+                    counter!("worker_extension_location_spool_invalid_total").increment(1);
                     move_bad_spool_file(&path).await.ok();
                     continue;
                 }
@@ -399,6 +408,7 @@ impl ExtensionLocationSpool {
             if report.expires_secs > 0 && report_is_expired(&path, report.expires_secs).await {
                 debug!(path = %path.display(), extension = %report.extension, "dropping expired extension location spool file");
                 tokio::fs::remove_file(&path).await.ok();
+                counter!("worker_extension_location_spool_expired_total").increment(1);
                 continue;
             }
             let pending = PendingReport {
@@ -409,13 +419,40 @@ impl ExtensionLocationSpool {
                 expires_secs: report.expires_secs,
             };
             if let Err(e) = report_location(&pending).await {
+                counter!("worker_extension_location_replay_failures_total").increment(1);
                 warn!(error = %e, path = %path.display(), extension = %report.extension, "extension location replay failed");
                 continue;
             }
             tokio::fs::remove_file(&path).await?;
+            counter!("worker_extension_location_replay_success_total").increment(1);
             sent += 1;
         }
+        self.update_pending_gauge().await;
         Ok(sent)
+    }
+
+    async fn pending_count(&self) -> Result<u64> {
+        let mut dir = match tokio::fs::read_dir(&self.dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut count = 0;
+        while let Some(entry) = dir.next_entry().await? {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("pb") {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn update_pending_gauge(&self) {
+        match self.pending_count().await {
+            Ok(count) => gauge!("worker_extension_location_spool_pending").set(count as f64),
+            Err(e) => {
+                warn!(error = %e, dir = %self.dir.display(), "failed to count extension location spool files")
+            }
+        }
     }
 }
 
@@ -494,6 +531,7 @@ mod tests {
         };
 
         let path = spool.enqueue(&report).await.unwrap();
+        assert_eq!(spool.pending_count().await.unwrap(), 1);
         let bytes = tokio::fs::read(&path).await.unwrap();
         let decoded = ExtensionLocationReport::decode(bytes.as_slice()).unwrap();
 

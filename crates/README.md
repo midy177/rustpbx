@@ -296,7 +296,10 @@ Worker → Edge 的 CDR 时间线状态上报。
    `cdr_spool_dir` 并后台重试；Prometheus 暴露
    `worker_cdr_spool_pending`、`worker_cdr_upload_failures_total`、
    `worker_cdr_replay_success_total` 和 `worker_cdr_replay_failures_total`。
-   生产环境应把该目录挂到持久卷，并对 pending 持续增长或 replay failure 告警。
+   分机位置上报 spool 同样暴露 `worker_extension_location_spool_pending`、
+   `worker_extension_location_replay_success_total`、
+   `worker_extension_location_replay_failures_total` 等指标。生产环境应把这些目录挂到
+   持久卷，并对 pending 持续增长或 replay failure 告警。
 
 多节点仍需关注：
 
