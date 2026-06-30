@@ -347,6 +347,21 @@ struct CreateSipTrunkRequest {
     register_enabled: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateRouteRequest {
+    name: String,
+    description: Option<String>,
+    direction: Option<crate::models::routing::RoutingDirection>,
+    priority: Option<i32>,
+    is_active: Option<bool>,
+    selection_strategy: Option<crate::models::routing::RoutingSelectionStrategy>,
+    source_trunk_id: Option<i64>,
+    default_trunk_id: Option<i64>,
+    source_pattern: Option<String>,
+    destination_pattern: Option<String>,
+    owner: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -366,7 +381,7 @@ pub fn router(state: crate::app::AppState) -> Router {
             "/api/cloudpbx/sip-trunks",
             get(list_sip_trunks).post(create_sip_trunk),
         )
-        .route("/api/cloudpbx/routes", get(list_routes))
+        .route("/api/cloudpbx/routes", get(list_routes).post(create_route))
         .route("/api/cloudpbx/call-records", get(list_call_records))
         .route("/api/cloudpbx/users", get(list_users))
         .with_state(state)
@@ -690,6 +705,103 @@ async fn list_routes(State(state): State<crate::app::AppState>, ctx: TenantConte
     }
 }
 
+async fn create_route(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<CreateRouteRequest>,
+) -> Response {
+    match create_route_for_tenant(state.db(), &ctx, payload).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn create_route_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    payload: CreateRouteRequest,
+) -> Result<RouteSummary, Response> {
+    use crate::models::routing::{
+        ActiveModel, Column, Entity, RoutingDirection, RoutingSelectionStrategy,
+    };
+
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(bad_request("invalid_route_name", "Route name is required."));
+    }
+    if name.len() > 160 {
+        return Err(bad_request(
+            "invalid_route_name",
+            "Route name must be 160 characters or fewer.",
+        ));
+    }
+
+    let tenant_id = match resolve_write_tenant_id(db, ctx).await {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return Err(response),
+    };
+
+    match Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::Name.eq(name))
+        .one(db)
+        .await
+    {
+        Ok(Some(_)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "route_exists",
+                    message: "Route already exists in this tenant.",
+                }),
+            )
+                .into_response());
+        }
+        Ok(None) => {}
+        Err(_) => return Err(tenant_query_failed()),
+    }
+
+    let now = chrono::Utc::now();
+    let model = ActiveModel {
+        tenant_id: Set(Some(tenant_id)),
+        name: Set(name.to_string()),
+        description: Set(clean_optional_string(payload.description)),
+        direction: Set(payload.direction.unwrap_or(RoutingDirection::Outbound)),
+        priority: Set(payload.priority.unwrap_or(100)),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        selection_strategy: Set(payload
+            .selection_strategy
+            .unwrap_or(RoutingSelectionStrategy::RoundRobin)),
+        hash_key: Set(None),
+        source_trunk_id: Set(payload.source_trunk_id),
+        default_trunk_id: Set(payload.default_trunk_id),
+        source_pattern: Set(clean_optional_string(payload.source_pattern)),
+        destination_pattern: Set(clean_optional_string(payload.destination_pattern)),
+        header_filters: Set(None),
+        rewrite_rules: Set(None),
+        target_trunks: Set(None),
+        owner: Set(clean_optional_string(payload.owner)),
+        notes: Set(None),
+        metadata: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        last_deployed_at: Set(None),
+        ..Default::default()
+    };
+
+    match model.insert(db).await {
+        Ok(model) => Ok(RouteSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "route_create_failed",
+                message: "Failed to create route.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
 async fn list_call_records(
     State(state): State<crate::app::AppState>,
     ctx: TenantContext,
@@ -975,5 +1087,55 @@ mod tests {
         assert_eq!(summary.tenant_id, Some(tenant.id));
         assert_eq!(trunk.tenant_id, Some(tenant.id));
         assert_eq!(trunk.auth_password.as_deref(), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn create_route_sets_current_tenant_id() {
+        use crate::models::{
+            routing::{Column as RouteColumn, Entity as RouteEntity},
+            tenant::{Column as TenantColumn, Entity as TenantEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_route_for_tenant(
+            &db,
+            &ctx,
+            CreateRouteRequest {
+                name: "outbound-default".to_string(),
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: None,
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: Some("^\\+?[0-9]+$".to_string()),
+                owner: None,
+            },
+        )
+        .await
+        .expect("create route");
+
+        let tenant = TenantEntity::find()
+            .filter(TenantColumn::Slug.eq(DEFAULT_TENANT_ID))
+            .one(&db)
+            .await
+            .expect("query tenant")
+            .expect("default tenant");
+        let route = RouteEntity::find()
+            .filter(RouteColumn::Name.eq("outbound-default"))
+            .one(&db)
+            .await
+            .expect("query route")
+            .expect("route");
+
+        assert_eq!(summary.tenant_id, Some(tenant.id));
+        assert_eq!(route.tenant_id, Some(tenant.id));
     }
 }

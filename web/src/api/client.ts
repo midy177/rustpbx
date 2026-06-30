@@ -82,6 +82,20 @@ export interface RouteSummary {
   owner?: string | null;
 }
 
+export interface CreateRouteRequest {
+  name: string;
+  description?: string | null;
+  direction?: string;
+  priority?: number;
+  is_active?: boolean;
+  selection_strategy?: string;
+  source_trunk_id?: number | null;
+  default_trunk_id?: number | null;
+  source_pattern?: string | null;
+  destination_pattern?: string | null;
+  owner?: string | null;
+}
+
 export interface CallRecordSummary {
   id: number;
   tenant_id?: number | null;
@@ -177,6 +191,12 @@ export const api = {
   },
   routes() {
     return request<RouteSummary[]>("/cloudpbx/routes");
+  },
+  createRoute(payload: CreateRouteRequest) {
+    return request<RouteSummary>("/cloudpbx/routes", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
   },
   callRecords() {
     return request<CallRecordSummary[]>("/cloudpbx/call-records");
