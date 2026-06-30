@@ -277,9 +277,9 @@ Worker → Edge 的 CDR 时间线状态上报。
 
 多节点仍需关注：
 
-- 多 Worker：会议室与分机已具备 sticky routing；分机位置上报仍是认证后的
-  best-effort 观察，后续应改为 registrar 成功事件驱动，并给 affinity 增加 TTL/
-  清理 API，避免长时间保留过期绑定。
+- 多 Worker：会议室与分机已具备 sticky routing；分机 affinity 已按 REGISTER
+  expires 过期并由 Control 定期清理。分机位置上报仍是认证后的 best-effort
+  观察，后续应改为 registrar 成功事件驱动，并补多 Contact/fork 注册模型。
 - 多 Edge：Edge 当前无共享会话状态，入站流量可横向扩展；但同一 SIP dialog 的
   后续请求应由 LB 保持到同一 Edge，或补 Record-Route/路径固定策略。
 - 多 Control：Worker/Edge registry、配额、affinity 走 Raft；数据库配置变更仍需

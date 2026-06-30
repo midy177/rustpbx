@@ -10,7 +10,7 @@ use crate::{
     store::Store,
 };
 use futures::Stream;
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
@@ -281,7 +281,11 @@ impl ControlPlane for ControlPlaneService {
             info!(affinity_key = %affinity_key, "extension location unbound");
         } else {
             self.workers
-                .bind_affinity(affinity_key.clone(), report.worker_id.clone())
+                .bind_affinity_ttl(
+                    affinity_key.clone(),
+                    report.worker_id.clone(),
+                    Duration::from_secs(report.expires_secs as u64),
+                )
                 .await
                 .map_err(|e| Status::internal(format!("raft write failed: {e}")))?;
             info!(

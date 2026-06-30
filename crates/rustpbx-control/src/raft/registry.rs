@@ -427,6 +427,24 @@ impl RaftRegistry {
         self.propose(RegistryCommand::BindAffinity {
             affinity_key,
             worker_id,
+            expires_at_ms: None,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Bind a sticky routing key to a worker with a TTL.
+    pub async fn bind_affinity_ttl(
+        &self,
+        affinity_key: String,
+        worker_id: String,
+        ttl: Duration,
+    ) -> Result<()> {
+        let expires_at_ms = now_ms() + ttl.as_millis() as i64;
+        self.propose(RegistryCommand::BindAffinity {
+            affinity_key,
+            worker_id,
+            expires_at_ms: Some(expires_at_ms),
         })
         .await?;
         Ok(())
@@ -438,6 +456,16 @@ impl RaftRegistry {
             .propose(RegistryCommand::UnbindAffinity { affinity_key })
             .await?;
         Ok(resp.removed > 0)
+    }
+
+    /// Reap expired sticky routing keys.
+    pub async fn reap_affinity(&self) -> Result<u32> {
+        let resp = self
+            .propose(RegistryCommand::ReapAffinity {
+                before_ms: now_ms(),
+            })
+            .await?;
+        Ok(resp.removed)
     }
 
     /// Healthy workers with spare capacity, most-available first.
@@ -491,10 +519,7 @@ impl RaftRegistry {
             }
             if let Some(worker) = workers.first()
                 && let Err(e) = self
-                    .propose(RegistryCommand::BindAffinity {
-                        affinity_key: affinity_key.to_string(),
-                        worker_id: worker.worker_id.clone(),
-                    })
+                    .bind_affinity(affinity_key.to_string(), worker.worker_id.clone())
                     .await
             {
                 tracing::warn!(affinity_key, error = %e, "failed to bind worker affinity");
@@ -885,6 +910,48 @@ mod tests {
             .available_with_constraints(None, &HashMap::new(), &[], Some(key))
             .await;
         assert_eq!(sticky[0].worker_id, "second");
+    }
+
+    #[tokio::test]
+    async fn expired_affinity_is_ignored_and_reaped() {
+        let reg = start().await;
+
+        let mut stale_target = rec("stale-target");
+        stale_target.active_calls = 90;
+        let fresh_target = rec("fresh-target");
+
+        reg.register(stale_target).await.unwrap();
+        reg.register(fresh_target).await.unwrap();
+
+        let key = "extension:1:1001";
+        reg.raft()
+            .client_write(RegistryCommand::BindAffinity {
+                affinity_key: key.to_string(),
+                worker_id: "stale-target".to_string(),
+                expires_at_ms: Some(1),
+            })
+            .await
+            .unwrap();
+
+        let selected = reg
+            .available_with_constraints(None, &HashMap::new(), &[], Some(key))
+            .await;
+        assert_eq!(
+            selected[0].worker_id, "fresh-target",
+            "expired binding should not pin selection"
+        );
+
+        let reap_key = "extension:1:1002";
+        reg.raft()
+            .client_write(RegistryCommand::BindAffinity {
+                affinity_key: reap_key.to_string(),
+                worker_id: "stale-target".to_string(),
+                expires_at_ms: Some(1),
+            })
+            .await
+            .unwrap();
+        let removed = reg.reap_affinity().await.unwrap();
+        assert_eq!(removed, 1, "expired binding should be removed");
     }
 
     #[tokio::test]

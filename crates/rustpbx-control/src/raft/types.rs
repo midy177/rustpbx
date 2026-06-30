@@ -218,9 +218,15 @@ pub enum RegistryCommand {
     BindAffinity {
         affinity_key: String,
         worker_id: String,
+        /// Optional unix-millis expiry. `None` means sticky until explicitly
+        /// unbound or the selected worker is removed.
+        #[serde(default)]
+        expires_at_ms: Option<i64>,
     },
     /// Remove an affinity binding.
     UnbindAffinity { affinity_key: String },
+    /// Remove affinity bindings whose expiry is at or before `before_ms`.
+    ReapAffinity { before_ms: i64 },
 }
 
 // Note: `AppData` / `AppDataResponse` have blanket impls for any

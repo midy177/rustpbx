@@ -167,6 +167,11 @@ async fn main() -> Result<()> {
             if let Err(e) = reap_registry.reap_stale_edges().await {
                 tracing::warn!(error = %e, "edge reap failed");
             }
+            match reap_registry.reap_affinity().await {
+                Ok(n) if n > 0 => tracing::info!(reaped = n, "reaped expired affinity bindings"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "affinity reap failed"),
+            }
             // Backstop: free per-tenant call slots whose CDR never arrived
             // (worker/edge crash), so a leaked slot doesn't pin a tenant's quota.
             match reap_registry.reap_call_slots(call_slot_ttl).await {
