@@ -330,6 +330,23 @@ struct CreateExtensionRequest {
     notes: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateSipTrunkRequest {
+    name: String,
+    display_name: Option<String>,
+    carrier: Option<String>,
+    description: Option<String>,
+    status: Option<crate::models::sip_trunk::SipTrunkStatus>,
+    direction: Option<crate::models::sip_trunk::SipTrunkDirection>,
+    sip_server: Option<String>,
+    sip_transport: Option<crate::models::sip_trunk::SipTransport>,
+    outbound_proxy: Option<String>,
+    auth_username: Option<String>,
+    auth_password: Option<String>,
+    is_active: Option<bool>,
+    register_enabled: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -345,7 +362,10 @@ pub fn router(state: crate::app::AppState) -> Router {
             "/api/cloudpbx/extensions",
             get(list_extensions).post(create_extension),
         )
-        .route("/api/cloudpbx/sip-trunks", get(list_sip_trunks))
+        .route(
+            "/api/cloudpbx/sip-trunks",
+            get(list_sip_trunks).post(create_sip_trunk),
+        )
         .route("/api/cloudpbx/routes", get(list_routes))
         .route("/api/cloudpbx/call-records", get(list_call_records))
         .route("/api/cloudpbx/users", get(list_users))
@@ -543,6 +563,102 @@ async fn list_sip_trunks(
         )
         .into_response(),
         Err(_) => tenant_query_failed(),
+    }
+}
+
+async fn create_sip_trunk(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<CreateSipTrunkRequest>,
+) -> Response {
+    match create_sip_trunk_for_tenant(state.db(), &ctx, payload).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn create_sip_trunk_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    payload: CreateSipTrunkRequest,
+) -> Result<SipTrunkSummary, Response> {
+    use crate::models::sip_trunk::{
+        ActiveModel, Column, Entity, SipTransport, SipTrunkDirection, SipTrunkStatus,
+    };
+
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(bad_request(
+            "invalid_trunk_name",
+            "SIP trunk name is required.",
+        ));
+    }
+    if name.len() > 120 {
+        return Err(bad_request(
+            "invalid_trunk_name",
+            "SIP trunk name must be 120 characters or fewer.",
+        ));
+    }
+
+    let tenant_id = match resolve_write_tenant_id(db, ctx).await {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return Err(response),
+    };
+
+    match Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::Name.eq(name))
+        .one(db)
+        .await
+    {
+        Ok(Some(_)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "sip_trunk_exists",
+                    message: "SIP trunk already exists in this tenant.",
+                }),
+            )
+                .into_response());
+        }
+        Ok(None) => {}
+        Err(_) => return Err(tenant_query_failed()),
+    }
+
+    let now = chrono::Utc::now();
+    let model = ActiveModel {
+        tenant_id: Set(Some(tenant_id)),
+        name: Set(name.to_string()),
+        display_name: Set(clean_optional_string(payload.display_name)),
+        carrier: Set(clean_optional_string(payload.carrier)),
+        description: Set(clean_optional_string(payload.description)),
+        status: Set(payload.status.unwrap_or(SipTrunkStatus::Healthy)),
+        direction: Set(payload
+            .direction
+            .unwrap_or(SipTrunkDirection::Bidirectional)),
+        sip_server: Set(clean_optional_string(payload.sip_server)),
+        sip_transport: Set(payload.sip_transport.unwrap_or(SipTransport::Udp)),
+        outbound_proxy: Set(clean_optional_string(payload.outbound_proxy)),
+        auth_username: Set(clean_optional_string(payload.auth_username)),
+        auth_password: Set(clean_optional_string(payload.auth_password)),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        register_enabled: Set(payload.register_enabled.unwrap_or(false)),
+        rewrite_hostport: Set(false),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+
+    match model.insert(db).await {
+        Ok(model) => Ok(SipTrunkSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "sip_trunk_create_failed",
+                message: "Failed to create SIP trunk.",
+            }),
+        )
+            .into_response()),
     }
 }
 
@@ -806,5 +922,58 @@ mod tests {
 
         assert_eq!(summary.tenant_id, Some(tenant.id));
         assert_eq!(extension.tenant_id, Some(tenant.id));
+    }
+
+    #[tokio::test]
+    async fn create_sip_trunk_sets_current_tenant_id() {
+        use crate::models::{
+            sip_trunk::{Column as SipTrunkColumn, Entity as SipTrunkEntity},
+            tenant::{Column as TenantColumn, Entity as TenantEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_sip_trunk_for_tenant(
+            &db,
+            &ctx,
+            CreateSipTrunkRequest {
+                name: "carrier-a".to_string(),
+                display_name: Some("Carrier A".to_string()),
+                carrier: None,
+                description: None,
+                status: None,
+                direction: None,
+                sip_server: Some("sip.example.com".to_string()),
+                sip_transport: None,
+                outbound_proxy: None,
+                auth_username: Some("user".to_string()),
+                auth_password: Some("secret".to_string()),
+                is_active: None,
+                register_enabled: None,
+            },
+        )
+        .await
+        .expect("create sip trunk");
+
+        let tenant = TenantEntity::find()
+            .filter(TenantColumn::Slug.eq(DEFAULT_TENANT_ID))
+            .one(&db)
+            .await
+            .expect("query tenant")
+            .expect("default tenant");
+        let trunk = SipTrunkEntity::find()
+            .filter(SipTrunkColumn::Name.eq("carrier-a"))
+            .one(&db)
+            .await
+            .expect("query trunk")
+            .expect("trunk");
+
+        assert_eq!(summary.tenant_id, Some(tenant.id));
+        assert_eq!(trunk.tenant_id, Some(tenant.id));
+        assert_eq!(trunk.auth_password.as_deref(), Some("secret"));
     }
 }
