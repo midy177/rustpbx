@@ -395,6 +395,21 @@ struct CreateRouteRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateRouteRequest {
+    name: Option<String>,
+    description: Option<String>,
+    direction: Option<crate::models::routing::RoutingDirection>,
+    priority: Option<i32>,
+    is_active: Option<bool>,
+    selection_strategy: Option<crate::models::routing::RoutingSelectionStrategy>,
+    source_trunk_id: Option<i64>,
+    default_trunk_id: Option<i64>,
+    source_pattern: Option<String>,
+    destination_pattern: Option<String>,
+    owner: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateUserRequest {
     username: String,
     email: String,
@@ -432,6 +447,10 @@ pub fn router(state: crate::app::AppState) -> Router {
             axum::routing::patch(update_sip_trunk).delete(delete_sip_trunk),
         )
         .route("/api/cloudpbx/routes", get(list_routes).post(create_route))
+        .route(
+            "/api/cloudpbx/routes/{id}",
+            axum::routing::patch(update_route).delete(delete_route),
+        )
         .route("/api/cloudpbx/call-records", get(list_call_records))
         .route("/api/cloudpbx/users", get(list_users).post(create_user))
         .with_state(state)
@@ -1165,6 +1184,164 @@ async fn create_route_for_tenant(
             }),
         )
             .into_response()),
+    }
+}
+
+async fn update_route(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<UpdateRouteRequest>,
+) -> Response {
+    match update_route_for_tenant(state.db(), &ctx, id, payload).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn update_route_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+    payload: UpdateRouteRequest,
+) -> Result<RouteSummary, Response> {
+    use crate::models::routing::{Column, Entity};
+
+    let model = load_route_for_write(db, ctx, id).await?;
+    let original_tenant_id = model.tenant_id;
+    let mut active = model.into_active_model();
+
+    if let Some(name) = payload.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(bad_request("invalid_route_name", "Route name is required."));
+        }
+        if name.len() > 160 {
+            return Err(bad_request(
+                "invalid_route_name",
+                "Route name must be 160 characters or fewer.",
+            ));
+        }
+
+        if let Some(tenant_id) = original_tenant_id {
+            match Entity::find()
+                .filter(Column::TenantId.eq(tenant_id))
+                .filter(Column::Name.eq(name))
+                .filter(Column::Id.ne(id))
+                .one(db)
+                .await
+            {
+                Ok(Some(_)) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(ErrorBody {
+                            error: "route_exists",
+                            message: "Route already exists in this tenant.",
+                        }),
+                    )
+                        .into_response());
+                }
+                Ok(None) => {}
+                Err(_) => return Err(tenant_query_failed()),
+            }
+        }
+
+        active.name = Set(name.to_string());
+    }
+    if payload.description.is_some() {
+        active.description = Set(clean_optional_string(payload.description));
+    }
+    if let Some(direction) = payload.direction {
+        active.direction = Set(direction);
+    }
+    if let Some(priority) = payload.priority {
+        active.priority = Set(priority);
+    }
+    if let Some(is_active) = payload.is_active {
+        active.is_active = Set(is_active);
+    }
+    if let Some(selection_strategy) = payload.selection_strategy {
+        active.selection_strategy = Set(selection_strategy);
+    }
+    if payload.source_trunk_id.is_some() {
+        active.source_trunk_id = Set(payload.source_trunk_id);
+    }
+    if payload.default_trunk_id.is_some() {
+        active.default_trunk_id = Set(payload.default_trunk_id);
+    }
+    if payload.source_pattern.is_some() {
+        active.source_pattern = Set(clean_optional_string(payload.source_pattern));
+    }
+    if payload.destination_pattern.is_some() {
+        active.destination_pattern = Set(clean_optional_string(payload.destination_pattern));
+    }
+    if payload.owner.is_some() {
+        active.owner = Set(clean_optional_string(payload.owner));
+    }
+    active.updated_at = Set(chrono::Utc::now());
+
+    match active.update(db).await {
+        Ok(model) => Ok(RouteSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "route_update_failed",
+                message: "Failed to update route.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+async fn delete_route(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+) -> Response {
+    match delete_route_for_tenant(state.db(), &ctx, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn delete_route_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<(), Response> {
+    use crate::models::routing::Entity;
+
+    let model = load_route_for_write(db, ctx, id).await?;
+    match Entity::delete_by_id(model.id).exec(db).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(tenant_query_failed()),
+    }
+}
+
+async fn load_route_for_write(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<crate::models::routing::Model, Response> {
+    use crate::models::routing::{Column, Entity};
+
+    let mut query = Entity::find().filter(Column::Id.eq(id));
+    if ctx.role != TenantRole::PlatformAdmin {
+        let tenant_id = resolve_write_tenant_id(db, ctx).await?;
+        query = query.filter(Column::TenantId.eq(tenant_id));
+    }
+
+    match query.one(db).await {
+        Ok(Some(model)) => Ok(model),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "route_not_found",
+                message: "Route not found.",
+            }),
+        )
+            .into_response()),
+        Err(_) => Err(tenant_query_failed()),
     }
 }
 
@@ -1941,6 +2118,172 @@ mod tests {
 
         assert_eq!(summary.tenant_id, Some(tenant.id));
         assert_eq!(route.tenant_id, Some(tenant.id));
+    }
+
+    #[tokio::test]
+    async fn update_route_preserves_tenant_scope() {
+        use crate::models::{
+            routing::{
+                Column as RouteColumn, Entity as RouteEntity, RoutingDirection,
+                RoutingSelectionStrategy,
+            },
+            tenant::{ActiveModel as TenantActiveModel, Entity as TenantEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_route_for_tenant(
+            &db,
+            &ctx,
+            CreateRouteRequest {
+                name: "outbound-a".to_string(),
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: None,
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: Some("^1[0-9]+$".to_string()),
+                owner: None,
+            },
+        )
+        .await
+        .expect("create route");
+
+        let updated = update_route_for_tenant(
+            &db,
+            &ctx,
+            summary.id,
+            UpdateRouteRequest {
+                name: Some("outbound-a-updated".to_string()),
+                description: Some("updated".to_string()),
+                direction: Some(RoutingDirection::Inbound),
+                priority: Some(10),
+                is_active: Some(false),
+                selection_strategy: Some(RoutingSelectionStrategy::Hash),
+                source_trunk_id: None,
+                default_trunk_id: None,
+                source_pattern: Some("^1001$".to_string()),
+                destination_pattern: Some("^2[0-9]+$".to_string()),
+                owner: Some("ops".to_string()),
+            },
+        )
+        .await
+        .expect("update route");
+
+        assert_eq!(updated.name, "outbound-a-updated");
+        assert_eq!(updated.description.as_deref(), Some("updated"));
+        assert_eq!(updated.direction, RoutingDirection::Inbound);
+        assert_eq!(updated.priority, 10);
+        assert!(!updated.is_active);
+        assert_eq!(updated.selection_strategy, RoutingSelectionStrategy::Hash);
+        assert_eq!(updated.source_pattern.as_deref(), Some("^1001$"));
+        assert_eq!(updated.destination_pattern.as_deref(), Some("^2[0-9]+$"));
+        assert_eq!(updated.owner.as_deref(), Some("ops"));
+        assert_eq!(updated.tenant_id, summary.tenant_id);
+
+        let now = chrono::Utc::now();
+        TenantActiveModel {
+            slug: Set("tenant-d".to_string()),
+            name: Set("Tenant D".to_string()),
+            status: Set("active".to_string()),
+            domain: Set(None),
+            max_concurrent_calls: Set(None),
+            max_trunks: Set(None),
+            storage_prefix: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert tenant d");
+
+        let other_ctx = TenantContext {
+            id: "tenant-d".to_string(),
+            name: "Tenant D".to_string(),
+            role: TenantRole::TenantAdmin,
+        };
+        let response = update_route_for_tenant(
+            &db,
+            &other_ctx,
+            summary.id,
+            UpdateRouteRequest {
+                name: None,
+                description: Some("Should Not Apply".to_string()),
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: None,
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: None,
+                owner: None,
+            },
+        )
+        .await
+        .expect_err("cross tenant update is hidden");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let unchanged = RouteEntity::find()
+            .filter(RouteColumn::Id.eq(summary.id))
+            .one(&db)
+            .await
+            .expect("query route")
+            .expect("route");
+        assert_eq!(unchanged.description.as_deref(), Some("updated"));
+        assert_eq!(
+            TenantEntity::find().all(&db).await.expect("tenants").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_route_requires_tenant_scope() {
+        use crate::models::routing::Entity as RouteEntity;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_route_for_tenant(
+            &db,
+            &ctx,
+            CreateRouteRequest {
+                name: "outbound-delete".to_string(),
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: None,
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: Some("^9[0-9]+$".to_string()),
+                owner: None,
+            },
+        )
+        .await
+        .expect("create route");
+
+        delete_route_for_tenant(&db, &ctx, summary.id)
+            .await
+            .expect("delete route");
+
+        let deleted = RouteEntity::find_by_id(summary.id)
+            .one(&db)
+            .await
+            .expect("query route");
+        assert!(deleted.is_none());
     }
 
     #[tokio::test]

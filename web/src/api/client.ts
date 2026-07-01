@@ -123,6 +123,20 @@ export interface CreateRouteRequest {
   owner?: string | null;
 }
 
+export interface UpdateRouteRequest {
+  name?: string;
+  description?: string | null;
+  direction?: string;
+  priority?: number;
+  is_active?: boolean;
+  selection_strategy?: string;
+  source_trunk_id?: number | null;
+  default_trunk_id?: number | null;
+  source_pattern?: string | null;
+  destination_pattern?: string | null;
+  owner?: string | null;
+}
+
 export interface CallRecordSummary {
   id: number;
   tenant_id?: number | null;
@@ -257,6 +271,17 @@ export const api = {
     return request<RouteSummary>("/cloudpbx/routes", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  updateRoute(id: number, payload: UpdateRouteRequest) {
+    return request<RouteSummary>(`/cloudpbx/routes/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteRoute(id: number) {
+    return request<void>(`/cloudpbx/routes/${id}`, {
+      method: "DELETE",
     });
   },
   callRecords() {
