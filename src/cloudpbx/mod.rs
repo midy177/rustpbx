@@ -3,12 +3,14 @@ use argon2::password_hash::{PasswordHash, PasswordVerifier, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{FromRequestParts, Path as AxumPath, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Request, StatusCode,
         header::{COOKIE, SET_COOKIE},
         request::Parts,
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -458,9 +460,7 @@ struct ErrorBody {
 }
 
 pub fn router(state: crate::app::AppState) -> Router {
-    Router::new()
-        .route("/api/auth/login", post(login))
-        .route("/api/auth/session", get(session))
+    let protected = Router::new()
         .route("/api/tenants", get(list_tenants))
         .route(
             "/api/cloudpbx/extensions",
@@ -489,7 +489,39 @@ pub fn router(state: crate::app::AppState) -> Router {
             "/api/cloudpbx/users/{id}",
             axum::routing::patch(update_user).delete(delete_user),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cloudpbx_session_middleware,
+        ));
+
+    Router::new()
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/session", get(session))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn cloudpbx_session_middleware(
+    State(state): State<crate::app::AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let secret = cloudpbx_session_secret(&state);
+    let user = match current_session_user(state.db(), &secret, req.headers()).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let tenant = match user.tenant {
+        Some(tenant) => tenant,
+        None => return unauthorized(),
+    };
+
+    req.extensions_mut().insert(TenantContext {
+        id: tenant.id,
+        name: tenant.name,
+        role: user.role,
+    });
+    next.run(req).await
 }
 
 async fn login(
@@ -2102,6 +2134,28 @@ mod tests {
         assert_eq!(ctx.id, "tenant-a");
         assert_eq!(ctx.name, "Tenant A");
         assert_eq!(ctx.role, TenantRole::PlatformAdmin);
+    }
+
+    #[tokio::test]
+    async fn tenant_context_prefers_request_extension() {
+        let mut request = Request::builder()
+            .header("x-tenant-id", "spoofed")
+            .body(())
+            .expect("request");
+        request.extensions_mut().insert(TenantContext {
+            id: "trusted".to_string(),
+            name: "Trusted".to_string(),
+            role: TenantRole::TenantAdmin,
+        });
+        let (mut parts, _) = request.into_parts();
+
+        let ctx = TenantContext::from_request_parts(&mut parts, &())
+            .await
+            .expect("tenant context");
+
+        assert_eq!(ctx.id, "trusted");
+        assert_eq!(ctx.name, "Trusted");
+        assert_eq!(ctx.role, TenantRole::TenantAdmin);
     }
 
     #[tokio::test]
