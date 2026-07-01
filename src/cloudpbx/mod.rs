@@ -108,7 +108,7 @@ impl TenantRole {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct TenantSummary {
     id: String,
@@ -117,7 +117,7 @@ struct TenantSummary {
     domain: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SessionUser {
     id: i64,
     username: String,
@@ -529,7 +529,10 @@ async fn cloudpbx_session_middleware(
         Err(response) => return response,
     };
 
-    let ctx = match request_tenant_context(state.db(), user, req.headers()).await {
+    let allow_inactive_tenant = !req.uri().path().starts_with("/api/cloudpbx/");
+    let ctx = match request_tenant_context(state.db(), user, req.headers(), allow_inactive_tenant)
+        .await
+    {
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
@@ -2151,6 +2154,7 @@ async fn request_tenant_context(
     db: &DatabaseConnection,
     user: SessionUser,
     headers: &HeaderMap,
+    allow_inactive_tenant: bool,
 ) -> Result<TenantContext, Response> {
     use crate::models::tenant::{Column, Entity};
 
@@ -2180,6 +2184,17 @@ async fn request_tenant_context(
             )
                 .into_response()
         })?;
+
+    if !allow_inactive_tenant && tenant.status != "active" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "tenant_inactive",
+                message: "Tenant is not active.",
+            }),
+        )
+            .into_response());
+    }
 
     Ok(TenantContext {
         id: tenant.slug,
@@ -2628,6 +2643,7 @@ mod tests {
                 }),
             },
             &headers,
+            false,
         )
         .await
         .expect("tenant context");
@@ -2638,6 +2654,53 @@ mod tests {
             TenantEntity::find().all(&db).await.expect("tenants").len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn platform_admin_resource_context_rejects_inactive_selected_tenant() {
+        use crate::models::tenant::ActiveModel as TenantActiveModel;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        TenantActiveModel {
+            slug: Set("tenant-suspended".to_string()),
+            name: Set("Tenant Suspended".to_string()),
+            status: Set("suspended".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert tenant");
+
+        let user = SessionUser {
+            id: 1,
+            username: "platform".to_string(),
+            email: "platform@example.com".to_string(),
+            role: TenantRole::PlatformAdmin,
+            tenant: Some(TenantSummary {
+                id: DEFAULT_TENANT_ID.to_string(),
+                name: "Default".to_string(),
+                status: "active".to_string(),
+                domain: None,
+            }),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant-id", HeaderValue::from_static("tenant-suspended"));
+
+        let response = request_tenant_context(&db, user.clone(), &headers, false)
+            .await
+            .expect_err("resource context rejects inactive tenant");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let ctx = request_tenant_context(&db, user, &headers, true)
+            .await
+            .expect("tenant management context allows inactive tenant");
+
+        assert_eq!(ctx.id, "tenant-suspended");
     }
 
     #[tokio::test]
@@ -2663,6 +2726,7 @@ mod tests {
                 }),
             },
             &headers,
+            false,
         )
         .await
         .expect("tenant context");
