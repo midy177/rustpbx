@@ -932,7 +932,8 @@ pub fn create_router(state: AppState) -> Router {
 
     #[cfg(feature = "console")]
     if let Some(console_state) = state.console.clone() {
-        router = router.merge(crate::console::router(console_state.clone()));
+        // CloudPBX serves its standalone Vue UI from /app. Keep the JSON API
+        // routes available, but do not expose the legacy server-rendered console.
         router = router.merge(crate::api::router(console_state));
     }
 

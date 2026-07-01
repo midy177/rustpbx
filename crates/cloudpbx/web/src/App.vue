@@ -22,7 +22,6 @@ const configError = ref("");
 const healthError = ref("");
 
 const amiPath = computed(() => phoneConfig.value?.amiPath ?? "/ami/v1");
-const consolePath = "/console";
 
 async function loadJson<T>(path: string): Promise<T> {
   const response = await fetch(path, { credentials: "include" });
@@ -151,28 +150,28 @@ onMounted(refresh);
 
         <Card>
           <CardHeader>
-            <CardTitle>Legacy console</CardTitle>
+            <CardTitle>CloudPBX UI mode</CardTitle>
           </CardHeader>
           <CardContent class="space-y-4">
             <p class="text-sm text-muted-foreground">
-              This standalone CloudPBX build still uses the legacy server-side console APIs for PBX
-              resources. Use the link below for extensions, trunks, routes, settings, recordings, and
-              authentication-backed operations.
+              Server-rendered RustPBX console pages are disabled in this standalone build. The
+              embedded Vue app at /app is the frontend entry point, while runtime JSON endpoints
+              remain available for status and configuration integrations.
             </p>
             <div class="flex flex-wrap gap-3">
               <a
                 class="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                :href="consolePath"
-              >
-                <ExternalLink class="h-4 w-4" />
-                Open legacy console
-              </a>
-              <a
-                class="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
                 :href="`${amiPath}/health`"
               >
                 <ExternalLink class="h-4 w-4" />
                 AMI health JSON
+              </a>
+              <a
+                class="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
+                href="/api/config/phone"
+              >
+                <ExternalLink class="h-4 w-4" />
+                Runtime config JSON
               </a>
             </div>
           </CardContent>
