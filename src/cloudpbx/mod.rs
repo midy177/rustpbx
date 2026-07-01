@@ -402,8 +402,8 @@ struct UpdateRouteRequest {
     priority: Option<i32>,
     is_active: Option<bool>,
     selection_strategy: Option<crate::models::routing::RoutingSelectionStrategy>,
-    source_trunk_id: Option<i64>,
-    default_trunk_id: Option<i64>,
+    source_trunk_id: Option<Option<i64>>,
+    default_trunk_id: Option<Option<i64>>,
     source_pattern: Option<String>,
     destination_pattern: Option<String>,
     owner: Option<String>,
@@ -1160,6 +1160,9 @@ async fn create_route_for_tenant(
         Err(_) => return Err(tenant_query_failed()),
     }
 
+    validate_route_trunk_ref(db, Some(tenant_id), payload.source_trunk_id).await?;
+    validate_route_trunk_ref(db, Some(tenant_id), payload.default_trunk_id).await?;
+
     let now = chrono::Utc::now();
     let model = ActiveModel {
         tenant_id: Set(Some(tenant_id)),
@@ -1277,11 +1280,13 @@ async fn update_route_for_tenant(
     if let Some(selection_strategy) = payload.selection_strategy {
         active.selection_strategy = Set(selection_strategy);
     }
-    if payload.source_trunk_id.is_some() {
-        active.source_trunk_id = Set(payload.source_trunk_id);
+    if let Some(source_trunk_id) = payload.source_trunk_id {
+        validate_route_trunk_ref(db, original_tenant_id, source_trunk_id).await?;
+        active.source_trunk_id = Set(source_trunk_id);
     }
-    if payload.default_trunk_id.is_some() {
-        active.default_trunk_id = Set(payload.default_trunk_id);
+    if let Some(default_trunk_id) = payload.default_trunk_id {
+        validate_route_trunk_ref(db, original_tenant_id, default_trunk_id).await?;
+        active.default_trunk_id = Set(default_trunk_id);
     }
     if payload.source_pattern.is_some() {
         active.source_pattern = Set(clean_optional_string(payload.source_pattern));
@@ -1355,6 +1360,33 @@ async fn load_route_for_write(
             }),
         )
             .into_response()),
+        Err(_) => Err(tenant_query_failed()),
+    }
+}
+
+async fn validate_route_trunk_ref(
+    db: &DatabaseConnection,
+    route_tenant_id: Option<i64>,
+    trunk_id: Option<i64>,
+) -> Result<(), Response> {
+    use crate::models::sip_trunk::{Column, Entity};
+
+    let Some(trunk_id) = trunk_id else {
+        return Ok(());
+    };
+
+    let mut query = Entity::find().filter(Column::Id.eq(trunk_id));
+    query = match route_tenant_id {
+        Some(tenant_id) => query.filter(Column::TenantId.eq(tenant_id)),
+        None => query.filter(Column::TenantId.is_null()),
+    };
+
+    match query.one(db).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(bad_request(
+            "invalid_route_trunk",
+            "Route trunk must exist in the same tenant.",
+        )),
         Err(_) => Err(tenant_query_failed()),
     }
 }
@@ -2482,6 +2514,181 @@ mod tests {
             .await
             .expect("query route");
         assert!(deleted.is_none());
+    }
+
+    #[tokio::test]
+    async fn route_trunk_references_must_stay_in_tenant() {
+        use crate::models::{
+            routing::Entity as RouteEntity, tenant::ActiveModel as TenantActiveModel,
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let default_trunk = create_sip_trunk_for_tenant(
+            &db,
+            &ctx,
+            CreateSipTrunkRequest {
+                name: "default-route-trunk".to_string(),
+                display_name: None,
+                carrier: None,
+                description: None,
+                status: None,
+                direction: None,
+                sip_server: Some("sip-default.example.com".to_string()),
+                sip_transport: None,
+                outbound_proxy: None,
+                auth_username: None,
+                auth_password: None,
+                is_active: None,
+                register_enabled: None,
+            },
+        )
+        .await
+        .expect("create default trunk");
+
+        let route = create_route_for_tenant(
+            &db,
+            &ctx,
+            CreateRouteRequest {
+                name: "route-with-trunk".to_string(),
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: Some(default_trunk.id),
+                default_trunk_id: Some(default_trunk.id),
+                source_pattern: None,
+                destination_pattern: Some("^3[0-9]+$".to_string()),
+                owner: None,
+            },
+        )
+        .await
+        .expect("create route with same-tenant trunk");
+        assert_eq!(route.source_trunk_id, Some(default_trunk.id));
+        assert_eq!(route.default_trunk_id, Some(default_trunk.id));
+
+        let now = chrono::Utc::now();
+        TenantActiveModel {
+            slug: Set("tenant-route-ref".to_string()),
+            name: Set("Tenant Route Ref".to_string()),
+            status: Set("active".to_string()),
+            domain: Set(None),
+            max_concurrent_calls: Set(None),
+            max_trunks: Set(None),
+            storage_prefix: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert other tenant");
+
+        let other_ctx = TenantContext {
+            id: "tenant-route-ref".to_string(),
+            name: "Tenant Route Ref".to_string(),
+            role: TenantRole::TenantAdmin,
+        };
+        let other_trunk = create_sip_trunk_for_tenant(
+            &db,
+            &other_ctx,
+            CreateSipTrunkRequest {
+                name: "other-route-trunk".to_string(),
+                display_name: None,
+                carrier: None,
+                description: None,
+                status: None,
+                direction: None,
+                sip_server: Some("sip-other.example.com".to_string()),
+                sip_transport: None,
+                outbound_proxy: None,
+                auth_username: None,
+                auth_password: None,
+                is_active: None,
+                register_enabled: None,
+            },
+        )
+        .await
+        .expect("create other tenant trunk");
+
+        let create_response = create_route_for_tenant(
+            &db,
+            &ctx,
+            CreateRouteRequest {
+                name: "route-cross-trunk".to_string(),
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: Some(other_trunk.id),
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: Some("^4[0-9]+$".to_string()),
+                owner: None,
+            },
+        )
+        .await
+        .expect_err("cross tenant trunk is rejected on create");
+        assert_eq!(create_response.status(), StatusCode::BAD_REQUEST);
+
+        let update_response = update_route_for_tenant(
+            &db,
+            &ctx,
+            route.id,
+            UpdateRouteRequest {
+                name: None,
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: Some(Some(other_trunk.id)),
+                default_trunk_id: None,
+                source_pattern: None,
+                destination_pattern: None,
+                owner: None,
+            },
+        )
+        .await
+        .expect_err("cross tenant trunk is rejected on update");
+        assert_eq!(update_response.status(), StatusCode::BAD_REQUEST);
+
+        let cleared = update_route_for_tenant(
+            &db,
+            &ctx,
+            route.id,
+            UpdateRouteRequest {
+                name: None,
+                description: None,
+                direction: None,
+                priority: None,
+                is_active: None,
+                selection_strategy: None,
+                source_trunk_id: Some(None),
+                default_trunk_id: Some(None),
+                source_pattern: None,
+                destination_pattern: None,
+                owner: None,
+            },
+        )
+        .await
+        .expect("clear trunk refs");
+        assert!(cleared.source_trunk_id.is_none());
+        assert!(cleared.default_trunk_id.is_none());
+
+        let stored = RouteEntity::find_by_id(route.id)
+            .one(&db)
+            .await
+            .expect("query route")
+            .expect("route");
+        assert!(stored.source_trunk_id.is_none());
+        assert!(stored.default_trunk_id.is_none());
     }
 
     #[tokio::test]
