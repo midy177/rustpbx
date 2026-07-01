@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { Building2, Cable, GitBranch, LogOut, Phone, Plus, RadioTower, Trash2, Users } from "lucide-vue-next";
+import { Building2, Cable, GitBranch, LogOut, Phone, Plus, Power, PowerOff, RadioTower, Trash2, Users } from "lucide-vue-next";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -53,6 +53,10 @@ const deletingExtensionId = ref<number | null>(null);
 const deletingSipTrunkId = ref<number | null>(null);
 const deletingRouteId = ref<number | null>(null);
 const deletingUserId = ref<number | null>(null);
+const updatingExtensionId = ref<number | null>(null);
+const updatingSipTrunkId = ref<number | null>(null);
+const updatingRouteId = ref<number | null>(null);
+const updatingUserId = ref<number | null>(null);
 const updatingTenantId = ref<string | null>(null);
 const selectedTenantId = ref(auth.user?.tenant?.id ?? "default");
 const loadingResources = ref(false);
@@ -235,6 +239,19 @@ async function deleteExtension(extension: ExtensionSummary) {
   }
 }
 
+async function setExtensionStatus(extension: ExtensionSummary, active: boolean) {
+  extensionError.value = "";
+  updatingExtensionId.value = extension.id;
+  try {
+    const updated = await api.updateExtension(extension.id, { status: active ? "active" : "disabled" });
+    extensions.value = extensions.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (err) {
+    extensionError.value = err instanceof Error ? err.message : "Failed to update extension";
+  } finally {
+    updatingExtensionId.value = null;
+  }
+}
+
 async function createSipTrunk() {
   sipTrunkError.value = "";
   const name = sipTrunkForm.value.name.trim();
@@ -278,6 +295,22 @@ async function deleteSipTrunk(trunk: SipTrunkSummary) {
   }
 }
 
+async function setSipTrunkActive(trunk: SipTrunkSummary, active: boolean) {
+  sipTrunkError.value = "";
+  updatingSipTrunkId.value = trunk.id;
+  try {
+    const updated = await api.updateSipTrunk(trunk.id, {
+      is_active: active,
+      status: active ? "healthy" : "disabled",
+    });
+    sipTrunks.value = sipTrunks.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (err) {
+    sipTrunkError.value = err instanceof Error ? err.message : "Failed to update SIP trunk";
+  } finally {
+    updatingSipTrunkId.value = null;
+  }
+}
+
 async function createRoute() {
   routeError.value = "";
   const name = routeForm.value.name.trim();
@@ -316,6 +349,19 @@ async function deleteRoute(route: RouteSummary) {
     routeError.value = err instanceof Error ? err.message : "Failed to delete route";
   } finally {
     deletingRouteId.value = null;
+  }
+}
+
+async function setRouteActive(route: RouteSummary, active: boolean) {
+  routeError.value = "";
+  updatingRouteId.value = route.id;
+  try {
+    const updated = await api.updateRoute(route.id, { is_active: active });
+    routes.value = routes.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (err) {
+    routeError.value = err instanceof Error ? err.message : "Failed to update route";
+  } finally {
+    updatingRouteId.value = null;
   }
 }
 
@@ -363,6 +409,23 @@ async function deleteUser(user: UserSummary) {
     userError.value = err instanceof Error ? err.message : "Failed to delete user";
   } finally {
     deletingUserId.value = null;
+  }
+}
+
+async function setUserActive(user: UserSummary, active: boolean) {
+  if (auth.user?.id === user.id) {
+    return;
+  }
+
+  userError.value = "";
+  updatingUserId.value = user.id;
+  try {
+    const updated = await api.updateUser(user.id, { is_active: active });
+    users.value = users.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (err) {
+    userError.value = err instanceof Error ? err.message : "Failed to update user";
+  } finally {
+    updatingUserId.value = null;
   }
 }
 </script>
@@ -551,7 +614,18 @@ async function deleteUser(user: UserSummary) {
                         v-if="canManageResources"
                         variant="ghost"
                         size="icon"
-                        :disabled="deletingExtensionId === extension.id"
+                        :disabled="updatingExtensionId === extension.id"
+                        :aria-label="extension.status === 'active' ? 'Disable extension' : 'Enable extension'"
+                        @click="setExtensionStatus(extension, extension.status !== 'active')"
+                      >
+                        <PowerOff v-if="extension.status === 'active'" class="h-4 w-4" />
+                        <Power v-else class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-if="canManageResources"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingExtensionId === extension.id || updatingExtensionId === extension.id"
                         aria-label="Delete extension"
                         @click="deleteExtension(extension)"
                       >
@@ -625,7 +699,18 @@ async function deleteUser(user: UserSummary) {
                         v-if="canManageResources"
                         variant="ghost"
                         size="icon"
-                        :disabled="deletingSipTrunkId === trunk.id"
+                        :disabled="updatingSipTrunkId === trunk.id"
+                        :aria-label="trunk.is_active ? 'Disable SIP trunk' : 'Enable SIP trunk'"
+                        @click="setSipTrunkActive(trunk, !trunk.is_active)"
+                      >
+                        <PowerOff v-if="trunk.is_active" class="h-4 w-4" />
+                        <Power v-else class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-if="canManageResources"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingSipTrunkId === trunk.id || updatingSipTrunkId === trunk.id"
                         aria-label="Delete SIP trunk"
                         @click="deleteSipTrunk(trunk)"
                       >
@@ -701,6 +786,7 @@ async function deleteUser(user: UserSummary) {
                     <th class="px-3 py-2 font-medium">Priority</th>
                     <th class="px-3 py-2 font-medium">Destination</th>
                     <th class="px-3 py-2 font-medium">Default trunk</th>
+                    <th class="px-3 py-2 font-medium">Status</th>
                     <th class="px-3 py-2 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
@@ -713,12 +799,28 @@ async function deleteUser(user: UserSummary) {
                     <td class="px-3 py-2">
                       {{ sipTrunks.find((trunk) => trunk.id === route.default_trunk_id)?.name ?? "-" }}
                     </td>
+                    <td class="px-3 py-2">
+                      <Badge :variant="route.is_active ? 'default' : 'outline'">
+                        {{ route.is_active ? "active" : "disabled" }}
+                      </Badge>
+                    </td>
                     <td class="px-3 py-2 text-right">
                       <Button
                         v-if="canManageResources"
                         variant="ghost"
                         size="icon"
-                        :disabled="deletingRouteId === route.id"
+                        :disabled="updatingRouteId === route.id"
+                        :aria-label="route.is_active ? 'Disable route' : 'Enable route'"
+                        @click="setRouteActive(route, !route.is_active)"
+                      >
+                        <PowerOff v-if="route.is_active" class="h-4 w-4" />
+                        <Power v-else class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-if="canManageResources"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingRouteId === route.id || updatingRouteId === route.id"
                         aria-label="Delete route"
                         @click="deleteRoute(route)"
                       >
@@ -727,7 +829,7 @@ async function deleteUser(user: UserSummary) {
                     </td>
                   </tr>
                   <tr v-if="routes.length === 0">
-                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="6">No routes</td>
+                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="7">No routes</td>
                   </tr>
                 </tbody>
               </table>
@@ -803,7 +905,18 @@ async function deleteUser(user: UserSummary) {
                         v-if="canManageResources"
                         variant="ghost"
                         size="icon"
-                        :disabled="deletingUserId === user.id || auth.user?.id === user.id"
+                        :disabled="updatingUserId === user.id || auth.user?.id === user.id"
+                        :aria-label="user.is_active ? 'Disable user' : 'Enable user'"
+                        @click="setUserActive(user, !user.is_active)"
+                      >
+                        <PowerOff v-if="user.is_active" class="h-4 w-4" />
+                        <Power v-else class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-if="canManageResources"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingUserId === user.id || updatingUserId === user.id || auth.user?.id === user.id"
                         aria-label="Delete user"
                         @click="deleteUser(user)"
                       >
