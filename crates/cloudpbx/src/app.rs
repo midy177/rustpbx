@@ -24,7 +24,7 @@ use axum::{
     extract::{State, WebSocketUpgrade},
     http::{StatusCode, Uri, header::CONTENT_TYPE},
     middleware,
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -43,7 +43,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::{
     compression::CompressionLayer,
     cors::{AllowOrigin, CorsLayer},
-    services::ServeDir,
 };
 use tracing::{info, warn};
 
@@ -794,7 +793,6 @@ async fn phone_config_handler(State(state): State<AppState>) -> impl IntoRespons
         "wsPath": proxy_cfg.ws_handler.clone().unwrap_or_else(|| "/ws".to_string()),
         "iceServersPath": proxy_cfg.ice_servers_path.clone().unwrap_or_else(|| "/iceservers".to_string()),
         "amiPath": proxy_cfg.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string()),
-        "staticPath": state.config().static_path(),
     });
     Json(config).into_response()
 }
@@ -823,23 +821,7 @@ async fn cloudpbx_spa(uri: Uri) -> Response {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    let mut router = Router::new();
-
-    // Serve static files
-    let static_files_service = ServeDir::new("static");
-
-    // If static/index.html exists, serve it at the root
-    if std::path::Path::new("static/index.html").exists() {
-        router = router.route(
-            "/",
-            get(|| async {
-                match tokio::fs::read_to_string("static/index.html").await {
-                    Ok(content) => Html(content).into_response(),
-                    Err(_) => StatusCode::NOT_FOUND.into_response(),
-                }
-            }),
-        );
-    }
+    let router = Router::new().route("/", get(|| async { Redirect::temporary("/app") }));
 
     // CORS configuration to allow cross-origin requests
     let cors = CorsLayer::new()
@@ -864,9 +846,8 @@ pub fn create_router(state: AppState) -> Router {
         .ice_servers_path
         .clone()
         .unwrap_or_else(|| "/iceservers".to_string());
-    let static_path = state.config().static_path();
 
-    // Merge call and WebSocket handlers with static file serving
+    // CloudPBX owns its SPA under /app.
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     #[allow(unused_mut)]
     let mut router = router
@@ -881,7 +862,6 @@ pub fn create_router(state: AppState) -> Router {
             get(iceservers_handler).with_state(state.clone()),
         )
         .merge(state.addon_registry.get_routers(state.clone()))
-        .nest_service(&static_path, static_files_service)
         .merge(call_routes)
         .layer(cors);
 
@@ -928,13 +908,6 @@ pub fn create_router(state: AppState) -> Router {
                 },
             ),
         );
-    }
-
-    #[cfg(feature = "console")]
-    if let Some(console_state) = state.console.clone() {
-        // CloudPBX serves its standalone Vue UI from /app. Keep the JSON API
-        // routes available, but do not expose the legacy server-rendered console.
-        router = router.merge(crate::api::router(console_state));
     }
 
     let access_log_skip_paths = Arc::new(state.config().http_access_skip_paths.clone());

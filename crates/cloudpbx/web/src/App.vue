@@ -9,7 +9,6 @@ interface PhoneConfig {
   wsPath: string;
   iceServersPath: string;
   amiPath: string;
-  staticPath: string;
 }
 
 type LoadState = "idle" | "loading" | "ready" | "error";
@@ -73,7 +72,7 @@ onMounted(refresh);
           </div>
           <div>
             <h1 class="text-lg font-semibold">CloudPBX Standalone</h1>
-            <p class="text-sm text-muted-foreground">Embedded console served by crates/cloudpbx</p>
+            <p class="text-sm text-muted-foreground">Vue console served from crates/cloudpbx/web</p>
           </div>
         </div>
         <Button variant="outline" size="sm" :disabled="configState === 'loading' || healthState === 'loading'" @click="refresh">
@@ -141,10 +140,6 @@ onMounted(refresh);
               <span class="text-muted-foreground">ICE servers</span>
               <code class="rounded bg-muted px-2 py-1">{{ phoneConfig?.iceServersPath ?? "-" }}</code>
             </div>
-            <div class="flex items-center justify-between gap-3">
-              <span class="text-muted-foreground">Static path</span>
-              <code class="rounded bg-muted px-2 py-1">{{ phoneConfig?.staticPath ?? "-" }}</code>
-            </div>
           </CardContent>
         </Card>
 
@@ -154,9 +149,9 @@ onMounted(refresh);
           </CardHeader>
           <CardContent class="space-y-4">
             <p class="text-sm text-muted-foreground">
-              Server-rendered RustPBX console pages are disabled in this standalone build. The
-              embedded Vue app at /app is the frontend entry point, while runtime JSON endpoints
-              remain available for status and configuration integrations.
+              CloudPBX serves the Vite/Vue build from /app and redirects the root path there. It
+              exposes only CloudPBX-owned frontend assets plus runtime JSON endpoints needed by this
+              standalone UI.
             </p>
             <div class="flex flex-wrap gap-3">
               <a
