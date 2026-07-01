@@ -375,13 +375,13 @@ struct CreateExtensionRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateExtensionRequest {
     extension: Option<String>,
-    display_name: Option<String>,
-    email: Option<String>,
-    status: Option<String>,
+    display_name: Option<Option<String>>,
+    email: Option<Option<String>>,
+    status: Option<Option<String>>,
     login_disabled: Option<bool>,
     voicemail_disabled: Option<bool>,
     allow_guest_calls: Option<bool>,
-    notes: Option<String>,
+    notes: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,16 +404,16 @@ struct CreateSipTrunkRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateSipTrunkRequest {
     name: Option<String>,
-    display_name: Option<String>,
-    carrier: Option<String>,
-    description: Option<String>,
+    display_name: Option<Option<String>>,
+    carrier: Option<Option<String>>,
+    description: Option<Option<String>>,
     status: Option<crate::models::sip_trunk::SipTrunkStatus>,
     direction: Option<crate::models::sip_trunk::SipTrunkDirection>,
-    sip_server: Option<String>,
+    sip_server: Option<Option<String>>,
     sip_transport: Option<crate::models::sip_trunk::SipTransport>,
-    outbound_proxy: Option<String>,
-    auth_username: Option<String>,
-    auth_password: Option<String>,
+    outbound_proxy: Option<Option<String>>,
+    auth_username: Option<Option<String>>,
+    auth_password: Option<Option<String>>,
     is_active: Option<bool>,
     register_enabled: Option<bool>,
 }
@@ -436,16 +436,16 @@ struct CreateRouteRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateRouteRequest {
     name: Option<String>,
-    description: Option<String>,
+    description: Option<Option<String>>,
     direction: Option<crate::models::routing::RoutingDirection>,
     priority: Option<i32>,
     is_active: Option<bool>,
     selection_strategy: Option<crate::models::routing::RoutingSelectionStrategy>,
     source_trunk_id: Option<Option<i64>>,
     default_trunk_id: Option<Option<i64>>,
-    source_pattern: Option<String>,
-    destination_pattern: Option<String>,
-    owner: Option<String>,
+    source_pattern: Option<Option<String>>,
+    destination_pattern: Option<Option<String>>,
+    owner: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -931,14 +931,14 @@ async fn update_extension_for_tenant(
 
         active.extension = Set(extension.to_string());
     }
-    if payload.display_name.is_some() {
-        active.display_name = Set(clean_optional_string(payload.display_name));
+    if let Some(display_name) = payload.display_name {
+        active.display_name = Set(clean_optional_string(display_name));
     }
-    if payload.email.is_some() {
-        active.email = Set(clean_optional_string(payload.email));
+    if let Some(email) = payload.email {
+        active.email = Set(clean_optional_string(email));
     }
-    if payload.status.is_some() {
-        active.status = Set(clean_optional_string(payload.status));
+    if let Some(status) = payload.status {
+        active.status = Set(clean_optional_string(status));
     }
     if let Some(login_disabled) = payload.login_disabled {
         active.login_disabled = Set(login_disabled);
@@ -949,8 +949,8 @@ async fn update_extension_for_tenant(
     if let Some(allow_guest_calls) = payload.allow_guest_calls {
         active.allow_guest_calls = Set(allow_guest_calls);
     }
-    if payload.notes.is_some() {
-        active.notes = Set(clean_optional_string(payload.notes));
+    if let Some(notes) = payload.notes {
+        active.notes = Set(clean_optional_string(notes));
     }
     active.updated_at = Set(chrono::Utc::now());
 
@@ -1212,14 +1212,14 @@ async fn update_sip_trunk_for_tenant(
 
         active.name = Set(name.to_string());
     }
-    if payload.display_name.is_some() {
-        active.display_name = Set(clean_optional_string(payload.display_name));
+    if let Some(display_name) = payload.display_name {
+        active.display_name = Set(clean_optional_string(display_name));
     }
-    if payload.carrier.is_some() {
-        active.carrier = Set(clean_optional_string(payload.carrier));
+    if let Some(carrier) = payload.carrier {
+        active.carrier = Set(clean_optional_string(carrier));
     }
-    if payload.description.is_some() {
-        active.description = Set(clean_optional_string(payload.description));
+    if let Some(description) = payload.description {
+        active.description = Set(clean_optional_string(description));
     }
     if let Some(status) = payload.status {
         active.status = Set(status);
@@ -1227,20 +1227,20 @@ async fn update_sip_trunk_for_tenant(
     if let Some(direction) = payload.direction {
         active.direction = Set(direction);
     }
-    if payload.sip_server.is_some() {
-        active.sip_server = Set(clean_optional_string(payload.sip_server));
+    if let Some(sip_server) = payload.sip_server {
+        active.sip_server = Set(clean_optional_string(sip_server));
     }
     if let Some(sip_transport) = payload.sip_transport {
         active.sip_transport = Set(sip_transport);
     }
-    if payload.outbound_proxy.is_some() {
-        active.outbound_proxy = Set(clean_optional_string(payload.outbound_proxy));
+    if let Some(outbound_proxy) = payload.outbound_proxy {
+        active.outbound_proxy = Set(clean_optional_string(outbound_proxy));
     }
-    if payload.auth_username.is_some() {
-        active.auth_username = Set(clean_optional_string(payload.auth_username));
+    if let Some(auth_username) = payload.auth_username {
+        active.auth_username = Set(clean_optional_string(auth_username));
     }
-    if payload.auth_password.is_some() {
-        active.auth_password = Set(clean_optional_string(payload.auth_password));
+    if let Some(auth_password) = payload.auth_password {
+        active.auth_password = Set(clean_optional_string(auth_password));
     }
     if let Some(is_active) = payload.is_active {
         active.is_active = Set(is_active);
@@ -1509,8 +1509,8 @@ async fn update_route_for_tenant(
 
         active.name = Set(name.to_string());
     }
-    if payload.description.is_some() {
-        active.description = Set(clean_optional_string(payload.description));
+    if let Some(description) = payload.description {
+        active.description = Set(clean_optional_string(description));
     }
     if let Some(direction) = payload.direction {
         active.direction = Set(direction);
@@ -1532,14 +1532,14 @@ async fn update_route_for_tenant(
         validate_route_trunk_ref(db, original_tenant_id, default_trunk_id).await?;
         active.default_trunk_id = Set(default_trunk_id);
     }
-    if payload.source_pattern.is_some() {
-        active.source_pattern = Set(clean_optional_string(payload.source_pattern));
+    if let Some(source_pattern) = payload.source_pattern {
+        active.source_pattern = Set(clean_optional_string(source_pattern));
     }
-    if payload.destination_pattern.is_some() {
-        active.destination_pattern = Set(clean_optional_string(payload.destination_pattern));
+    if let Some(destination_pattern) = payload.destination_pattern {
+        active.destination_pattern = Set(clean_optional_string(destination_pattern));
     }
-    if payload.owner.is_some() {
-        active.owner = Set(clean_optional_string(payload.owner));
+    if let Some(owner) = payload.owner {
+        active.owner = Set(clean_optional_string(owner));
     }
     active.updated_at = Set(chrono::Utc::now());
 
@@ -2849,13 +2849,13 @@ mod tests {
             summary.id,
             UpdateExtensionRequest {
                 extension: Some("1003".to_string()),
-                display_name: Some("Bob Updated".to_string()),
-                email: Some("bob@example.com".to_string()),
-                status: Some("disabled".to_string()),
+                display_name: Some(Some("Bob Updated".to_string())),
+                email: Some(Some("bob@example.com".to_string())),
+                status: Some(Some("disabled".to_string())),
                 login_disabled: Some(true),
                 voicemail_disabled: None,
                 allow_guest_calls: None,
-                notes: Some("updated".to_string()),
+                notes: Some(Some("updated".to_string())),
             },
         )
         .await
@@ -2896,7 +2896,7 @@ mod tests {
             summary.id,
             UpdateExtensionRequest {
                 extension: None,
-                display_name: Some("Should Not Apply".to_string()),
+                display_name: Some(Some("Should Not Apply".to_string())),
                 email: None,
                 status: None,
                 login_disabled: None,
@@ -3054,16 +3054,16 @@ mod tests {
             summary.id,
             UpdateSipTrunkRequest {
                 name: Some("carrier-b-updated".to_string()),
-                display_name: Some("Carrier B Updated".to_string()),
-                carrier: Some("CarrierCo".to_string()),
-                description: Some("updated".to_string()),
+                display_name: Some(Some("Carrier B Updated".to_string())),
+                carrier: Some(Some("CarrierCo".to_string())),
+                description: Some(Some("updated".to_string())),
                 status: Some(SipTrunkStatus::Warning),
                 direction: None,
-                sip_server: Some("sip-b2.example.com".to_string()),
+                sip_server: Some(Some("sip-b2.example.com".to_string())),
                 sip_transport: None,
                 outbound_proxy: None,
-                auth_username: Some("user-b2".to_string()),
-                auth_password: Some("secret-b2".to_string()),
+                auth_username: Some(Some("user-b2".to_string())),
+                auth_password: Some(Some("secret-b2".to_string())),
                 is_active: Some(false),
                 register_enabled: Some(true),
             },
@@ -3108,7 +3108,7 @@ mod tests {
             summary.id,
             UpdateSipTrunkRequest {
                 name: None,
-                display_name: Some("Should Not Apply".to_string()),
+                display_name: Some(Some("Should Not Apply".to_string())),
                 carrier: None,
                 description: None,
                 status: None,
@@ -3275,16 +3275,16 @@ mod tests {
             summary.id,
             UpdateRouteRequest {
                 name: Some("outbound-a-updated".to_string()),
-                description: Some("updated".to_string()),
+                description: Some(Some("updated".to_string())),
                 direction: Some(RoutingDirection::Inbound),
                 priority: Some(10),
                 is_active: Some(false),
                 selection_strategy: Some(RoutingSelectionStrategy::Hash),
                 source_trunk_id: None,
                 default_trunk_id: None,
-                source_pattern: Some("^1001$".to_string()),
-                destination_pattern: Some("^2[0-9]+$".to_string()),
-                owner: Some("ops".to_string()),
+                source_pattern: Some(Some("^1001$".to_string())),
+                destination_pattern: Some(Some("^2[0-9]+$".to_string())),
+                owner: Some(Some("ops".to_string())),
             },
         )
         .await
@@ -3329,7 +3329,7 @@ mod tests {
             summary.id,
             UpdateRouteRequest {
                 name: None,
-                description: Some("Should Not Apply".to_string()),
+                description: Some(Some("Should Not Apply".to_string())),
                 direction: None,
                 priority: None,
                 is_active: None,
