@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { Building2, Cable, GitBranch, LogOut, Phone, Plus, Power, PowerOff, RadioTower, Trash2, Users } from "lucide-vue-next";
+import { Building2, Cable, Check, GitBranch, LogOut, Pencil, Phone, Plus, Power, PowerOff, RadioTower, Trash2, Users, X } from "lucide-vue-next";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +34,7 @@ const routes = ref<RouteSummary[]>([]);
 const users = ref<UserSummary[]>([]);
 const callRecords = ref<CallRecordSummary[]>([]);
 const tenantForm = ref({ id: "", name: "", domain: "" });
+const tenantEditForm = ref({ name: "", domain: "" });
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
 const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
@@ -58,6 +59,7 @@ const updatingSipTrunkId = ref<number | null>(null);
 const updatingRouteId = ref<number | null>(null);
 const updatingUserId = ref<number | null>(null);
 const updatingTenantId = ref<string | null>(null);
+const editingTenantId = ref<string | null>(null);
 const selectedTenantId = ref(auth.user?.tenant?.id ?? "default");
 const loadingResources = ref(false);
 const selectedTenant = computed(() => tenants.value.find((tenant) => tenant.id === selectedTenantId.value));
@@ -153,6 +155,15 @@ async function selectTenant() {
   await loadTenantResources();
 }
 
+function replaceTenant(updated: TenantSummary) {
+  tenants.value = tenants.value
+    .map((item) => (item.id === updated.id ? updated : item))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (updated.id === selectedTenantId.value && auth.user) {
+    setTenantContextForTenant(updated, auth.user.role);
+  }
+}
+
 async function createTenant() {
   tenantError.value = "";
   const id = tenantForm.value.id.trim();
@@ -187,11 +198,47 @@ async function setTenantStatus(tenant: TenantSummary, status: TenantSummary["sta
   updatingTenantId.value = tenant.id;
   try {
     const updated = await api.updateTenant(tenant.id, { status });
-    tenants.value = tenants.value.map((item) => (item.id === updated.id ? updated : item));
-    if (updated.id === selectedTenantId.value && auth.user) {
-      setTenantContextForTenant(updated, auth.user.role);
+    replaceTenant(updated);
+    if (updated.id === selectedTenantId.value) {
       await loadTenantResources();
     }
+  } catch (err) {
+    tenantError.value = err instanceof Error ? err.message : "Failed to update tenant";
+  } finally {
+    updatingTenantId.value = null;
+  }
+}
+
+function startEditTenant(tenant: TenantSummary) {
+  tenantError.value = "";
+  editingTenantId.value = tenant.id;
+  tenantEditForm.value = {
+    name: tenant.name,
+    domain: tenant.domain ?? "",
+  };
+}
+
+function cancelEditTenant() {
+  editingTenantId.value = null;
+  tenantEditForm.value = { name: "", domain: "" };
+}
+
+async function saveTenantDetails(tenant: TenantSummary) {
+  tenantError.value = "";
+  const name = tenantEditForm.value.name.trim();
+  if (!name) {
+    tenantError.value = "Tenant name is required";
+    return;
+  }
+
+  updatingTenantId.value = tenant.id;
+  try {
+    const updated = await api.updateTenant(tenant.id, {
+      name,
+      domain: tenantEditForm.value.domain.trim() || null,
+    });
+    replaceTenant(updated);
+    cancelEditTenant();
   } catch (err) {
     tenantError.value = err instanceof Error ? err.message : "Failed to update tenant";
   } finally {
@@ -510,17 +557,48 @@ async function setUserActive(user: UserSummary, active: boolean) {
             <p v-if="tenantError" class="text-sm text-destructive">{{ tenantError }}</p>
 
             <div v-for="tenant in tenants" :key="tenant.id" class="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
-              <div>
-                <div class="font-medium">{{ tenant.name }}</div>
-                <div class="text-sm text-muted-foreground">{{ tenant.domain ?? tenant.id }}</div>
+              <div class="min-w-0 flex-1">
+                <div v-if="editingTenantId === tenant.id" class="grid gap-2 md:grid-cols-2">
+                  <Input v-model="tenantEditForm.name" aria-label="Tenant name" autocomplete="off" />
+                  <Input v-model="tenantEditForm.domain" aria-label="Tenant domain" autocomplete="off" />
+                </div>
+                <template v-else>
+                  <div class="font-medium">{{ tenant.name }}</div>
+                  <div class="text-sm text-muted-foreground">{{ tenant.domain ?? tenant.id }}</div>
+                </template>
               </div>
               <div class="flex items-center gap-2">
                 <Badge :variant="tenant.status === 'active' ? 'default' : 'outline'">{{ tenant.status }}</Badge>
+                <template v-if="editingTenantId === tenant.id">
+                  <Button
+                    v-if="canManageTenants"
+                    variant="ghost"
+                    size="icon"
+                    :disabled="updatingTenantId === tenant.id"
+                    aria-label="Save tenant"
+                    @click="saveTenantDetails(tenant)"
+                  >
+                    <Check class="h-4 w-4" />
+                  </Button>
+                  <Button variant="ghost" size="icon" :disabled="updatingTenantId === tenant.id" aria-label="Cancel tenant edit" @click="cancelEditTenant">
+                    <X class="h-4 w-4" />
+                  </Button>
+                </template>
+                <Button
+                  v-else-if="canManageTenants"
+                  variant="ghost"
+                  size="icon"
+                  :disabled="updatingTenantId === tenant.id"
+                  aria-label="Edit tenant"
+                  @click="startEditTenant(tenant)"
+                >
+                  <Pencil class="h-4 w-4" />
+                </Button>
                 <Button
                   v-if="canManageTenants && tenant.status !== 'active'"
                   variant="outline"
                   size="sm"
-                  :disabled="updatingTenantId === tenant.id"
+                  :disabled="updatingTenantId === tenant.id || editingTenantId === tenant.id"
                   @click="setTenantStatus(tenant, 'active')"
                 >
                   Activate
@@ -529,7 +607,7 @@ async function setUserActive(user: UserSummary, active: boolean) {
                   v-if="canManageTenants && tenant.status === 'active' && tenant.id !== 'default'"
                   variant="outline"
                   size="sm"
-                  :disabled="updatingTenantId === tenant.id"
+                  :disabled="updatingTenantId === tenant.id || editingTenantId === tenant.id"
                   @click="setTenantStatus(tenant, 'suspended')"
                 >
                   Suspend
