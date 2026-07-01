@@ -346,6 +346,21 @@ struct LoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateTenantRequest {
+    id: String,
+    name: String,
+    status: Option<String>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTenantRequest {
+    name: Option<String>,
+    status: Option<String>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateExtensionRequest {
     extension: String,
     display_name: Option<String>,
@@ -461,7 +476,8 @@ struct ErrorBody {
 
 pub fn router(state: crate::app::AppState) -> Router {
     let protected = Router::new()
-        .route("/api/tenants", get(list_tenants))
+        .route("/api/tenants", get(list_tenants).post(create_tenant))
+        .route("/api/tenants/{id}", axum::routing::patch(update_tenant))
         .route(
             "/api/cloudpbx/extensions",
             get(list_extensions).post(create_extension),
@@ -580,6 +596,158 @@ async fn list_tenants(State(state): State<crate::app::AppState>, ctx: TenantCont
             }),
         )
             .into_response(),
+    }
+}
+
+async fn create_tenant(
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<CreateTenantRequest>,
+) -> Response {
+    match create_tenant_for_platform(state.db(), &ctx, payload).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn create_tenant_for_platform(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    payload: CreateTenantRequest,
+) -> Result<TenantSummary, Response> {
+    use crate::models::tenant::{ActiveModel, Column, Entity};
+
+    require_platform_admin(ctx)?;
+
+    let slug = normalize_tenant_slug(&payload.id)?;
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(bad_request(
+            "invalid_tenant_name",
+            "Tenant name is required.",
+        ));
+    }
+    if name.len() > 255 {
+        return Err(bad_request(
+            "invalid_tenant_name",
+            "Tenant name must be 255 characters or fewer.",
+        ));
+    }
+    let status = normalize_tenant_status(payload.status)?;
+
+    match Entity::find()
+        .filter(Column::Slug.eq(slug.clone()))
+        .one(db)
+        .await
+    {
+        Ok(Some(_)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "tenant_exists",
+                    message: "Tenant already exists.",
+                }),
+            )
+                .into_response());
+        }
+        Ok(None) => {}
+        Err(_) => return Err(tenant_query_failed()),
+    }
+
+    let now = chrono::Utc::now();
+    let model = ActiveModel {
+        slug: Set(slug),
+        name: Set(name.to_string()),
+        status: Set(status),
+        domain: Set(clean_optional_string(payload.domain)),
+        max_concurrent_calls: Set(None),
+        max_trunks: Set(None),
+        storage_prefix: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+
+    match model.insert(db).await {
+        Ok(model) => Ok(TenantSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "tenant_create_failed",
+                message: "Failed to create tenant.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+async fn update_tenant(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<UpdateTenantRequest>,
+) -> Response {
+    match update_tenant_for_platform(state.db(), &ctx, &id, payload).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn update_tenant_for_platform(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: &str,
+    payload: UpdateTenantRequest,
+) -> Result<TenantSummary, Response> {
+    use crate::models::tenant::{Column, Entity};
+
+    require_platform_admin(ctx)?;
+
+    let slug = normalize_tenant_slug(id)?;
+    let model = Entity::find()
+        .filter(Column::Slug.eq(slug))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "tenant_not_found",
+                    message: "Tenant does not exist.",
+                }),
+            )
+                .into_response()
+        })?;
+
+    let mut active = model.into_active_model();
+    if let Some(name) = payload.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(bad_request(
+                "invalid_tenant_name",
+                "Tenant name is required.",
+            ));
+        }
+        if name.len() > 255 {
+            return Err(bad_request(
+                "invalid_tenant_name",
+                "Tenant name must be 255 characters or fewer.",
+            ));
+        }
+        active.name = Set(name.to_string());
+    }
+    if payload.status.is_some() {
+        active.status = Set(normalize_tenant_status(payload.status)?);
+    }
+    if payload.domain.is_some() {
+        active.domain = Set(clean_optional_string(payload.domain));
+    }
+    active.updated_at = Set(chrono::Utc::now());
+
+    match active.update(db).await {
+        Ok(model) => Ok(TenantSummary::from(model)),
+        Err(_) => Err(tenant_query_failed()),
     }
 }
 
@@ -2116,8 +2284,65 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[allow(clippy::result_large_err)]
+fn normalize_tenant_slug(value: &str) -> Result<String, Response> {
+    let slug = value.trim().to_lowercase();
+    if slug.is_empty() {
+        return Err(bad_request("invalid_tenant_id", "Tenant id is required."));
+    }
+    if slug.len() > 120 {
+        return Err(bad_request(
+            "invalid_tenant_id",
+            "Tenant id must be 120 characters or fewer.",
+        ));
+    }
+    if !slug
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+    {
+        return Err(bad_request(
+            "invalid_tenant_id",
+            "Tenant id may only contain lowercase letters, digits, hyphens, and underscores.",
+        ));
+    }
+    Ok(slug)
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_tenant_status(value: Option<String>) -> Result<String, Response> {
+    let status = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("active");
+
+    match status {
+        "active" | "suspended" | "disabled" => Ok(status.to_string()),
+        _ => Err(bad_request(
+            "invalid_tenant_status",
+            "Tenant status must be active, suspended, or disabled.",
+        )),
+    }
+}
+
 fn bad_request(error: &'static str, message: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, Json(ErrorBody { error, message })).into_response()
+}
+
+#[allow(clippy::result_large_err)]
+fn require_platform_admin(ctx: &TenantContext) -> Result<(), Response> {
+    if ctx.role == TenantRole::PlatformAdmin {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden",
+            message: "CloudPBX tenant management requires a platform administrator.",
+        }),
+    )
+        .into_response())
 }
 
 #[allow(clippy::result_large_err)]
@@ -2256,6 +2481,76 @@ mod tests {
             .await
             .expect("missing scope");
         assert!(matches!(missing_scope, TenantDbScope::Missing));
+    }
+
+    #[tokio::test]
+    async fn platform_admin_can_create_and_update_tenant() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext {
+            id: DEFAULT_TENANT_ID.to_string(),
+            name: "Default".to_string(),
+            role: TenantRole::PlatformAdmin,
+        };
+
+        let created = create_tenant_for_platform(
+            &db,
+            &ctx,
+            CreateTenantRequest {
+                id: "Tenant-A".to_string(),
+                name: "Tenant A".to_string(),
+                status: None,
+                domain: Some("tenant-a.example.com".to_string()),
+            },
+        )
+        .await
+        .expect("create tenant");
+
+        assert_eq!(created.id, "tenant-a");
+        assert_eq!(created.status, "active");
+
+        let updated = update_tenant_for_platform(
+            &db,
+            &ctx,
+            "tenant-a",
+            UpdateTenantRequest {
+                name: Some("Tenant A Updated".to_string()),
+                status: Some("suspended".to_string()),
+                domain: Some("".to_string()),
+            },
+        )
+        .await
+        .expect("update tenant");
+
+        assert_eq!(updated.name, "Tenant A Updated");
+        assert_eq!(updated.status, "suspended");
+        assert!(updated.domain.is_none());
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_cannot_create_tenant() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        let ctx = TenantContext::default_tenant_admin();
+
+        let response = create_tenant_for_platform(
+            &db,
+            &ctx,
+            CreateTenantRequest {
+                id: "tenant-denied".to_string(),
+                name: "Denied".to_string(),
+                status: None,
+                domain: None,
+            },
+        )
+        .await
+        .expect_err("tenant admin cannot create tenant");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
