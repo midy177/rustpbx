@@ -821,7 +821,9 @@ async fn cloudpbx_spa(uri: Uri) -> Response {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    let router = Router::new().route("/", get(|| async { Redirect::temporary("/app") }));
+    let router = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/app/") }))
+        .route("/app", get(|| async { Redirect::temporary("/app/") }));
 
     // CORS configuration to allow cross-origin requests
     let cors = CorsLayer::new()
@@ -851,7 +853,6 @@ pub fn create_router(state: AppState) -> Router {
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     #[allow(unused_mut)]
     let mut router = router
-        .route("/app", get(cloudpbx_spa))
         .route("/app/{*path}", get(cloudpbx_spa))
         .route(
             "/api/config/phone",
