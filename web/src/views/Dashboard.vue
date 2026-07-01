@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   api,
+  setTenantContextForTenant,
   type CallRecordSummary,
   type ExtensionSummary,
   type RouteSummary,
@@ -52,7 +53,11 @@ const deletingSipTrunkId = ref<number | null>(null);
 const deletingRouteId = ref<number | null>(null);
 const deletingUserId = ref<number | null>(null);
 const updatingTenantId = ref<string | null>(null);
-const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
+const selectedTenantId = ref(auth.user?.tenant?.id ?? "default");
+const loadingResources = ref(false);
+const activeTenant = computed(
+  () => tenants.value.find((tenant) => tenant.id === selectedTenantId.value)?.name ?? auth.user?.tenant?.name ?? "default",
+);
 const canManageTenants = computed(() => auth.user?.role === "platform_admin");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
 
@@ -67,9 +72,18 @@ const resources = computed(() => [
 async function loadDashboard() {
   try {
     tenants.value = await api.tenants();
+    if (!tenants.value.some((tenant) => tenant.id === selectedTenantId.value)) {
+      selectedTenantId.value = tenants.value[0]?.id ?? auth.user?.tenant?.id ?? "default";
+    }
   } catch {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
+    selectedTenantId.value = "default";
   }
+  await loadTenantResources();
+}
+
+async function loadTenantResources() {
+  loadingResources.value = true;
   try {
     const [loadedExtensions, loadedSipTrunks, loadedRoutes, loadedCallRecords, loadedUsers] = await Promise.all([
       api.extensions(),
@@ -99,6 +113,8 @@ async function loadDashboard() {
     routeCount.value = 0;
     callRecordCount.value = 0;
     userCount.value = 0;
+  } finally {
+    loadingResources.value = false;
   }
 }
 
@@ -114,6 +130,15 @@ async function signOut() {
   } finally {
     signingOut.value = false;
   }
+}
+
+async function selectTenant() {
+  const tenant = tenants.value.find((item) => item.id === selectedTenantId.value);
+  if (!tenant || !auth.user) {
+    return;
+  }
+  setTenantContextForTenant(tenant, auth.user.role);
+  await loadTenantResources();
 }
 
 async function createTenant() {
@@ -134,6 +159,9 @@ async function createTenant() {
       status: "active",
     });
     tenants.value = [created, ...tenants.value].sort((a, b) => a.name.localeCompare(b.name));
+    selectedTenantId.value = created.id;
+    setTenantContextForTenant(created, auth.user?.role ?? "platform_admin");
+    await loadTenantResources();
     tenantForm.value = { id: "", name: "", domain: "" };
   } catch (err) {
     tenantError.value = err instanceof Error ? err.message : "Failed to create tenant";
@@ -341,7 +369,18 @@ async function deleteUser(user: UserSummary) {
           </div>
         </div>
         <div class="flex items-center gap-3">
-          <Badge variant="secondary">{{ activeTenant }}</Badge>
+          <select
+            v-if="canManageTenants"
+            v-model="selectedTenantId"
+            class="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+            :disabled="loadingResources"
+            @change="selectTenant"
+          >
+            <option v-for="tenant in tenants" :key="tenant.id" :value="tenant.id">
+              {{ tenant.name }}
+            </option>
+          </select>
+          <Badge v-else variant="secondary">{{ activeTenant }}</Badge>
           <Button variant="outline" size="sm" :disabled="signingOut" @click="signOut">
             <LogOut class="h-4 w-4" />
             Sign out

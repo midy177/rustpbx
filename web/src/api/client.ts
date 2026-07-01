@@ -233,6 +233,15 @@ export function setTenantContext(user: SessionUser | null) {
   localStorage.setItem(TENANT_CONTEXT_KEY, JSON.stringify(context));
 }
 
+export function setTenantContextForTenant(tenant: TenantSummary, role: SessionUser["role"]) {
+  const context: StoredTenantContext = {
+    id: tenant.id,
+    name: tenant.name,
+    role,
+  };
+  localStorage.setItem(TENANT_CONTEXT_KEY, JSON.stringify(context));
+}
+
 function tenantHeaders(): Record<string, string> {
   const raw = localStorage.getItem(TENANT_CONTEXT_KEY);
   if (!raw) {
