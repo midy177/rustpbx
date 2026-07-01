@@ -39,6 +39,7 @@ const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
 const userForm = ref({ username: "", email: "", password: "", role: "tenant_user" });
 const tenantError = ref("");
+const resourceError = ref("");
 const extensionError = ref("");
 const sipTrunkError = ref("");
 const routeError = ref("");
@@ -55,11 +56,16 @@ const deletingUserId = ref<number | null>(null);
 const updatingTenantId = ref<string | null>(null);
 const selectedTenantId = ref(auth.user?.tenant?.id ?? "default");
 const loadingResources = ref(false);
+const selectedTenant = computed(() => tenants.value.find((tenant) => tenant.id === selectedTenantId.value));
 const activeTenant = computed(
-  () => tenants.value.find((tenant) => tenant.id === selectedTenantId.value)?.name ?? auth.user?.tenant?.name ?? "default",
+  () => selectedTenant.value?.name ?? auth.user?.tenant?.name ?? "default",
+);
+const selectedTenantStatus = computed(
+  () => selectedTenant.value?.status ?? auth.user?.tenant?.status ?? "active",
 );
 const canManageTenants = computed(() => auth.user?.role === "platform_admin");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
+const canManageResources = computed(() => canManage.value && selectedTenantStatus.value === "active");
 
 const resources = computed(() => [
   { label: "Extensions", value: String(extensionCount.value), icon: Phone },
@@ -84,6 +90,7 @@ async function loadDashboard() {
 
 async function loadTenantResources() {
   loadingResources.value = true;
+  resourceError.value = "";
   try {
     const [loadedExtensions, loadedSipTrunks, loadedRoutes, loadedCallRecords, loadedUsers] = await Promise.all([
       api.extensions(),
@@ -102,7 +109,8 @@ async function loadTenantResources() {
     callRecordCount.value = loadedCallRecords.length;
     users.value = loadedUsers;
     userCount.value = loadedUsers.length;
-  } catch {
+  } catch (err) {
+    resourceError.value = err instanceof Error ? err.message : "Failed to load tenant resources";
     extensions.value = [];
     sipTrunks.value = [];
     routes.value = [];
@@ -176,6 +184,10 @@ async function setTenantStatus(tenant: TenantSummary, status: TenantSummary["sta
   try {
     const updated = await api.updateTenant(tenant.id, { status });
     tenants.value = tenants.value.map((item) => (item.id === updated.id ? updated : item));
+    if (updated.id === selectedTenantId.value && auth.user) {
+      setTenantContextForTenant(updated, auth.user.role);
+      await loadTenantResources();
+    }
   } catch (err) {
     tenantError.value = err instanceof Error ? err.message : "Failed to update tenant";
   } finally {
@@ -377,7 +389,7 @@ async function deleteUser(user: UserSummary) {
             @change="selectTenant"
           >
             <option v-for="tenant in tenants" :key="tenant.id" :value="tenant.id">
-              {{ tenant.name }}
+              {{ tenant.name }} · {{ tenant.status }}
             </option>
           </select>
           <Badge v-else variant="secondary">{{ activeTenant }}</Badge>
@@ -401,6 +413,10 @@ async function deleteUser(user: UserSummary) {
           </CardContent>
         </Card>
       </section>
+
+      <div v-if="resourceError" class="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+        {{ resourceError }}
+      </div>
 
       <section class="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
         <Card>
@@ -487,7 +503,7 @@ async function deleteUser(user: UserSummary) {
             <CardTitle>Extensions</CardTitle>
           </CardHeader>
           <CardContent class="space-y-4">
-            <form v-if="canManage" class="grid gap-3 md:grid-cols-[140px_1fr_1fr_auto]" @submit.prevent="createExtension">
+            <form v-if="canManageResources" class="grid gap-3 md:grid-cols-[140px_1fr_1fr_auto]" @submit.prevent="createExtension">
               <div class="space-y-2">
                 <Label for="new-extension">Extension</Label>
                 <Input id="new-extension" v-model="extensionForm.extension" autocomplete="off" />
@@ -532,7 +548,7 @@ async function deleteUser(user: UserSummary) {
                     </td>
                     <td class="px-3 py-2 text-right">
                       <Button
-                        v-if="canManage"
+                        v-if="canManageResources"
                         variant="ghost"
                         size="icon"
                         :disabled="deletingExtensionId === extension.id"
@@ -559,7 +575,7 @@ async function deleteUser(user: UserSummary) {
             <CardTitle>SIP trunks</CardTitle>
           </CardHeader>
           <CardContent class="space-y-4">
-            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]" @submit.prevent="createSipTrunk">
+            <form v-if="canManageResources" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]" @submit.prevent="createSipTrunk">
               <div class="space-y-2">
                 <Label for="new-trunk-name">Name</Label>
                 <Input id="new-trunk-name" v-model="sipTrunkForm.name" autocomplete="off" />
@@ -606,7 +622,7 @@ async function deleteUser(user: UserSummary) {
                     </td>
                     <td class="px-3 py-2 text-right">
                       <Button
-                        v-if="canManage"
+                        v-if="canManageResources"
                         variant="ghost"
                         size="icon"
                         :disabled="deletingSipTrunkId === trunk.id"
@@ -633,7 +649,7 @@ async function deleteUser(user: UserSummary) {
             <CardTitle>Routes</CardTitle>
           </CardHeader>
           <CardContent class="space-y-4">
-            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_150px_1fr_1fr_auto]" @submit.prevent="createRoute">
+            <form v-if="canManageResources" class="grid gap-3 md:grid-cols-[1fr_150px_1fr_1fr_auto]" @submit.prevent="createRoute">
               <div class="space-y-2">
                 <Label for="new-route-name">Name</Label>
                 <Input id="new-route-name" v-model="routeForm.name" autocomplete="off" />
@@ -699,7 +715,7 @@ async function deleteUser(user: UserSummary) {
                     </td>
                     <td class="px-3 py-2 text-right">
                       <Button
-                        v-if="canManage"
+                        v-if="canManageResources"
                         variant="ghost"
                         size="icon"
                         :disabled="deletingRouteId === route.id"
@@ -726,7 +742,7 @@ async function deleteUser(user: UserSummary) {
             <CardTitle>Users</CardTitle>
           </CardHeader>
           <CardContent class="space-y-4">
-            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_160px_auto]" @submit.prevent="createUser">
+            <form v-if="canManageResources" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_160px_auto]" @submit.prevent="createUser">
               <div class="space-y-2">
                 <Label for="new-user-username">Username</Label>
                 <Input id="new-user-username" v-model="userForm.username" autocomplete="off" />
@@ -784,7 +800,7 @@ async function deleteUser(user: UserSummary) {
                     </td>
                     <td class="px-3 py-2 text-right">
                       <Button
-                        v-if="canManage"
+                        v-if="canManageResources"
                         variant="ghost"
                         size="icon"
                         :disabled="deletingUserId === user.id || auth.user?.id === user.id"
