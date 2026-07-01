@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api, type ExtensionSummary, type TenantSummary } from "@/api/client";
+import { api, type ExtensionSummary, type SipTrunkSummary, type TenantSummary } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
@@ -20,10 +20,15 @@ const callRecordCount = ref(0);
 const userCount = ref(0);
 const signingOut = ref(false);
 const extensions = ref<ExtensionSummary[]>([]);
+const sipTrunks = ref<SipTrunkSummary[]>([]);
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
+const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const extensionError = ref("");
+const sipTrunkError = ref("");
 const creatingExtension = ref(false);
+const creatingSipTrunk = ref(false);
 const deletingExtensionId = ref<number | null>(null);
+const deletingSipTrunkId = ref<number | null>(null);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
 
@@ -42,7 +47,7 @@ async function loadDashboard() {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
   }
   try {
-    const [loadedExtensions, trunks, routes, callRecords, users] = await Promise.all([
+    const [loadedExtensions, loadedSipTrunks, routes, callRecords, users] = await Promise.all([
       api.extensions(),
       api.sipTrunks(),
       api.routes(),
@@ -51,12 +56,14 @@ async function loadDashboard() {
     ]);
     extensions.value = loadedExtensions;
     extensionCount.value = loadedExtensions.length;
-    sipTrunkCount.value = trunks.length;
+    sipTrunks.value = loadedSipTrunks;
+    sipTrunkCount.value = loadedSipTrunks.length;
     routeCount.value = routes.length;
     callRecordCount.value = callRecords.length;
     userCount.value = users.length;
   } catch {
     extensions.value = [];
+    sipTrunks.value = [];
     extensionCount.value = 0;
     sipTrunkCount.value = 0;
     routeCount.value = 0;
@@ -116,6 +123,49 @@ async function deleteExtension(extension: ExtensionSummary) {
     extensionError.value = err instanceof Error ? err.message : "Failed to delete extension";
   } finally {
     deletingExtensionId.value = null;
+  }
+}
+
+async function createSipTrunk() {
+  sipTrunkError.value = "";
+  const name = sipTrunkForm.value.name.trim();
+  if (!name) {
+    sipTrunkError.value = "SIP trunk name is required";
+    return;
+  }
+
+  creatingSipTrunk.value = true;
+  try {
+    const created = await api.createSipTrunk({
+      name,
+      carrier: sipTrunkForm.value.carrier.trim() || null,
+      sip_server: sipTrunkForm.value.sip_server.trim() || null,
+      status: "healthy",
+      direction: "bidirectional",
+      sip_transport: "udp",
+      is_active: true,
+    });
+    sipTrunks.value = [created, ...sipTrunks.value].sort((a, b) => a.name.localeCompare(b.name));
+    sipTrunkCount.value = sipTrunks.value.length;
+    sipTrunkForm.value = { name: "", carrier: "", sip_server: "" };
+  } catch (err) {
+    sipTrunkError.value = err instanceof Error ? err.message : "Failed to create SIP trunk";
+  } finally {
+    creatingSipTrunk.value = false;
+  }
+}
+
+async function deleteSipTrunk(trunk: SipTrunkSummary) {
+  sipTrunkError.value = "";
+  deletingSipTrunkId.value = trunk.id;
+  try {
+    await api.deleteSipTrunk(trunk.id);
+    sipTrunks.value = sipTrunks.value.filter((item) => item.id !== trunk.id);
+    sipTrunkCount.value = sipTrunks.value.length;
+  } catch (err) {
+    sipTrunkError.value = err instanceof Error ? err.message : "Failed to delete SIP trunk";
+  } finally {
+    deletingSipTrunkId.value = null;
   }
 }
 </script>
@@ -257,6 +307,80 @@ async function deleteExtension(extension: ExtensionSummary) {
                   </tr>
                   <tr v-if="extensions.length === 0">
                     <td class="px-3 py-6 text-center text-muted-foreground" colspan="5">No extensions</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section>
+        <Card>
+          <CardHeader>
+            <CardTitle>SIP trunks</CardTitle>
+          </CardHeader>
+          <CardContent class="space-y-4">
+            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]" @submit.prevent="createSipTrunk">
+              <div class="space-y-2">
+                <Label for="new-trunk-name">Name</Label>
+                <Input id="new-trunk-name" v-model="sipTrunkForm.name" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-trunk-carrier">Carrier</Label>
+                <Input id="new-trunk-carrier" v-model="sipTrunkForm.carrier" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-trunk-server">SIP server</Label>
+                <Input id="new-trunk-server" v-model="sipTrunkForm.sip_server" autocomplete="off" />
+              </div>
+              <div class="flex items-end">
+                <Button type="submit" :disabled="creatingSipTrunk">
+                  <Plus class="h-4 w-4" />
+                  Add
+                </Button>
+              </div>
+            </form>
+            <p v-if="sipTrunkError" class="text-sm text-destructive">{{ sipTrunkError }}</p>
+
+            <div class="overflow-x-auto rounded-md border">
+              <table class="w-full min-w-[760px] text-left text-sm">
+                <thead class="bg-muted/50 text-muted-foreground">
+                  <tr>
+                    <th class="px-3 py-2 font-medium">Name</th>
+                    <th class="px-3 py-2 font-medium">Carrier</th>
+                    <th class="px-3 py-2 font-medium">SIP server</th>
+                    <th class="px-3 py-2 font-medium">Transport</th>
+                    <th class="px-3 py-2 font-medium">Status</th>
+                    <th class="px-3 py-2 text-right font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="trunk in sipTrunks" :key="trunk.id" class="border-t">
+                    <td class="px-3 py-2 font-medium">{{ trunk.display_name || trunk.name }}</td>
+                    <td class="px-3 py-2">{{ trunk.carrier || "-" }}</td>
+                    <td class="px-3 py-2">{{ trunk.sip_server || "-" }}</td>
+                    <td class="px-3 py-2 uppercase">{{ trunk.sip_transport }}</td>
+                    <td class="px-3 py-2">
+                      <Badge :variant="trunk.is_active ? 'default' : 'outline'">
+                        {{ trunk.status }}
+                      </Badge>
+                    </td>
+                    <td class="px-3 py-2 text-right">
+                      <Button
+                        v-if="canManage"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingSipTrunkId === trunk.id"
+                        aria-label="Delete SIP trunk"
+                        @click="deleteSipTrunk(trunk)"
+                      >
+                        <Trash2 class="h-4 w-4" />
+                      </Button>
+                    </td>
+                  </tr>
+                  <tr v-if="sipTrunks.length === 0">
+                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="6">No SIP trunks</td>
                   </tr>
                 </tbody>
               </table>
