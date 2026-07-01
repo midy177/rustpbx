@@ -22,7 +22,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{StatusCode, Uri, header::CONTENT_TYPE},
     middleware,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -48,6 +48,10 @@ use tower_http::{
 use tracing::{info, warn};
 
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
+
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+struct CloudPbxWebAssets;
 
 pub struct CoreContext {
     pub config: Arc<Config>,
@@ -795,6 +799,29 @@ async fn phone_config_handler(State(state): State<AppState>) -> impl IntoRespons
     Json(config).into_response()
 }
 
+async fn cloudpbx_spa(uri: Uri) -> Response {
+    let path = uri
+        .path()
+        .strip_prefix("/app")
+        .unwrap_or(uri.path())
+        .trim_start_matches('/');
+    if !path.is_empty()
+        && let Some(asset) = CloudPbxWebAssets::get(path)
+    {
+        let mime = asset.metadata.mimetype().to_string();
+        return ([(CONTENT_TYPE, mime)], asset.data.into_owned()).into_response();
+    }
+
+    match CloudPbxWebAssets::get("index.html") {
+        Some(index) => (
+            [(CONTENT_TYPE, "text/html; charset=utf-8")],
+            index.data.into_owned(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "CloudPBX web assets not embedded").into_response(),
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new();
 
@@ -843,6 +870,8 @@ pub fn create_router(state: AppState) -> Router {
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     #[allow(unused_mut)]
     let mut router = router
+        .route("/app", get(cloudpbx_spa))
+        .route("/app/{*path}", get(cloudpbx_spa))
         .route(
             "/api/config/phone",
             get(phone_config_handler).with_state(state.clone()),

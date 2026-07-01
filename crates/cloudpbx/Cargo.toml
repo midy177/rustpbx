@@ -107,7 +107,9 @@ default = [
     "addon-transcript",
     "addon-archive",
     "addon-observability",
+    "build-web",
 ]
+build-web = []
 
 
 [dependencies]
@@ -246,6 +248,7 @@ tower-http = { version = "0.7.0", features = [
     "cors",
     "compression-gzip",
 ] }
+rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
 rcgen = { version = "0.14.8", default-features = false, features = [
     "pem",
     "ring",

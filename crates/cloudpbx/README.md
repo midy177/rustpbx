@@ -40,16 +40,30 @@ and `SHORT_VERSION`.
 
 ## Frontend Packaging
 
-CloudPBX currently serves the Vue frontend from `web/dist` at runtime. Build it
-before running packaged binaries:
+CloudPBX has its own Vue frontend under `crates/cloudpbx/web`. The default
+Cargo build runs the frontend build and embeds `web/dist` into the binary with
+`rust-embed`, so release artifacts do not need an external `web/dist` folder.
+
+Run the frontend directly during UI development:
 
 ```bash
-cd ../../web
+cd crates/cloudpbx/web
 bun install
+bun run dev
+```
+
+Build the frontend manually:
+
+```bash
+cd crates/cloudpbx/web
 bun run build
 ```
 
-At the moment the frontend is not embedded into the `cloudpbx` binary. To make
-the release self-contained, add a `build-web` feature, run the web build from
-`crates/cloudpbx/build.rs`, add `rust-embed`, and replace `ServeDir::new("web/dist")`
-in `src/app.rs` with embedded asset serving and SPA fallback to `index.html`.
+Skip the frontend build for backend-only iteration:
+
+```bash
+CLOUDPBX_SKIP_WEB_BUILD=1 cargo check --manifest-path crates/cloudpbx/Cargo.toml --bin cloudpbx
+```
+
+When skipped, `build.rs` embeds a small placeholder page if `web/dist/index.html`
+does not already exist.
