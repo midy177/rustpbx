@@ -528,16 +528,13 @@ async fn cloudpbx_session_middleware(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let tenant = match user.tenant {
-        Some(tenant) => tenant,
-        None => return unauthorized(),
+
+    let ctx = match request_tenant_context(state.db(), user, req.headers()).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
     };
 
-    req.extensions_mut().insert(TenantContext {
-        id: tenant.id,
-        name: tenant.name,
-        role: user.role,
-    });
+    req.extensions_mut().insert(ctx);
     next.run(req).await
 }
 
@@ -759,7 +756,6 @@ async fn list_extensions(
 
     let mut query = Entity::find().order_by_asc(Column::Extension).limit(500);
     match resolve_tenant_scope(state.db(), &ctx).await {
-        Ok(TenantDbScope::All) => {}
         Ok(TenantDbScope::Tenant(tenant_id)) => {
             query = query.filter(Column::TenantId.eq(tenant_id));
         }
@@ -1030,7 +1026,6 @@ async fn list_sip_trunks(
 
     let mut query = Entity::find().order_by_asc(Column::Name).limit(500);
     match resolve_tenant_scope(state.db(), &ctx).await {
-        Ok(TenantDbScope::All) => {}
         Ok(TenantDbScope::Tenant(tenant_id)) => {
             query = query.filter(Column::TenantId.eq(tenant_id));
         }
@@ -1327,7 +1322,6 @@ async fn list_routes(State(state): State<crate::app::AppState>, ctx: TenantConte
         .order_by_asc(Column::Name)
         .limit(500);
     match resolve_tenant_scope(state.db(), &ctx).await {
-        Ok(TenantDbScope::All) => {}
         Ok(TenantDbScope::Tenant(tenant_id)) => {
             query = query.filter(Column::TenantId.eq(tenant_id));
         }
@@ -1648,7 +1642,6 @@ async fn list_call_records(
 
     let mut query = Entity::find().order_by_desc(Column::StartedAt).limit(500);
     match resolve_tenant_scope(state.db(), &ctx).await {
-        Ok(TenantDbScope::All) => {}
         Ok(TenantDbScope::Tenant(tenant_id)) => {
             query = query.filter(Column::TenantId.eq(tenant_id));
         }
@@ -1675,7 +1668,6 @@ async fn list_users(State(state): State<crate::app::AppState>, ctx: TenantContex
 
     let mut query = Entity::find().order_by_asc(Column::Username).limit(500);
     match resolve_tenant_scope(state.db(), &ctx).await {
-        Ok(TenantDbScope::All) => {}
         Ok(TenantDbScope::Tenant(tenant_id)) => {
             query = query.filter(Column::TenantId.eq(tenant_id));
         }
@@ -1986,7 +1978,6 @@ async fn load_user_for_write(
 }
 
 enum TenantDbScope {
-    All,
     Tenant(i64),
     Missing,
 }
@@ -1996,10 +1987,6 @@ async fn resolve_tenant_scope(
     ctx: &TenantContext,
 ) -> Result<TenantDbScope, DbErr> {
     use crate::models::tenant::{Column, Entity};
-
-    if ctx.role == TenantRole::PlatformAdmin {
-        return Ok(TenantDbScope::All);
-    }
 
     let tenant = Entity::find()
         .filter(Column::Slug.eq(ctx.id.clone()))
@@ -2148,6 +2135,47 @@ async fn current_session_user(
         .ok_or_else(unauthorized)?;
 
     Ok(session_user_from_model(user, Some(tenant)))
+}
+
+async fn request_tenant_context(
+    db: &DatabaseConnection,
+    user: SessionUser,
+    headers: &HeaderMap,
+) -> Result<TenantContext, Response> {
+    use crate::models::tenant::{Column, Entity};
+
+    let session_tenant = user.tenant.ok_or_else(unauthorized)?;
+    if user.role != TenantRole::PlatformAdmin {
+        return Ok(TenantContext {
+            id: session_tenant.id,
+            name: session_tenant.name,
+            role: user.role,
+        });
+    }
+
+    let requested_tenant = header_string(headers, "x-tenant-id").unwrap_or(session_tenant.id);
+    let requested_tenant = normalize_tenant_slug(&requested_tenant)?;
+    let tenant = Entity::find()
+        .filter(Column::Slug.eq(requested_tenant))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "tenant_not_found",
+                    message: "Tenant does not exist.",
+                }),
+            )
+                .into_response()
+        })?;
+
+    Ok(TenantContext {
+        id: tenant.slug,
+        name: tenant.name,
+        role: user.role,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2470,7 +2498,7 @@ mod tests {
         let platform_scope = resolve_tenant_scope(&db, &platform_ctx)
             .await
             .expect("platform scope");
-        assert!(matches!(platform_scope, TenantDbScope::All));
+        assert!(matches!(platform_scope, TenantDbScope::Tenant(_)));
 
         let missing_ctx = TenantContext {
             id: "missing".to_string(),
@@ -2551,6 +2579,85 @@ mod tests {
         .expect_err("tenant admin cannot create tenant");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn platform_admin_request_context_uses_selected_tenant_header() {
+        use crate::models::tenant::{ActiveModel as TenantActiveModel, Entity as TenantEntity};
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        TenantActiveModel {
+            slug: Set("tenant-selected".to_string()),
+            name: Set("Tenant Selected".to_string()),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert tenant");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant-id", HeaderValue::from_static("tenant-selected"));
+        let ctx = request_tenant_context(
+            &db,
+            SessionUser {
+                id: 1,
+                username: "platform".to_string(),
+                email: "platform@example.com".to_string(),
+                role: TenantRole::PlatformAdmin,
+                tenant: Some(TenantSummary {
+                    id: DEFAULT_TENANT_ID.to_string(),
+                    name: "Default".to_string(),
+                    status: "active".to_string(),
+                    domain: None,
+                }),
+            },
+            &headers,
+        )
+        .await
+        .expect("tenant context");
+
+        assert_eq!(ctx.id, "tenant-selected");
+        assert_eq!(ctx.name, "Tenant Selected");
+        assert_eq!(
+            TenantEntity::find().all(&db).await.expect("tenants").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_request_context_ignores_selected_tenant_header() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant-id", HeaderValue::from_static("other-tenant"));
+
+        let ctx = request_tenant_context(
+            &db,
+            SessionUser {
+                id: 1,
+                username: "tenant-admin".to_string(),
+                email: "admin@example.com".to_string(),
+                role: TenantRole::TenantAdmin,
+                tenant: Some(TenantSummary {
+                    id: DEFAULT_TENANT_ID.to_string(),
+                    name: "Default".to_string(),
+                    status: "active".to_string(),
+                    domain: None,
+                }),
+            },
+            &headers,
+        )
+        .await
+        .expect("tenant context");
+
+        assert_eq!(ctx.id, DEFAULT_TENANT_ID);
+        assert_eq!(ctx.role, TenantRole::TenantAdmin);
     }
 
     #[tokio::test]
