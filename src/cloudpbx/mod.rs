@@ -357,7 +357,7 @@ struct CreateTenantRequest {
 struct UpdateTenantRequest {
     name: Option<String>,
     status: Option<String>,
-    domain: Option<String>,
+    domain: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -740,8 +740,8 @@ async fn update_tenant_for_platform(
     if payload.status.is_some() {
         active.status = Set(normalize_tenant_status(payload.status)?);
     }
-    if payload.domain.is_some() {
-        active.domain = Set(clean_optional_string(payload.domain));
+    if let Some(domain) = payload.domain {
+        active.domain = Set(clean_optional_string(domain));
     }
     active.updated_at = Set(chrono::Utc::now());
 
@@ -2573,7 +2573,7 @@ mod tests {
             UpdateTenantRequest {
                 name: Some("Tenant A Updated".to_string()),
                 status: Some("suspended".to_string()),
-                domain: Some("".to_string()),
+                domain: Some(None),
             },
         )
         .await
