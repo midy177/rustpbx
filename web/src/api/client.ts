@@ -77,6 +77,22 @@ export interface CreateSipTrunkRequest {
   register_enabled?: boolean;
 }
 
+export interface UpdateSipTrunkRequest {
+  name?: string;
+  display_name?: string | null;
+  carrier?: string | null;
+  description?: string | null;
+  status?: string;
+  direction?: string;
+  sip_server?: string | null;
+  sip_transport?: string;
+  outbound_proxy?: string | null;
+  auth_username?: string | null;
+  auth_password?: string | null;
+  is_active?: boolean;
+  register_enabled?: boolean;
+}
+
 export interface RouteSummary {
   id: number;
   tenant_id?: number | null;
@@ -221,6 +237,17 @@ export const api = {
     return request<SipTrunkSummary>("/cloudpbx/sip-trunks", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  updateSipTrunk(id: number, payload: UpdateSipTrunkRequest) {
+    return request<SipTrunkSummary>(`/cloudpbx/sip-trunks/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteSipTrunk(id: number) {
+    return request<void>(`/cloudpbx/sip-trunks/${id}`, {
+      method: "DELETE",
     });
   },
   routes() {
