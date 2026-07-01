@@ -7,7 +7,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api, type ExtensionSummary, type RouteSummary, type SipTrunkSummary, type TenantSummary } from "@/api/client";
+import {
+  api,
+  type ExtensionSummary,
+  type RouteSummary,
+  type SipTrunkSummary,
+  type TenantSummary,
+  type UserSummary,
+} from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
@@ -22,18 +29,23 @@ const signingOut = ref(false);
 const extensions = ref<ExtensionSummary[]>([]);
 const sipTrunks = ref<SipTrunkSummary[]>([]);
 const routes = ref<RouteSummary[]>([]);
+const users = ref<UserSummary[]>([]);
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
 const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
+const userForm = ref({ username: "", email: "", password: "", role: "tenant_user" });
 const extensionError = ref("");
 const sipTrunkError = ref("");
 const routeError = ref("");
+const userError = ref("");
 const creatingExtension = ref(false);
 const creatingSipTrunk = ref(false);
 const creatingRoute = ref(false);
+const creatingUser = ref(false);
 const deletingExtensionId = ref<number | null>(null);
 const deletingSipTrunkId = ref<number | null>(null);
 const deletingRouteId = ref<number | null>(null);
+const deletingUserId = ref<number | null>(null);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
 
@@ -52,7 +64,7 @@ async function loadDashboard() {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
   }
   try {
-    const [loadedExtensions, loadedSipTrunks, loadedRoutes, callRecords, users] = await Promise.all([
+    const [loadedExtensions, loadedSipTrunks, loadedRoutes, callRecords, loadedUsers] = await Promise.all([
       api.extensions(),
       api.sipTrunks(),
       api.routes(),
@@ -66,11 +78,13 @@ async function loadDashboard() {
     routes.value = loadedRoutes;
     routeCount.value = loadedRoutes.length;
     callRecordCount.value = callRecords.length;
-    userCount.value = users.length;
+    users.value = loadedUsers;
+    userCount.value = loadedUsers.length;
   } catch {
     extensions.value = [];
     sipTrunks.value = [];
     routes.value = [];
+    users.value = [];
     extensionCount.value = 0;
     sipTrunkCount.value = 0;
     routeCount.value = 0;
@@ -214,6 +228,53 @@ async function deleteRoute(route: RouteSummary) {
     routeError.value = err instanceof Error ? err.message : "Failed to delete route";
   } finally {
     deletingRouteId.value = null;
+  }
+}
+
+async function createUser() {
+  userError.value = "";
+  const username = userForm.value.username.trim();
+  const email = userForm.value.email.trim();
+  if (!username || !email || !userForm.value.password) {
+    userError.value = "Username, email, and password are required";
+    return;
+  }
+
+  creatingUser.value = true;
+  try {
+    const created = await api.createUser({
+      username,
+      email,
+      password: userForm.value.password,
+      is_active: true,
+      is_staff: userForm.value.role === "tenant_admin",
+      is_superuser: false,
+    });
+    users.value = [created, ...users.value].sort((a, b) => a.username.localeCompare(b.username));
+    userCount.value = users.value.length;
+    userForm.value = { username: "", email: "", password: "", role: "tenant_user" };
+  } catch (err) {
+    userError.value = err instanceof Error ? err.message : "Failed to create user";
+  } finally {
+    creatingUser.value = false;
+  }
+}
+
+async function deleteUser(user: UserSummary) {
+  if (auth.user?.id === user.id) {
+    return;
+  }
+
+  userError.value = "";
+  deletingUserId.value = user.id;
+  try {
+    await api.deleteUser(user.id);
+    users.value = users.value.filter((item) => item.id !== user.id);
+    userCount.value = users.value.length;
+  } catch (err) {
+    userError.value = err instanceof Error ? err.message : "Failed to delete user";
+  } finally {
+    deletingUserId.value = null;
   }
 }
 </script>
@@ -522,6 +583,91 @@ async function deleteRoute(route: RouteSummary) {
                   </tr>
                   <tr v-if="routes.length === 0">
                     <td class="px-3 py-6 text-center text-muted-foreground" colspan="6">No routes</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Users</CardTitle>
+          </CardHeader>
+          <CardContent class="space-y-4">
+            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_1fr_1fr_160px_auto]" @submit.prevent="createUser">
+              <div class="space-y-2">
+                <Label for="new-user-username">Username</Label>
+                <Input id="new-user-username" v-model="userForm.username" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-user-email">Email</Label>
+                <Input id="new-user-email" v-model="userForm.email" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-user-password">Password</Label>
+                <Input id="new-user-password" v-model="userForm.password" type="password" autocomplete="new-password" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-user-role">Role</Label>
+                <select
+                  id="new-user-role"
+                  v-model="userForm.role"
+                  class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="tenant_user">User</option>
+                  <option value="tenant_admin">Admin</option>
+                </select>
+              </div>
+              <div class="flex items-end">
+                <Button type="submit" :disabled="creatingUser">
+                  <Plus class="h-4 w-4" />
+                  Add
+                </Button>
+              </div>
+            </form>
+            <p v-if="userError" class="text-sm text-destructive">{{ userError }}</p>
+
+            <div class="overflow-x-auto rounded-md border">
+              <table class="w-full min-w-[760px] text-left text-sm">
+                <thead class="bg-muted/50 text-muted-foreground">
+                  <tr>
+                    <th class="px-3 py-2 font-medium">Username</th>
+                    <th class="px-3 py-2 font-medium">Email</th>
+                    <th class="px-3 py-2 font-medium">Role</th>
+                    <th class="px-3 py-2 font-medium">Status</th>
+                    <th class="px-3 py-2 text-right font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="user in users" :key="user.id" class="border-t">
+                    <td class="px-3 py-2 font-medium">{{ user.username }}</td>
+                    <td class="px-3 py-2">{{ user.email }}</td>
+                    <td class="px-3 py-2">
+                      {{ user.is_superuser ? "Platform admin" : user.is_staff ? "Admin" : "User" }}
+                    </td>
+                    <td class="px-3 py-2">
+                      <Badge :variant="user.is_active ? 'default' : 'outline'">
+                        {{ user.is_active ? "active" : "disabled" }}
+                      </Badge>
+                    </td>
+                    <td class="px-3 py-2 text-right">
+                      <Button
+                        v-if="canManage"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingUserId === user.id || auth.user?.id === user.id"
+                        aria-label="Delete user"
+                        @click="deleteUser(user)"
+                      >
+                        <Trash2 class="h-4 w-4" />
+                      </Button>
+                    </td>
+                  </tr>
+                  <tr v-if="users.length === 0">
+                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="5">No users</td>
                   </tr>
                 </tbody>
               </table>
