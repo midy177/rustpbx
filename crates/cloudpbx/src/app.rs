@@ -853,6 +853,7 @@ pub fn create_router(state: AppState) -> Router {
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     #[allow(unused_mut)]
     let mut router = router
+        .route("/app/", get(cloudpbx_spa))
         .route("/app/{*path}", get(cloudpbx_spa))
         .route(
             "/api/config/phone",
