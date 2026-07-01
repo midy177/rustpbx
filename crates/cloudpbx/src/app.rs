@@ -863,6 +863,7 @@ pub fn create_router(state: AppState) -> Router {
             &ice_servers_path,
             get(iceservers_handler).with_state(state.clone()),
         )
+        .merge(crate::cloud_api::router().with_state(state.clone()))
         .merge(state.addon_registry.get_routers(state.clone()))
         .merge(call_routes)
         .layer(cors);
