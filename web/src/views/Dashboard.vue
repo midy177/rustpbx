@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { Building2, Cable, GitBranch, Phone, RadioTower, Users } from "lucide-vue-next";
+import { useRouter } from "vue-router";
+import { Building2, Cable, GitBranch, LogOut, Phone, RadioTower, Users } from "lucide-vue-next";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,12 +9,14 @@ import { api, type TenantSummary } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
+const router = useRouter();
 const tenants = ref<TenantSummary[]>([]);
 const extensionCount = ref(0);
 const sipTrunkCount = ref(0);
 const routeCount = ref(0);
 const callRecordCount = ref(0);
 const userCount = ref(0);
+const signingOut = ref(false);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 
 const resources = computed(() => [
@@ -51,6 +54,16 @@ onMounted(async () => {
     userCount.value = 0;
   }
 });
+
+async function signOut() {
+  signingOut.value = true;
+  try {
+    await auth.logout();
+    await router.push({ name: "login" });
+  } finally {
+    signingOut.value = false;
+  }
+}
 </script>
 
 <template>
@@ -68,7 +81,10 @@ onMounted(async () => {
         </div>
         <div class="flex items-center gap-3">
           <Badge variant="secondary">{{ activeTenant }}</Badge>
-          <Button variant="outline" size="sm">Switch tenant</Button>
+          <Button variant="outline" size="sm" :disabled="signingOut" @click="signOut">
+            <LogOut class="h-4 w-4" />
+            Sign out
+          </Button>
         </div>
       </div>
     </header>
