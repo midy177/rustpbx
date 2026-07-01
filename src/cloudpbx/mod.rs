@@ -1,20 +1,33 @@
-use argon2::password_hash::SaltString;
 use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHash, PasswordVerifier, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use axum::{
     Json, Router,
     extract::{FromRequestParts, Path as AxumPath, State},
-    http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{COOKIE, SET_COOKIE},
+        request::Parts,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::engine::{Engine, general_purpose::STANDARD_NO_PAD};
+use chrono::Utc;
+use hmac::{Hmac, KeyInit, Mac};
+use sea_orm::sea_query::Condition;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
     IntoActiveModel, QueryFilter, QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::time::Duration;
 
 pub const DEFAULT_TENANT_ID: &str = "default";
+const SESSION_COOKIE_NAME: &str = "cloudpbx_session";
+const SESSION_TTL_HOURS: u64 = 12;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantContext {
@@ -100,6 +113,15 @@ struct TenantSummary {
     name: String,
     status: String,
     domain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionUser {
+    id: i64,
+    username: String,
+    email: String,
+    role: TenantRole,
+    tenant: Option<TenantSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,27 +492,27 @@ pub fn router(state: crate::app::AppState) -> Router {
         .with_state(state)
 }
 
-async fn login(Json(payload): Json<LoginRequest>) -> Response {
-    let _ = (&payload.username, &payload.password, &payload.tenant);
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorBody {
-            error: "not_implemented",
-            message: "CloudPBX SPA auth is not wired to the monolith user store yet.",
-        }),
-    )
-        .into_response()
+async fn login(
+    State(state): State<crate::app::AppState>,
+    Json(payload): Json<LoginRequest>,
+) -> Response {
+    let secret = cloudpbx_session_secret(&state);
+    match authenticate_login(state.db(), &secret, payload).await {
+        Ok((user, cookie)) => {
+            let mut response = Json(user).into_response();
+            response.headers_mut().append(SET_COOKIE, cookie);
+            response
+        }
+        Err(response) => response,
+    }
 }
 
-async fn session() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorBody {
-            error: "unauthorized",
-            message: "No CloudPBX SPA session is active.",
-        }),
-    )
-        .into_response()
+async fn session(State(state): State<crate::app::AppState>, headers: HeaderMap) -> Response {
+    let secret = cloudpbx_session_secret(&state);
+    match current_session_user(state.db(), &secret, &headers).await {
+        Ok(user) => Json(user).into_response(),
+        Err(response) => response,
+    }
 }
 
 async fn list_tenants(State(state): State<crate::app::AppState>, ctx: TenantContext) -> Response {
@@ -1781,6 +1803,7 @@ async fn resolve_write_tenant_id(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn hash_password(password: &str) -> Result<String, Response> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -1796,6 +1819,226 @@ fn hash_password(password: &str) -> Result<String, Response> {
                 .into_response()
         })
         .map(|hash| hash.to_string())
+}
+
+async fn authenticate_login(
+    db: &DatabaseConnection,
+    secret: &str,
+    payload: LoginRequest,
+) -> Result<(SessionUser, HeaderValue), Response> {
+    use crate::models::{
+        tenant::{Column as TenantColumn, Entity as TenantEntity},
+        user::{Column as UserColumn, Entity as UserEntity},
+    };
+
+    let username = payload.username.trim();
+    let password = payload.password;
+    if username.is_empty() || password.is_empty() {
+        return Err(unauthorized());
+    }
+
+    let tenant_slug = payload
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TENANT_ID);
+
+    let tenant = TenantEntity::find()
+        .filter(TenantColumn::Slug.eq(tenant_slug))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .ok_or_else(unauthorized)?;
+
+    if tenant.status != "active" {
+        return Err(unauthorized());
+    }
+
+    let user = UserEntity::find()
+        .filter(
+            Condition::any()
+                .add(UserColumn::Username.eq(username))
+                .add(UserColumn::Email.eq(username.to_lowercase())),
+        )
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .filter(|user| user.is_superuser || user.tenant_id == Some(tenant.id))
+        .filter(|user| user.is_active)
+        .ok_or_else(unauthorized)?;
+
+    let parsed_hash = PasswordHash::new(&user.password_hash).map_err(|_| unauthorized())?;
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .map_err(|_| unauthorized())?;
+
+    let mut active = user.clone().into_active_model();
+    active.last_login_at = Set(Some(Utc::now()));
+    active.updated_at = Set(Utc::now());
+    let user = active.update(db).await.map_err(|_| tenant_query_failed())?;
+    let cookie = session_cookie_header(secret, &tenant.slug, user.id)?;
+
+    Ok((session_user_from_model(user, Some(tenant)), cookie))
+}
+
+async fn current_session_user(
+    db: &DatabaseConnection,
+    secret: &str,
+    headers: &HeaderMap,
+) -> Result<SessionUser, Response> {
+    use crate::models::{
+        tenant::{Column as TenantColumn, Entity as TenantEntity},
+        user::{Column as UserColumn, Entity as UserEntity},
+    };
+
+    let token = get_cookie(headers, SESSION_COOKIE_NAME).ok_or_else(unauthorized)?;
+    let session = verify_session_token(secret, &token).ok_or_else(unauthorized)?;
+    let tenant = TenantEntity::find()
+        .filter(TenantColumn::Slug.eq(session.tenant_slug.clone()))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .ok_or_else(unauthorized)?;
+
+    if tenant.status != "active" {
+        return Err(unauthorized());
+    }
+
+    let user = UserEntity::find()
+        .filter(UserColumn::Id.eq(session.user_id))
+        .one(db)
+        .await
+        .map_err(|_| tenant_query_failed())?
+        .filter(|user| user.is_superuser || user.tenant_id == Some(tenant.id))
+        .filter(|user| user.is_active)
+        .ok_or_else(unauthorized)?;
+
+    Ok(session_user_from_model(user, Some(tenant)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SessionToken {
+    tenant_slug: String,
+    user_id: i64,
+}
+
+fn cloudpbx_session_secret(state: &crate::app::AppState) -> String {
+    state
+        .config()
+        .console
+        .as_ref()
+        .map(|config| config.session_secret.clone())
+        .unwrap_or_else(|| "cloudpbx-local-session-secret".to_string())
+}
+
+fn session_user_from_model(
+    user: crate::models::user::Model,
+    tenant: Option<crate::models::tenant::Model>,
+) -> SessionUser {
+    let role = if user.is_superuser {
+        TenantRole::PlatformAdmin
+    } else if user.is_staff {
+        TenantRole::TenantAdmin
+    } else {
+        TenantRole::TenantUser
+    };
+
+    SessionUser {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role,
+        tenant: tenant.map(TenantSummary::from),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn session_cookie_header(
+    secret: &str,
+    tenant_slug: &str,
+    user_id: i64,
+) -> Result<HeaderValue, Response> {
+    let token = generate_session_token(secret, tenant_slug, user_id)?;
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; Max-Age={}; SameSite=Lax",
+        SESSION_COOKIE_NAME,
+        token,
+        SESSION_TTL_HOURS * 3600
+    );
+    HeaderValue::from_str(&cookie).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "session_cookie_failed",
+                message: "Failed to create session cookie.",
+            }),
+        )
+            .into_response()
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn generate_session_token(
+    secret: &str,
+    tenant_slug: &str,
+    user_id: i64,
+) -> Result<String, Response> {
+    let expires_at = Utc::now() + Duration::from_secs(SESSION_TTL_HOURS * 3600);
+    let payload = format!("{}:{}:{}", tenant_slug, user_id, expires_at.timestamp());
+    let signature = sign_session_payload(secret, &payload)?;
+    Ok(format!("{}:{}", payload, signature))
+}
+
+fn verify_session_token(secret: &str, token: &str) -> Option<SessionToken> {
+    let mut segments = token.split(':');
+    let tenant_slug = segments.next()?.to_string();
+    let user_id: i64 = segments.next()?.parse().ok()?;
+    let expires_at: i64 = segments.next()?.parse().ok()?;
+    let signature = segments.next()?;
+    if segments.next().is_some() || tenant_slug.is_empty() || expires_at <= Utc::now().timestamp() {
+        return None;
+    }
+
+    let payload = format!("{}:{}:{}", tenant_slug, user_id, expires_at);
+    let expected = sign_session_payload(secret, &payload).ok()?;
+    if expected != signature {
+        return None;
+    }
+
+    Some(SessionToken {
+        tenant_slug,
+        user_id,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn sign_session_payload(secret: &str, payload: &str) -> Result<String, Response> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "session_sign_failed",
+                message: "Failed to sign session token.",
+            }),
+        )
+            .into_response()
+    })?;
+    mac.update(payload.as_bytes());
+    Ok(STANDARD_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    for header in headers.get_all(COOKIE) {
+        let header = header.to_str().ok()?;
+        for part in header.split(';') {
+            let mut pair = part.trim().splitn(2, '=');
+            if pair.next()? == name {
+                return pair.next().map(ToOwned::to_owned);
+            }
+        }
+    }
+    None
 }
 
 fn clean_optional_string(value: Option<String>) -> Option<String> {
@@ -1814,6 +2057,17 @@ fn tenant_query_failed() -> Response {
         Json(ErrorBody {
             error: "tenant_query_failed",
             message: "Failed to load tenant-scoped resources.",
+        }),
+    )
+        .into_response()
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorBody {
+            error: "unauthorized",
+            message: "Invalid CloudPBX credentials or session.",
         }),
     )
         .into_response()
@@ -2736,6 +2990,132 @@ mod tests {
         assert_eq!(user.tenant_id, Some(tenant.id));
         assert_ne!(user.password_hash, "secret-password");
         assert!(user.password_hash.starts_with("$argon2"));
+    }
+
+    #[tokio::test]
+    async fn login_sets_signed_session_cookie() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "login-user".to_string(),
+                email: "login-user@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: Some(true),
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let (user, cookie) = authenticate_login(
+            &db,
+            "test-secret",
+            LoginRequest {
+                username: "login-user".to_string(),
+                password: "secret-password".to_string(),
+                tenant: Some(DEFAULT_TENANT_ID.to_string()),
+            },
+        )
+        .await
+        .expect("login");
+
+        assert_eq!(user.username, "login-user");
+        assert_eq!(user.role, TenantRole::TenantAdmin);
+        assert!(cookie.to_str().unwrap().starts_with("cloudpbx_session="));
+        assert!(cookie.to_str().unwrap().contains("HttpOnly"));
+    }
+
+    #[tokio::test]
+    async fn session_restores_user_from_cookie() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "session-user".to_string(),
+                email: "session-user@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let (_, cookie) = authenticate_login(
+            &db,
+            "test-secret",
+            LoginRequest {
+                username: "session-user@example.com".to_string(),
+                password: "secret-password".to_string(),
+                tenant: Some(DEFAULT_TENANT_ID.to_string()),
+            },
+        )
+        .await
+        .expect("login");
+
+        let cookie_pair = cookie.to_str().unwrap().split(';').next().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_str(cookie_pair).unwrap());
+
+        let user = current_session_user(&db, "test-secret", &headers)
+            .await
+            .expect("session user");
+        assert_eq!(user.username, "session-user");
+        assert_eq!(user.role, TenantRole::TenantUser);
+        assert_eq!(user.tenant.unwrap().id, DEFAULT_TENANT_ID);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_password() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "reject-user".to_string(),
+                email: "reject-user@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let response = authenticate_login(
+            &db,
+            "test-secret",
+            LoginRequest {
+                username: "reject-user".to_string(),
+                password: "wrong-password".to_string(),
+                tenant: Some(DEFAULT_TENANT_ID.to_string()),
+            },
+        )
+        .await
+        .expect_err("reject wrong password");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
