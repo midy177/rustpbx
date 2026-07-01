@@ -9,13 +9,13 @@ independent package.
 From this directory:
 
 ```bash
-cargo run --bin cloudpbx -- --conf rustpbx.toml
+cargo run --bin cloudpbx -- --conf ../../config.toml.example
 ```
 
 From the repository root:
 
 ```bash
-cargo run --manifest-path crates/cloudpbx/Cargo.toml --bin cloudpbx -- --conf crates/cloudpbx/rustpbx.toml
+cargo run --manifest-path crates/cloudpbx/Cargo.toml --bin cloudpbx -- --conf config.toml.example
 ```
 
 The SIP flow helper binary is available as:
