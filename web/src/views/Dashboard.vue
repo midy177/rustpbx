@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api, type ExtensionSummary, type SipTrunkSummary, type TenantSummary } from "@/api/client";
+import { api, type ExtensionSummary, type RouteSummary, type SipTrunkSummary, type TenantSummary } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
@@ -21,14 +21,19 @@ const userCount = ref(0);
 const signingOut = ref(false);
 const extensions = ref<ExtensionSummary[]>([]);
 const sipTrunks = ref<SipTrunkSummary[]>([]);
+const routes = ref<RouteSummary[]>([]);
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
 const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
+const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
 const extensionError = ref("");
 const sipTrunkError = ref("");
+const routeError = ref("");
 const creatingExtension = ref(false);
 const creatingSipTrunk = ref(false);
+const creatingRoute = ref(false);
 const deletingExtensionId = ref<number | null>(null);
 const deletingSipTrunkId = ref<number | null>(null);
+const deletingRouteId = ref<number | null>(null);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
 
@@ -47,7 +52,7 @@ async function loadDashboard() {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
   }
   try {
-    const [loadedExtensions, loadedSipTrunks, routes, callRecords, users] = await Promise.all([
+    const [loadedExtensions, loadedSipTrunks, loadedRoutes, callRecords, users] = await Promise.all([
       api.extensions(),
       api.sipTrunks(),
       api.routes(),
@@ -58,12 +63,14 @@ async function loadDashboard() {
     extensionCount.value = loadedExtensions.length;
     sipTrunks.value = loadedSipTrunks;
     sipTrunkCount.value = loadedSipTrunks.length;
-    routeCount.value = routes.length;
+    routes.value = loadedRoutes;
+    routeCount.value = loadedRoutes.length;
     callRecordCount.value = callRecords.length;
     userCount.value = users.length;
   } catch {
     extensions.value = [];
     sipTrunks.value = [];
+    routes.value = [];
     extensionCount.value = 0;
     sipTrunkCount.value = 0;
     routeCount.value = 0;
@@ -166,6 +173,47 @@ async function deleteSipTrunk(trunk: SipTrunkSummary) {
     sipTrunkError.value = err instanceof Error ? err.message : "Failed to delete SIP trunk";
   } finally {
     deletingSipTrunkId.value = null;
+  }
+}
+
+async function createRoute() {
+  routeError.value = "";
+  const name = routeForm.value.name.trim();
+  if (!name) {
+    routeError.value = "Route name is required";
+    return;
+  }
+
+  creatingRoute.value = true;
+  try {
+    const created = await api.createRoute({
+      name,
+      direction: routeForm.value.direction,
+      destination_pattern: routeForm.value.destination_pattern.trim() || null,
+      default_trunk_id: routeForm.value.default_trunk_id ? Number(routeForm.value.default_trunk_id) : null,
+      is_active: true,
+    });
+    routes.value = [created, ...routes.value].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
+    routeCount.value = routes.value.length;
+    routeForm.value = { name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" };
+  } catch (err) {
+    routeError.value = err instanceof Error ? err.message : "Failed to create route";
+  } finally {
+    creatingRoute.value = false;
+  }
+}
+
+async function deleteRoute(route: RouteSummary) {
+  routeError.value = "";
+  deletingRouteId.value = route.id;
+  try {
+    await api.deleteRoute(route.id);
+    routes.value = routes.value.filter((item) => item.id !== route.id);
+    routeCount.value = routes.value.length;
+  } catch (err) {
+    routeError.value = err instanceof Error ? err.message : "Failed to delete route";
+  } finally {
+    deletingRouteId.value = null;
   }
 }
 </script>
@@ -381,6 +429,99 @@ async function deleteSipTrunk(trunk: SipTrunkSummary) {
                   </tr>
                   <tr v-if="sipTrunks.length === 0">
                     <td class="px-3 py-6 text-center text-muted-foreground" colspan="6">No SIP trunks</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Routes</CardTitle>
+          </CardHeader>
+          <CardContent class="space-y-4">
+            <form v-if="canManage" class="grid gap-3 md:grid-cols-[1fr_150px_1fr_1fr_auto]" @submit.prevent="createRoute">
+              <div class="space-y-2">
+                <Label for="new-route-name">Name</Label>
+                <Input id="new-route-name" v-model="routeForm.name" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-route-direction">Direction</Label>
+                <select
+                  id="new-route-direction"
+                  v-model="routeForm.direction"
+                  class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="outbound">Outbound</option>
+                  <option value="inbound">Inbound</option>
+                  <option value="bidirectional">Bidirectional</option>
+                </select>
+              </div>
+              <div class="space-y-2">
+                <Label for="new-route-destination">Destination pattern</Label>
+                <Input id="new-route-destination" v-model="routeForm.destination_pattern" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-route-trunk">Default trunk</Label>
+                <select
+                  id="new-route-trunk"
+                  v-model="routeForm.default_trunk_id"
+                  class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">None</option>
+                  <option v-for="trunk in sipTrunks" :key="trunk.id" :value="String(trunk.id)">
+                    {{ trunk.display_name || trunk.name }}
+                  </option>
+                </select>
+              </div>
+              <div class="flex items-end">
+                <Button type="submit" :disabled="creatingRoute">
+                  <Plus class="h-4 w-4" />
+                  Add
+                </Button>
+              </div>
+            </form>
+            <p v-if="routeError" class="text-sm text-destructive">{{ routeError }}</p>
+
+            <div class="overflow-x-auto rounded-md border">
+              <table class="w-full min-w-[820px] text-left text-sm">
+                <thead class="bg-muted/50 text-muted-foreground">
+                  <tr>
+                    <th class="px-3 py-2 font-medium">Name</th>
+                    <th class="px-3 py-2 font-medium">Direction</th>
+                    <th class="px-3 py-2 font-medium">Priority</th>
+                    <th class="px-3 py-2 font-medium">Destination</th>
+                    <th class="px-3 py-2 font-medium">Default trunk</th>
+                    <th class="px-3 py-2 text-right font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="route in routes" :key="route.id" class="border-t">
+                    <td class="px-3 py-2 font-medium">{{ route.name }}</td>
+                    <td class="px-3 py-2">{{ route.direction }}</td>
+                    <td class="px-3 py-2">{{ route.priority }}</td>
+                    <td class="px-3 py-2">{{ route.destination_pattern || "-" }}</td>
+                    <td class="px-3 py-2">
+                      {{ sipTrunks.find((trunk) => trunk.id === route.default_trunk_id)?.name ?? "-" }}
+                    </td>
+                    <td class="px-3 py-2 text-right">
+                      <Button
+                        v-if="canManage"
+                        variant="ghost"
+                        size="icon"
+                        :disabled="deletingRouteId === route.id"
+                        aria-label="Delete route"
+                        @click="deleteRoute(route)"
+                      >
+                        <Trash2 class="h-4 w-4" />
+                      </Button>
+                    </td>
+                  </tr>
+                  <tr v-if="routes.length === 0">
+                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="6">No routes</td>
                   </tr>
                 </tbody>
               </table>
