@@ -1726,6 +1726,11 @@ async fn create_user_for_tenant(
     if payload.password.is_empty() {
         return Err(bad_request("invalid_password", "Password is required."));
     }
+    if payload.is_superuser.unwrap_or(false) && ctx.role != TenantRole::PlatformAdmin {
+        return Err(forbidden(
+            "CloudPBX platform administrator access is required to grant superuser privileges.",
+        ));
+    }
 
     let tenant_id = match resolve_write_tenant_id(db, ctx).await {
         Ok(tenant_id) => tenant_id,
@@ -1906,6 +1911,11 @@ async fn update_user_for_tenant(
         active.is_staff = Set(is_staff);
     }
     if let Some(is_superuser) = payload.is_superuser {
+        if is_superuser && ctx.role != TenantRole::PlatformAdmin {
+            return Err(forbidden(
+                "CloudPBX platform administrator access is required to grant superuser privileges.",
+            ));
+        }
         active.is_superuser = Set(is_superuser);
     }
     active.updated_at = Set(chrono::Utc::now());
@@ -2357,34 +2367,35 @@ fn bad_request(error: &'static str, message: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, Json(ErrorBody { error, message })).into_response()
 }
 
+fn forbidden(message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden",
+            message,
+        }),
+    )
+        .into_response()
+}
+
 #[allow(clippy::result_large_err)]
 fn require_platform_admin(ctx: &TenantContext) -> Result<(), Response> {
     if ctx.role == TenantRole::PlatformAdmin {
         return Ok(());
     }
 
-    Err((
-        StatusCode::FORBIDDEN,
-        Json(ErrorBody {
-            error: "forbidden",
-            message: "CloudPBX tenant management requires a platform administrator.",
-        }),
-    )
-        .into_response())
+    Err(forbidden(
+        "CloudPBX tenant management requires a platform administrator.",
+    ))
 }
 
 #[allow(clippy::result_large_err)]
 fn require_tenant_admin(ctx: &TenantContext) -> Result<(), Response> {
     match ctx.role {
         TenantRole::PlatformAdmin | TenantRole::TenantAdmin => Ok(()),
-        TenantRole::TenantUser => Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorBody {
-                error: "forbidden",
-                message: "CloudPBX write access requires a tenant administrator.",
-            }),
-        )
-            .into_response()),
+        TenantRole::TenantUser => Err(forbidden(
+            "CloudPBX write access requires a tenant administrator.",
+        )),
     }
 }
 
@@ -3547,6 +3558,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_admin_cannot_create_superuser() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let response = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "super-denied".to_string(),
+                email: "super-denied@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: Some(true),
+                is_superuser: Some(true),
+            },
+        )
+        .await
+        .expect_err("tenant admin cannot create superuser");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_cannot_promote_superuser() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "promote-denied".to_string(),
+                email: "promote-denied@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let response = update_user_for_tenant(
+            &db,
+            &ctx,
+            summary.id,
+            UpdateUserRequest {
+                username: None,
+                email: None,
+                password: None,
+                is_active: None,
+                is_staff: None,
+                is_superuser: Some(true),
+            },
+        )
+        .await
+        .expect_err("tenant admin cannot promote superuser");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn login_sets_signed_session_cookie() {
         let db = Database::connect("sqlite::memory:")
             .await
@@ -3716,7 +3795,7 @@ mod tests {
                 password: Some("new-secret-password".to_string()),
                 is_active: Some(false),
                 is_staff: Some(true),
-                is_superuser: Some(true),
+                is_superuser: None,
             },
         )
         .await
@@ -3726,7 +3805,7 @@ mod tests {
         assert_eq!(updated.email, "bob-updated@example.com");
         assert!(!updated.is_active);
         assert!(updated.is_staff);
-        assert!(updated.is_superuser);
+        assert!(!updated.is_superuser);
         assert_eq!(updated.tenant_id, summary.tenant_id);
 
         let changed = UserEntity::find()
