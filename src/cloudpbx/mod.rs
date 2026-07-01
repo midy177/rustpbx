@@ -419,6 +419,16 @@ struct CreateUserRequest {
     is_superuser: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    username: Option<String>,
+    email: Option<String>,
+    password: Option<String>,
+    is_active: Option<bool>,
+    is_staff: Option<bool>,
+    is_superuser: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
@@ -453,6 +463,10 @@ pub fn router(state: crate::app::AppState) -> Router {
         )
         .route("/api/cloudpbx/call-records", get(list_call_records))
         .route("/api/cloudpbx/users", get(list_users).post(create_user))
+        .route(
+            "/api/cloudpbx/users/{id}",
+            axum::routing::patch(update_user).delete(delete_user),
+        )
         .with_state(state)
 }
 
@@ -1468,20 +1482,7 @@ async fn create_user_for_tenant(
             .into_response());
     }
 
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Argon2::default()
-        .hash_password(payload.password.as_bytes(), &salt)
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: "password_hash_failed",
-                    message: "Failed to hash password.",
-                }),
-            )
-                .into_response()
-        })?
-        .to_string();
+    let password_hash = hash_password(&payload.password)?;
 
     let now = chrono::Utc::now();
     let model = ActiveModel {
@@ -1514,6 +1515,186 @@ async fn create_user_for_tenant(
             }),
         )
             .into_response()),
+    }
+}
+
+async fn update_user(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+    Json(payload): Json<UpdateUserRequest>,
+) -> Response {
+    match update_user_for_tenant(state.db(), &ctx, id, payload).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn update_user_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+    payload: UpdateUserRequest,
+) -> Result<UserSummary, Response> {
+    use crate::models::user::{Column, Entity};
+
+    let model = load_user_for_write(db, ctx, id).await?;
+    let original_tenant_id = model.tenant_id;
+    let mut active = model.into_active_model();
+
+    if let Some(username) = payload.username {
+        let username = username.trim();
+        if username.is_empty() {
+            return Err(bad_request("invalid_username", "Username is required."));
+        }
+        if username.len() > 100 {
+            return Err(bad_request(
+                "invalid_username",
+                "Username must be 100 characters or fewer.",
+            ));
+        }
+        if let Some(tenant_id) = original_tenant_id {
+            match Entity::find()
+                .filter(Column::TenantId.eq(tenant_id))
+                .filter(Column::Username.eq(username))
+                .filter(Column::Id.ne(id))
+                .one(db)
+                .await
+            {
+                Ok(Some(_)) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(ErrorBody {
+                            error: "user_exists",
+                            message: "User already exists in this tenant.",
+                        }),
+                    )
+                        .into_response());
+                }
+                Ok(None) => {}
+                Err(_) => return Err(tenant_query_failed()),
+            }
+        }
+        active.username = Set(username.to_string());
+    }
+
+    if let Some(email) = payload.email {
+        let email = email.trim().to_lowercase();
+        if email.is_empty() || !email.contains('@') {
+            return Err(bad_request("invalid_email", "Valid email is required."));
+        }
+        if email.len() > 255 {
+            return Err(bad_request(
+                "invalid_email",
+                "Email must be 255 characters or fewer.",
+            ));
+        }
+        if let Some(tenant_id) = original_tenant_id {
+            match Entity::find()
+                .filter(Column::TenantId.eq(tenant_id))
+                .filter(Column::Email.eq(email.clone()))
+                .filter(Column::Id.ne(id))
+                .one(db)
+                .await
+            {
+                Ok(Some(_)) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(ErrorBody {
+                            error: "user_exists",
+                            message: "User already exists in this tenant.",
+                        }),
+                    )
+                        .into_response());
+                }
+                Ok(None) => {}
+                Err(_) => return Err(tenant_query_failed()),
+            }
+        }
+        active.email = Set(email);
+    }
+
+    if let Some(password) = payload.password {
+        if password.is_empty() {
+            return Err(bad_request("invalid_password", "Password is required."));
+        }
+        active.password_hash = Set(hash_password(&password)?);
+        active.reset_token = Set(None);
+        active.reset_token_expires = Set(None);
+    }
+    if let Some(is_active) = payload.is_active {
+        active.is_active = Set(is_active);
+    }
+    if let Some(is_staff) = payload.is_staff {
+        active.is_staff = Set(is_staff);
+    }
+    if let Some(is_superuser) = payload.is_superuser {
+        active.is_superuser = Set(is_superuser);
+    }
+    active.updated_at = Set(chrono::Utc::now());
+
+    match active.update(db).await {
+        Ok(model) => Ok(UserSummary::from(model)),
+        Err(_) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "user_update_failed",
+                message: "Failed to update user.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+async fn delete_user(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<crate::app::AppState>,
+    ctx: TenantContext,
+) -> Response {
+    match delete_user_for_tenant(state.db(), &ctx, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn delete_user_for_tenant(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<(), Response> {
+    use crate::models::user::Entity;
+
+    let model = load_user_for_write(db, ctx, id).await?;
+    match Entity::delete_by_id(model.id).exec(db).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(tenant_query_failed()),
+    }
+}
+
+async fn load_user_for_write(
+    db: &DatabaseConnection,
+    ctx: &TenantContext,
+    id: i64,
+) -> Result<crate::models::user::Model, Response> {
+    use crate::models::user::{Column, Entity};
+
+    let mut query = Entity::find().filter(Column::Id.eq(id));
+    if ctx.role != TenantRole::PlatformAdmin {
+        let tenant_id = resolve_write_tenant_id(db, ctx).await?;
+        query = query.filter(Column::TenantId.eq(tenant_id));
+    }
+
+    match query.one(db).await {
+        Ok(Some(model)) => Ok(model),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "user_not_found",
+                message: "User not found.",
+            }),
+        )
+            .into_response()),
+        Err(_) => Err(tenant_query_failed()),
     }
 }
 
@@ -1566,6 +1747,23 @@ async fn resolve_write_tenant_id(
             .into_response()),
         Err(_) => Err(tenant_query_failed()),
     }
+}
+
+fn hash_password(password: &str) -> Result<String, Response> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "password_hash_failed",
+                    message: "Failed to hash password.",
+                }),
+            )
+                .into_response()
+        })
+        .map(|hash| hash.to_string())
 }
 
 fn clean_optional_string(value: Option<String>) -> Option<String> {
@@ -2331,5 +2529,160 @@ mod tests {
         assert_eq!(user.tenant_id, Some(tenant.id));
         assert_ne!(user.password_hash, "secret-password");
         assert!(user.password_hash.starts_with("$argon2"));
+    }
+
+    #[tokio::test]
+    async fn update_user_preserves_tenant_scope_and_hashes_password() {
+        use crate::models::{
+            tenant::{ActiveModel as TenantActiveModel, Entity as TenantEntity},
+            user::{Column as UserColumn, Entity as UserEntity},
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "bob".to_string(),
+                email: "bob@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let original = UserEntity::find_by_id(summary.id)
+            .one(&db)
+            .await
+            .expect("query user")
+            .expect("user");
+
+        let updated = update_user_for_tenant(
+            &db,
+            &ctx,
+            summary.id,
+            UpdateUserRequest {
+                username: Some("bob-updated".to_string()),
+                email: Some("bob-updated@example.com".to_string()),
+                password: Some("new-secret-password".to_string()),
+                is_active: Some(false),
+                is_staff: Some(true),
+                is_superuser: Some(true),
+            },
+        )
+        .await
+        .expect("update user");
+
+        assert_eq!(updated.username, "bob-updated");
+        assert_eq!(updated.email, "bob-updated@example.com");
+        assert!(!updated.is_active);
+        assert!(updated.is_staff);
+        assert!(updated.is_superuser);
+        assert_eq!(updated.tenant_id, summary.tenant_id);
+
+        let changed = UserEntity::find()
+            .filter(UserColumn::Id.eq(summary.id))
+            .one(&db)
+            .await
+            .expect("query updated user")
+            .expect("updated user");
+        assert_ne!(changed.password_hash, original.password_hash);
+        assert!(changed.password_hash.starts_with("$argon2"));
+        assert!(changed.reset_token.is_none());
+        assert!(changed.reset_token_expires.is_none());
+
+        let now = chrono::Utc::now();
+        TenantActiveModel {
+            slug: Set("tenant-e".to_string()),
+            name: Set("Tenant E".to_string()),
+            status: Set("active".to_string()),
+            domain: Set(None),
+            max_concurrent_calls: Set(None),
+            max_trunks: Set(None),
+            storage_prefix: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert tenant e");
+
+        let other_ctx = TenantContext {
+            id: "tenant-e".to_string(),
+            name: "Tenant E".to_string(),
+            role: TenantRole::TenantAdmin,
+        };
+        let response = update_user_for_tenant(
+            &db,
+            &other_ctx,
+            summary.id,
+            UpdateUserRequest {
+                username: Some("should-not-apply".to_string()),
+                email: None,
+                password: None,
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect_err("cross tenant update is hidden");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let unchanged = UserEntity::find_by_id(summary.id)
+            .one(&db)
+            .await
+            .expect("query user")
+            .expect("user");
+        assert_eq!(unchanged.username, "bob-updated");
+        assert_eq!(
+            TenantEntity::find().all(&db).await.expect("tenants").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_user_requires_tenant_scope() {
+        use crate::models::user::Entity as UserEntity;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "delete-user".to_string(),
+                email: "delete-user@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        delete_user_for_tenant(&db, &ctx, summary.id)
+            .await
+            .expect("delete user");
+
+        let deleted = UserEntity::find_by_id(summary.id)
+            .one(&db)
+            .await
+            .expect("query user");
+        assert!(deleted.is_none());
     }
 }

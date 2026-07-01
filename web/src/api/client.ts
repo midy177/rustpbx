@@ -182,6 +182,15 @@ export interface CreateUserRequest {
   is_superuser?: boolean;
 }
 
+export interface UpdateUserRequest {
+  username?: string;
+  email?: string;
+  password?: string;
+  is_active?: boolean;
+  is_staff?: boolean;
+  is_superuser?: boolean;
+}
+
 export interface LoginRequest {
   username: string;
   password: string;
@@ -294,6 +303,17 @@ export const api = {
     return request<UserSummary>("/cloudpbx/users", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  updateUser(id: number, payload: UpdateUserRequest) {
+    return request<UserSummary>(`/cloudpbx/users/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteUser(id: number) {
+    return request<void>(`/cloudpbx/users/${id}`, {
+      method: "DELETE",
     });
   },
 };
