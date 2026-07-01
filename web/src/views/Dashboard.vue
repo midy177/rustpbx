@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   api,
+  type CallRecordSummary,
   type ExtensionSummary,
   type RouteSummary,
   type SipTrunkSummary,
@@ -30,6 +31,7 @@ const extensions = ref<ExtensionSummary[]>([]);
 const sipTrunks = ref<SipTrunkSummary[]>([]);
 const routes = ref<RouteSummary[]>([]);
 const users = ref<UserSummary[]>([]);
+const callRecords = ref<CallRecordSummary[]>([]);
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
 const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
@@ -64,7 +66,7 @@ async function loadDashboard() {
     tenants.value = [{ id: "default", name: "Default", status: "active" }];
   }
   try {
-    const [loadedExtensions, loadedSipTrunks, loadedRoutes, callRecords, loadedUsers] = await Promise.all([
+    const [loadedExtensions, loadedSipTrunks, loadedRoutes, loadedCallRecords, loadedUsers] = await Promise.all([
       api.extensions(),
       api.sipTrunks(),
       api.routes(),
@@ -77,7 +79,8 @@ async function loadDashboard() {
     sipTrunkCount.value = loadedSipTrunks.length;
     routes.value = loadedRoutes;
     routeCount.value = loadedRoutes.length;
-    callRecordCount.value = callRecords.length;
+    callRecords.value = loadedCallRecords;
+    callRecordCount.value = loadedCallRecords.length;
     users.value = loadedUsers;
     userCount.value = loadedUsers.length;
   } catch {
@@ -85,6 +88,7 @@ async function loadDashboard() {
     sipTrunks.value = [];
     routes.value = [];
     users.value = [];
+    callRecords.value = [];
     extensionCount.value = 0;
     sipTrunkCount.value = 0;
     routeCount.value = 0;
@@ -668,6 +672,49 @@ async function deleteUser(user: UserSummary) {
                   </tr>
                   <tr v-if="users.length === 0">
                     <td class="px-3 py-6 text-center text-muted-foreground" colspan="5">No users</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Call records</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div class="overflow-x-auto rounded-md border">
+              <table class="w-full min-w-[860px] text-left text-sm">
+                <thead class="bg-muted/50 text-muted-foreground">
+                  <tr>
+                    <th class="px-3 py-2 font-medium">Call ID</th>
+                    <th class="px-3 py-2 font-medium">Direction</th>
+                    <th class="px-3 py-2 font-medium">From</th>
+                    <th class="px-3 py-2 font-medium">To</th>
+                    <th class="px-3 py-2 font-medium">Status</th>
+                    <th class="px-3 py-2 font-medium">Duration</th>
+                    <th class="px-3 py-2 font-medium">Started</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="record in callRecords.slice(0, 20)" :key="record.id" class="border-t">
+                    <td class="max-w-[220px] truncate px-3 py-2 font-medium">{{ record.display_id || record.call_id }}</td>
+                    <td class="px-3 py-2">{{ record.direction }}</td>
+                    <td class="px-3 py-2">{{ record.from_number || "-" }}</td>
+                    <td class="px-3 py-2">{{ record.to_number || "-" }}</td>
+                    <td class="px-3 py-2">
+                      <Badge :variant="record.status === 'completed' ? 'default' : 'outline'">
+                        {{ record.status }}
+                      </Badge>
+                    </td>
+                    <td class="px-3 py-2">{{ record.duration_secs }}s</td>
+                    <td class="px-3 py-2">{{ new Date(record.started_at).toLocaleString() }}</td>
+                  </tr>
+                  <tr v-if="callRecords.length === 0">
+                    <td class="px-3 py-6 text-center text-muted-foreground" colspan="7">No call records</td>
                   </tr>
                 </tbody>
               </table>
