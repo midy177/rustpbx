@@ -198,12 +198,56 @@ export interface LoginRequest {
 }
 
 const API_BASE = "/api";
+const TENANT_CONTEXT_KEY = "cloudpbx:tenant-context";
+
+interface StoredTenantContext {
+  id: string;
+  name: string;
+  role: SessionUser["role"];
+}
+
+export function setTenantContext(user: SessionUser | null) {
+  if (!user?.tenant?.id) {
+    localStorage.removeItem(TENANT_CONTEXT_KEY);
+    return;
+  }
+
+  const context: StoredTenantContext = {
+    id: user.tenant.id,
+    name: user.tenant.name,
+    role: user.role,
+  };
+  localStorage.setItem(TENANT_CONTEXT_KEY, JSON.stringify(context));
+}
+
+function tenantHeaders(): Record<string, string> {
+  const raw = localStorage.getItem(TENANT_CONTEXT_KEY);
+  if (!raw) {
+    return {};
+  }
+
+  try {
+    const context = JSON.parse(raw) as StoredTenantContext;
+    if (!context.id) {
+      return {};
+    }
+    return {
+      "x-tenant-id": context.id,
+      "x-tenant-name": context.name,
+      "x-tenant-role": context.role,
+    };
+  } catch {
+    localStorage.removeItem(TENANT_CONTEXT_KEY);
+    return {};
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
+      ...tenantHeaders(),
       ...(init?.headers ?? {}),
     },
     ...init,

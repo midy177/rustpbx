@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { api, type SessionUser } from "@/api/client";
+import { api, setTenantContext, type SessionUser } from "@/api/client";
 
 interface AuthState {
   user: SessionUser | null;
@@ -20,15 +20,22 @@ export const useAuthStore = defineStore("auth", {
       this.loading = true;
       try {
         this.user = await api.session();
+        setTenantContext(this.user);
+      } catch (error) {
+        this.user = null;
+        setTenantContext(null);
+        throw error;
       } finally {
         this.loading = false;
       }
     },
     async login(username: string, password: string, tenant?: string) {
       this.user = await api.login({ username, password, tenant });
+      setTenantContext(this.user);
     },
     clear() {
       this.user = null;
+      setTenantContext(null);
     },
   },
 });
