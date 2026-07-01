@@ -213,6 +213,11 @@ export interface LoginRequest {
 const API_BASE = "/api";
 const TENANT_CONTEXT_KEY = "cloudpbx:tenant-context";
 
+interface ApiErrorBody {
+  error?: string;
+  message?: string;
+}
+
 interface StoredTenantContext {
   id: string;
   name: string;
@@ -278,7 +283,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     window.dispatchEvent(new CustomEvent("cloudpbx:unauthorized"));
   }
   if (!response.ok) {
-    throw new Error(`API ${response.status}: ${response.statusText}`);
+    let detail = response.statusText;
+    try {
+      const body = (await response.json()) as ApiErrorBody;
+      detail = body.message ?? body.error ?? detail;
+    } catch {
+      // Keep the HTTP status text when the response is not JSON.
+    }
+    throw new Error(`API ${response.status}: ${detail}`);
   }
   if (response.status === 204) {
     return undefined as T;

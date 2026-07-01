@@ -1911,9 +1911,9 @@ async fn update_user_for_tenant(
         active.is_staff = Set(is_staff);
     }
     if let Some(is_superuser) = payload.is_superuser {
-        if is_superuser && ctx.role != TenantRole::PlatformAdmin {
+        if ctx.role != TenantRole::PlatformAdmin {
             return Err(forbidden(
-                "CloudPBX platform administrator access is required to grant superuser privileges.",
+                "CloudPBX platform administrator access is required to modify superuser privileges.",
             ));
         }
         active.is_superuser = Set(is_superuser);
@@ -3621,6 +3621,48 @@ mod tests {
         )
         .await
         .expect_err("tenant admin cannot promote superuser");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_cannot_modify_superuser_flag() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let ctx = TenantContext::default_tenant_admin();
+        let summary = create_user_for_tenant(
+            &db,
+            &ctx,
+            CreateUserRequest {
+                username: "super-flag-denied".to_string(),
+                email: "super-flag-denied@example.com".to_string(),
+                password: "secret-password".to_string(),
+                is_active: None,
+                is_staff: None,
+                is_superuser: None,
+            },
+        )
+        .await
+        .expect("create user");
+
+        let response = update_user_for_tenant(
+            &db,
+            &ctx,
+            summary.id,
+            UpdateUserRequest {
+                username: None,
+                email: None,
+                password: None,
+                is_active: None,
+                is_staff: None,
+                is_superuser: Some(false),
+            },
+        )
+        .await
+        .expect_err("tenant admin cannot modify superuser flag");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
