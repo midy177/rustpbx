@@ -32,14 +32,17 @@ const sipTrunks = ref<SipTrunkSummary[]>([]);
 const routes = ref<RouteSummary[]>([]);
 const users = ref<UserSummary[]>([]);
 const callRecords = ref<CallRecordSummary[]>([]);
+const tenantForm = ref({ id: "", name: "", domain: "" });
 const extensionForm = ref({ extension: "", display_name: "", email: "" });
 const sipTrunkForm = ref({ name: "", carrier: "", sip_server: "" });
 const routeForm = ref({ name: "", direction: "outbound", destination_pattern: "", default_trunk_id: "" });
 const userForm = ref({ username: "", email: "", password: "", role: "tenant_user" });
+const tenantError = ref("");
 const extensionError = ref("");
 const sipTrunkError = ref("");
 const routeError = ref("");
 const userError = ref("");
+const creatingTenant = ref(false);
 const creatingExtension = ref(false);
 const creatingSipTrunk = ref(false);
 const creatingRoute = ref(false);
@@ -48,7 +51,9 @@ const deletingExtensionId = ref<number | null>(null);
 const deletingSipTrunkId = ref<number | null>(null);
 const deletingRouteId = ref<number | null>(null);
 const deletingUserId = ref<number | null>(null);
+const updatingTenantId = ref<string | null>(null);
 const activeTenant = computed(() => auth.user?.tenant?.name ?? tenants.value[0]?.name ?? "default");
+const canManageTenants = computed(() => auth.user?.role === "platform_admin");
 const canManage = computed(() => auth.user?.role === "platform_admin" || auth.user?.role === "tenant_admin");
 
 const resources = computed(() => [
@@ -108,6 +113,45 @@ async function signOut() {
     await router.push({ name: "login" });
   } finally {
     signingOut.value = false;
+  }
+}
+
+async function createTenant() {
+  tenantError.value = "";
+  const id = tenantForm.value.id.trim();
+  const name = tenantForm.value.name.trim();
+  if (!id || !name) {
+    tenantError.value = "Tenant id and name are required";
+    return;
+  }
+
+  creatingTenant.value = true;
+  try {
+    const created = await api.createTenant({
+      id,
+      name,
+      domain: tenantForm.value.domain.trim() || null,
+      status: "active",
+    });
+    tenants.value = [created, ...tenants.value].sort((a, b) => a.name.localeCompare(b.name));
+    tenantForm.value = { id: "", name: "", domain: "" };
+  } catch (err) {
+    tenantError.value = err instanceof Error ? err.message : "Failed to create tenant";
+  } finally {
+    creatingTenant.value = false;
+  }
+}
+
+async function setTenantStatus(tenant: TenantSummary, status: TenantSummary["status"]) {
+  tenantError.value = "";
+  updatingTenantId.value = tenant.id;
+  try {
+    const updated = await api.updateTenant(tenant.id, { status });
+    tenants.value = tenants.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (err) {
+    tenantError.value = err instanceof Error ? err.message : "Failed to update tenant";
+  } finally {
+    updatingTenantId.value = null;
   }
 }
 
@@ -325,12 +369,54 @@ async function deleteUser(user: UserSummary) {
             <CardTitle>Tenant scope</CardTitle>
           </CardHeader>
           <CardContent class="space-y-3">
-            <div v-for="tenant in tenants" :key="tenant.id" class="flex items-center justify-between rounded-md border px-3 py-2">
+            <form v-if="canManageTenants" class="grid gap-3 md:grid-cols-[120px_1fr_1fr_auto]" @submit.prevent="createTenant">
+              <div class="space-y-2">
+                <Label for="new-tenant-id">Tenant id</Label>
+                <Input id="new-tenant-id" v-model="tenantForm.id" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-tenant-name">Name</Label>
+                <Input id="new-tenant-name" v-model="tenantForm.name" autocomplete="off" />
+              </div>
+              <div class="space-y-2">
+                <Label for="new-tenant-domain">Domain</Label>
+                <Input id="new-tenant-domain" v-model="tenantForm.domain" autocomplete="off" />
+              </div>
+              <div class="flex items-end">
+                <Button type="submit" :disabled="creatingTenant">
+                  <Plus class="h-4 w-4" />
+                  Add
+                </Button>
+              </div>
+            </form>
+            <p v-if="tenantError" class="text-sm text-destructive">{{ tenantError }}</p>
+
+            <div v-for="tenant in tenants" :key="tenant.id" class="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
               <div>
                 <div class="font-medium">{{ tenant.name }}</div>
                 <div class="text-sm text-muted-foreground">{{ tenant.domain ?? tenant.id }}</div>
               </div>
-              <Badge :variant="tenant.status === 'active' ? 'default' : 'outline'">{{ tenant.status }}</Badge>
+              <div class="flex items-center gap-2">
+                <Badge :variant="tenant.status === 'active' ? 'default' : 'outline'">{{ tenant.status }}</Badge>
+                <Button
+                  v-if="canManageTenants && tenant.status !== 'active'"
+                  variant="outline"
+                  size="sm"
+                  :disabled="updatingTenantId === tenant.id"
+                  @click="setTenantStatus(tenant, 'active')"
+                >
+                  Activate
+                </Button>
+                <Button
+                  v-if="canManageTenants && tenant.status === 'active' && tenant.id !== 'default'"
+                  variant="outline"
+                  size="sm"
+                  :disabled="updatingTenantId === tenant.id"
+                  @click="setTenantStatus(tenant, 'suspended')"
+                >
+                  Suspend
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>

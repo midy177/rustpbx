@@ -5,6 +5,19 @@ export interface TenantSummary {
   domain?: string;
 }
 
+export interface CreateTenantRequest {
+  id: string;
+  name: string;
+  status?: "active" | "suspended" | "disabled";
+  domain?: string | null;
+}
+
+export interface UpdateTenantRequest {
+  name?: string;
+  status?: "active" | "suspended" | "disabled";
+  domain?: string | null;
+}
+
 export interface SessionUser {
   id: number;
   username: string;
@@ -281,6 +294,18 @@ export const api = {
   },
   tenants() {
     return request<TenantSummary[]>("/tenants");
+  },
+  createTenant(payload: CreateTenantRequest) {
+    return request<TenantSummary>("/tenants", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  updateTenant(id: string, payload: UpdateTenantRequest) {
+    return request<TenantSummary>(`/tenants/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
   },
   extensions() {
     return request<ExtensionSummary[]>("/cloudpbx/extensions");
