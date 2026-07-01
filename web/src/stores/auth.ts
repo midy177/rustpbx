@@ -33,6 +33,13 @@ export const useAuthStore = defineStore("auth", {
       this.user = await api.login({ username, password, tenant });
       setTenantContext(this.user);
     },
+    async logout() {
+      try {
+        await api.logout();
+      } finally {
+        this.clear();
+      }
+    },
     clear() {
       this.user = null;
       setTenantContext(null);

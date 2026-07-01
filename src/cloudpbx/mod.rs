@@ -496,6 +496,7 @@ pub fn router(state: crate::app::AppState) -> Router {
 
     Router::new()
         .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
         .route("/api/auth/session", get(session))
         .merge(protected)
         .with_state(state)
@@ -537,6 +538,14 @@ async fn login(
         }
         Err(response) => response,
     }
+}
+
+async fn logout() -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .append(SET_COOKIE, clear_session_cookie_header());
+    response
 }
 
 async fn session(State(state): State<crate::app::AppState>, headers: HeaderMap) -> Response {
@@ -2034,6 +2043,10 @@ fn session_cookie_header(
     })
 }
 
+fn clear_session_cookie_header() -> HeaderValue {
+    HeaderValue::from_static("cloudpbx_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax")
+}
+
 #[allow(clippy::result_large_err)]
 fn generate_session_token(
     secret: &str,
@@ -2195,6 +2208,21 @@ mod tests {
         assert_eq!(ctx.id, "trusted");
         assert_eq!(ctx.name, "Trusted");
         assert_eq!(ctx.role, TenantRole::TenantAdmin);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session_cookie() {
+        let response = logout().await;
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .expect("set-cookie")
+            .to_str()
+            .expect("cookie str");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(cookie.starts_with("cloudpbx_session=;"));
+        assert!(cookie.contains("Max-Age=0"));
     }
 
     #[tokio::test]

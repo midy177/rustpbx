@@ -271,6 +271,11 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
+  logout() {
+    return request<void>("/auth/logout", {
+      method: "POST",
+    });
+  },
   session() {
     return request<SessionUser>("/auth/session");
   },
