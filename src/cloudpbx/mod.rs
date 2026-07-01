@@ -620,6 +620,8 @@ async fn create_extension_for_tenant(
 ) -> Result<ExtensionSummary, Response> {
     use crate::models::extension::{ActiveModel, Column, Entity};
 
+    require_tenant_admin(ctx)?;
+
     let extension = payload.extension.trim();
     if extension.is_empty() {
         return Err(bad_request("invalid_extension", "Extension is required."));
@@ -709,6 +711,8 @@ async fn update_extension_for_tenant(
     payload: UpdateExtensionRequest,
 ) -> Result<ExtensionSummary, Response> {
     use crate::models::extension::{Column, Entity};
+
+    require_tenant_admin(ctx)?;
 
     let model = load_extension_for_write(db, ctx, id).await?;
     let original_tenant_id = model.tenant_id;
@@ -805,6 +809,8 @@ async fn delete_extension_for_tenant(
 ) -> Result<(), Response> {
     use crate::models::extension::Entity;
 
+    require_tenant_admin(ctx)?;
+
     let model = load_extension_for_write(db, ctx, id).await?;
     match Entity::delete_by_id(model.id).exec(db).await {
         Ok(_) => Ok(()),
@@ -886,6 +892,8 @@ async fn create_sip_trunk_for_tenant(
     use crate::models::sip_trunk::{
         ActiveModel, Column, Entity, SipTransport, SipTrunkDirection, SipTrunkStatus,
     };
+
+    require_tenant_admin(ctx)?;
 
     let name = payload.name.trim();
     if name.is_empty() {
@@ -982,6 +990,8 @@ async fn update_sip_trunk_for_tenant(
     payload: UpdateSipTrunkRequest,
 ) -> Result<SipTrunkSummary, Response> {
     use crate::models::sip_trunk::{Column, Entity};
+
+    require_tenant_admin(ctx)?;
 
     let model = load_sip_trunk_for_write(db, ctx, id).await?;
     let original_tenant_id = model.tenant_id;
@@ -1096,6 +1106,8 @@ async fn delete_sip_trunk_for_tenant(
 ) -> Result<(), Response> {
     use crate::models::sip_trunk::Entity;
 
+    require_tenant_admin(ctx)?;
+
     let model = load_sip_trunk_for_write(db, ctx, id).await?;
     match Entity::delete_by_id(model.id).exec(db).await {
         Ok(_) => Ok(()),
@@ -1177,6 +1189,8 @@ async fn create_route_for_tenant(
     use crate::models::routing::{
         ActiveModel, Column, Entity, RoutingDirection, RoutingSelectionStrategy,
     };
+
+    require_tenant_admin(ctx)?;
 
     let name = payload.name.trim();
     if name.is_empty() {
@@ -1277,6 +1291,8 @@ async fn update_route_for_tenant(
     payload: UpdateRouteRequest,
 ) -> Result<RouteSummary, Response> {
     use crate::models::routing::{Column, Entity};
+
+    require_tenant_admin(ctx)?;
 
     let model = load_route_for_write(db, ctx, id).await?;
     let original_tenant_id = model.tenant_id;
@@ -1383,6 +1399,8 @@ async fn delete_route_for_tenant(
     id: i64,
 ) -> Result<(), Response> {
     use crate::models::routing::Entity;
+
+    require_tenant_admin(ctx)?;
 
     let model = load_route_for_write(db, ctx, id).await?;
     match Entity::delete_by_id(model.id).exec(db).await {
@@ -1514,6 +1532,8 @@ async fn create_user_for_tenant(
 ) -> Result<UserSummary, Response> {
     use crate::models::user::{ActiveModel, Column, Entity};
 
+    require_tenant_admin(ctx)?;
+
     let username = payload.username.trim();
     let email = payload.email.trim().to_lowercase();
     if username.is_empty() {
@@ -1623,6 +1643,8 @@ async fn update_user_for_tenant(
     payload: UpdateUserRequest,
 ) -> Result<UserSummary, Response> {
     use crate::models::user::{Column, Entity};
+
+    require_tenant_admin(ctx)?;
 
     let model = load_user_for_write(db, ctx, id).await?;
     let original_tenant_id = model.tenant_id;
@@ -1749,6 +1771,8 @@ async fn delete_user_for_tenant(
     id: i64,
 ) -> Result<(), Response> {
     use crate::models::user::Entity;
+
+    require_tenant_admin(ctx)?;
 
     let model = load_user_for_write(db, ctx, id).await?;
     match Entity::delete_by_id(model.id).exec(db).await {
@@ -2083,6 +2107,21 @@ fn bad_request(error: &'static str, message: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, Json(ErrorBody { error, message })).into_response()
 }
 
+#[allow(clippy::result_large_err)]
+fn require_tenant_admin(ctx: &TenantContext) -> Result<(), Response> {
+    match ctx.role {
+        TenantRole::PlatformAdmin | TenantRole::TenantAdmin => Ok(()),
+        TenantRole::TenantUser => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "forbidden",
+                message: "CloudPBX write access requires a tenant administrator.",
+            }),
+        )
+            .into_response()),
+    }
+}
+
 fn tenant_query_failed() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2189,6 +2228,37 @@ mod tests {
             .await
             .expect("missing scope");
         assert!(matches!(missing_scope, TenantDbScope::Missing));
+    }
+
+    #[tokio::test]
+    async fn tenant_user_cannot_create_extension() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        let ctx = TenantContext {
+            id: DEFAULT_TENANT_ID.to_string(),
+            name: "Default".to_string(),
+            role: TenantRole::TenantUser,
+        };
+
+        let response = create_extension_for_tenant(
+            &db,
+            &ctx,
+            CreateExtensionRequest {
+                extension: "1001".to_string(),
+                display_name: None,
+                email: None,
+                status: None,
+                login_disabled: None,
+                voicemail_disabled: None,
+                allow_guest_calls: None,
+                notes: None,
+            },
+        )
+        .await
+        .expect_err("tenant user write denied");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
